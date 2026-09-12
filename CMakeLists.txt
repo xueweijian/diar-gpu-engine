@@ -1,0 +1,19 @@
+cmake_minimum_required(VERSION 3.16)
+project(diar_gpu_engine VERSION 0.1.0 LANGUAGES CXX)
+
+include(CTest)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_library(diar_core STATIC src/diar.cpp)
+target_include_directories(diar_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(diar_core PUBLIC cxx_std_17)
+target_compile_options(diar_core PRIVATE -Wall -Wextra -Wpedantic)
+
+if(BUILD_TESTING)
+  add_executable(diar_core_tests tests/test_core.cpp)
+  target_link_libraries(diar_core_tests PRIVATE diar_core)
+  target_compile_options(diar_core_tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME diar_core_tests COMMAND diar_core_tests)
+endif()

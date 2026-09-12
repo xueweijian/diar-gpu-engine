@@ -1,0 +1,27 @@
+.DS_Store
+.vscode/
+.idea/
+build/
+out/
+artifacts/
+benchmarks/results/
+__pycache__/
+*.pyc
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.exe
+*.ninja
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+# Model weights and large runtime artifacts never belong in git.
+*.nemo
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.safetensors

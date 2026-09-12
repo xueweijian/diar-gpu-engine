@@ -1,0 +1,11 @@
+{
+  "id": "weijianxue/diar-gpu-engine-p100-smoke",
+  "title": "diar-gpu-engine-p100-smoke",
+  "code_file": "p100_smoke.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaP100"
+}

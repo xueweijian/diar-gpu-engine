@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xueweijian/diar-gpu-engine/blob/main/benchmarks/schema/benchmark-v1.schema.json",
+  "title": "Pure diarization benchmark result",
+  "type": "object",
+  "required": ["schema_version", "commit", "scope", "environment", "workload", "timing", "accuracy"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "commit": {"type": "string", "minLength": 7},
+    "scope": {"const": "pure_speaker_diarization"},
+    "environment": {
+      "type": "object",
+      "required": ["os", "compiler", "gpu"],
+      "properties": {
+        "os": {"type": "string"},
+        "compiler": {"type": "string"},
+        "cuda_toolkit": {"type": ["string", "null"]},
+        "driver": {"type": ["string", "null"]},
+        "gpu": {"type": "string"},
+        "compute_capability": {"type": ["string", "null"]}
+      }
+    },
+    "workload": {
+      "type": "object",
+      "required": ["model", "fixture", "precision", "batch"],
+      "properties": {
+        "model": {"type": "string"},
+        "checkpoint_hash": {"type": ["string", "null"]},
+        "fixture": {"type": "string"},
+        "precision": {"type": "string"},
+        "quantization": {"type": ["string", "null"]},
+        "batch": {"type": "integer", "minimum": 1},
+        "chunk_frames": {"type": ["integer", "null"]},
+        "right_context_frames": {"type": ["integer", "null"]},
+        "fifo_frames": {"type": ["integer", "null"]},
+        "spkcache_frames": {"type": ["integer", "null"]}
+      }
+    },
+    "timing": {
+      "type": "object",
+      "required": ["audio_seconds", "wall_seconds", "rtf", "realtime_x"],
+      "properties": {
+        "audio_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "warmup": {"type": "integer", "minimum": 0},
+        "iterations": {"type": "integer", "minimum": 1},
+        "frontend_seconds": {"type": "number", "minimum": 0},
+        "neural_core_seconds": {"type": "number", "minimum": 0},
+        "postprocess_seconds": {"type": "number", "minimum": 0},
+        "wall_seconds": {"type": "number", "minimum": 0},
+        "rtf": {"type": "number", "minimum": 0},
+        "realtime_x": {"type": "number", "minimum": 0},
+        "p50_ms": {"type": ["number", "null"]},
+        "p95_ms": {"type": ["number", "null"]},
+        "p99_ms": {"type": ["number", "null"]}
+      }
+    },
+    "accuracy": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["not_scored", "pass", "fail"]},
+        "max_abs_probability_error": {"type": ["number", "null"]},
+        "frame_agreement": {"type": ["number", "null"]},
+        "der": {"type": ["number", "null"]},
+        "jer": {"type": ["number", "null"]},
+        "notes": {"type": "string"}
+      }
+    }
+  }
+}
