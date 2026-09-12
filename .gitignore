@@ -2,6 +2,8 @@
 .vscode/
 .idea/
 build/
+.local-build/
+.local-cmake/
 out/
 artifacts/
 benchmarks/results/
