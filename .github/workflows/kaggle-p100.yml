@@ -15,7 +15,6 @@ permissions:
 jobs:
   p100-smoke:
     runs-on: ubuntu-24.04
-    if: ${{ secrets.KAGGLE_API_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
