@@ -1,0 +1,11 @@
+{
+  "id": "weijianxue/diar-gpu-engine-sortformer-p100",
+  "title": "diar-gpu-engine-sortformer-p100",
+  "code_file": "sortformer_p100.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaP100"
+}
