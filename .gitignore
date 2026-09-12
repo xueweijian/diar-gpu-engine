@@ -6,7 +6,8 @@ build/
 .local-cmake/
 out/
 artifacts/
-benchmarks/results/
+benchmarks/results/*
+!benchmarks/results/*.jsonl
 __pycache__/
 *.pyc
 *.o
