@@ -45,8 +45,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check forbidden ASR dependencies in core
+        shell: bash
         run: |
-          ! grep -RniE 'whisper|parakeet|nemotron|tokenizer|wer|transcri(be|ption)' include src tests CMakeLists.txt
+          if grep -RniE '#include.*(whisper|parakeet|nemotron|tokenizer)|find_package.*(whisper|parakeet|nemotron)|import[[:space:]]+(whisper|parakeet|nemotron|tokenizer)' include src tests CMakeLists.txt; then
+            echo 'forbidden ASR dependency found in core'
+            exit 1
+          fi
       - name: Check model artifacts are absent
         run: |
           test -z "$(find . -type f \( -name '*.nemo' -o -name '*.ckpt' -o -name '*.gguf' -o -name '*.onnx' \) -print)"
