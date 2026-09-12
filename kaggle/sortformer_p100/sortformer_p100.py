@@ -80,7 +80,7 @@ def find_binary() -> Path:
     return candidates[0]
 
 
-def main() -> int:
+def _main() -> int:
     shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(parents=True, exist_ok=True)
     LOG.write_text("", encoding="utf-8")
@@ -177,6 +177,24 @@ def main() -> int:
     result["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(json.dumps(result, sort_keys=True, indent=2))
     return 0 if result["status"] == "pass" else 1
+
+
+def main() -> int:
+    try:
+        return _main()
+    except Exception as exc:  # noqa: BLE001 - preserve diagnostics in Kaggle output
+        report = {
+            "schema_version": 1,
+            "scope": "pure_speaker_diarization",
+            "job": "sortformer_v2_p100",
+            "status": "error",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        print(json.dumps(report, sort_keys=True, indent=2))
+        print("\n--- last runtime log ---\n", LOG.read_text(encoding="utf-8", errors="replace")[-12000:] if LOG.exists() else "<none>")
+        return 1
 
 
 if __name__ == "__main__":
