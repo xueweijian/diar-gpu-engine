@@ -193,8 +193,14 @@ def run_matrix(binary: Path, fixtures: list[tuple[str, Path]]) -> list[dict[str,
     return results
 
 
-def select(fixtures: list[tuple[str, Path]], prefix: str) -> list[tuple[str, Path]]:
-    return [item for item in fixtures if item[0].startswith(prefix)]
+def select_entries(entries: list[dict[str, object]], prefix: str) -> list[dict[str, object]]:
+    """Filter measurement entries by label prefix.
+
+    (A previous revision wrongly called the tuple-based ``select`` on entry
+    dicts, which raised ``KeyError: 0`` and killed the whole run after the GPU
+    matrix had already completed. Entry filtering is string-based by design.)
+    """
+    return [entry for entry in entries if str(entry.get("label", "")).startswith(prefix)]
 
 
 def run_cpu(binary: Path, fixtures: list[tuple[str, Path]]) -> list[dict[str, object]]:
@@ -415,7 +421,7 @@ def _main() -> None:
     gpu_entries = run_matrix(binary, fixtures)
     REPORT["gpu_streaming"] = gpu_entries
     REPORT["length_scaling_fit"] = fit_scaling(gpu_entries)
-    real_entries = select(gpu_entries, "real_")
+    real_entries = select_entries(gpu_entries, "real_")
     real_fixtures = [(e["label"], Path(str(e["audio"]))) for e in real_entries]
     if len(real_entries) >= 2:
         REPORT["length_scaling_fit_real_only"] = fit_scaling(real_entries)
