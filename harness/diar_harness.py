@@ -116,6 +116,51 @@ def slugify(name: str, limit: int = 40) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:limit]
 
 
+AUDIO_SUFFIXES = (".wav", ".mp3", ".flac", ".m4a", ".ogg")
+
+
+def discover_audio(root: Path | str = "/kaggle/input") -> list[Path]:
+    """Find every audio file under a mount root, layout-independent.
+
+    Kaggle has used both ``/kaggle/input/<slug>/`` and the nested
+    ``/kaggle/input/datasets/<owner>/<slug>/`` layout, so never assume a
+    prefix: search recursively and sort for deterministic ordering.
+    """
+    base = Path(root)
+    if not base.exists():
+        return []
+    found: list[Path] = []
+    for suffix in AUDIO_SUFFIXES:
+        found.extend(p for p in base.rglob(f"*{suffix}") if p.is_file())
+    return sorted(set(found))
+
+
+def input_layout(root: Path | str = "/kaggle/input", depth: int = 3) -> list[str]:
+    """Compact snapshot of the mount tree, for diagnosing missing datasets."""
+    base = Path(root)
+    if not base.exists():
+        return [f"MISSING {base}"]
+    lines: list[str] = []
+
+    def walk(directory: Path, level: int) -> None:
+        if level > depth:
+            return
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError as exc:
+            lines.append(f"{'  ' * level}<unreadable {directory}: {exc}>")
+            return
+        for entry in entries:
+            if entry.is_dir():
+                lines.append(f"{'  ' * level}{entry.name}/")
+                walk(entry, level + 1)
+            else:
+                lines.append(f"{'  ' * level}{entry.name}")
+
+    walk(base, 0)
+    return lines
+
+
 # --------------------------------------------------------------------------
 # GPU sampling
 # --------------------------------------------------------------------------

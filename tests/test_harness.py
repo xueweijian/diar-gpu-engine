@@ -139,3 +139,36 @@ def test_run_reports_missing_executable(tmp_work):
     code, text, _ = harness.run(["definitely-not-a-real-binary-xyz"], timeout=10)
     assert code == 127
     assert "missing executable" in text
+
+
+def test_discover_audio_handles_both_mount_layouts(tmp_path):
+    flat = tmp_path / "diar-smoke-audio"
+    flat.mkdir(parents=True)
+    (flat / "a.wav").write_bytes(b"RIFF")
+    nested = tmp_path / "datasets" / "owner" / "diar-real-audio-1"
+    nested.mkdir(parents=True)
+    (nested / "b.mp3").write_bytes(b"ID3")
+    (nested / "notes.txt").write_text("ignore me", encoding="utf-8")
+    found = [str(p) for p in harness.discover_audio(tmp_path)]
+    assert len(found) == 2
+    assert any("a.wav" in p for p in found)
+    assert any("b.mp3" in p for p in found)
+    assert not any("notes.txt" in p for p in found)
+
+
+def test_discover_audio_on_missing_root_is_empty(tmp_path):
+    assert harness.discover_audio(tmp_path / "nope") == []
+
+
+def test_input_layout_marks_missing_root(tmp_path):
+    assert harness.input_layout(tmp_path / "absent") == [f"MISSING {tmp_path / 'absent'}"]
+
+
+def test_input_layout_snapshots_tree(tmp_path):
+    (tmp_path / "datasets" / "owner" / "slug").mkdir(parents=True)
+    (tmp_path / "datasets" / "owner" / "slug" / "file.wav").write_bytes(b"x")
+    lines = harness.input_layout(tmp_path, depth=3)
+    joined = "\n".join(lines)
+    assert "datasets/" in joined
+    assert "owner/" in joined
+    assert "file.wav" in joined

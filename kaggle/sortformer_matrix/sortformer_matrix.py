@@ -18,12 +18,41 @@ Artifacts are small reports; build trees and weights stay in /tmp.
 from __future__ import annotations
 
 import json
+
 import sys
 import time
 import wave
 from pathlib import Path
 
-sys.path.insert(0, "/kaggle/input/diar-gpu-engine-harness")
+
+def locate_harness() -> Path:
+    """Find the published harness dataset wherever Kaggle mounted it.
+
+    Dataset mount paths depend on the owner ref and can nest, so resolve the
+    module's directory by searching rather than hard-coding one path.
+    """
+    roots = [Path("/kaggle/input"), Path("/kaggle/working")]
+    listing: list[str] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            for entry in sorted(root.iterdir()):
+                listing.append(str(entry))
+        except OSError as exc:
+            listing.append(f"{root}: {exc}")
+    for root in roots:
+        if not root.exists():
+            continue
+        for candidate in root.rglob("diar_harness.py"):
+            return candidate.parent
+    raise RuntimeError(
+        "diar_harness.py not found. Kaggle input listing: " + " | ".join(listing)
+    )
+
+
+HARNESS_DIR = locate_harness()
+sys.path.insert(0, str(HARNESS_DIR))
 
 import diar_harness as h  # noqa: E402
 
@@ -36,7 +65,7 @@ REPORT: dict[str, object] = {
     "schema_version": 2,
     "scope": "pure_speaker_diarization",
     "job": "sortformer_v2_p100_matrix",
-    "harness_source": "/kaggle/input/diar-gpu-engine-harness/diar_harness.py",
+    "harness_source": "diar_harness.py resolved at runtime from /kaggle/input",
     "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
 }
 
@@ -54,24 +83,87 @@ def cut_wav(source: Path, destination: Path, start_seconds: float, seconds: floa
     return destination
 
 
-def find_fixture(pattern: str) -> Path | None:
-    matches = sorted(FIXTURE_ROOT.glob(pattern))
-    return matches[0] if matches else None
+AUDIO_SUFFIXES = (".wav", ".mp3", ".flac", ".m4a", ".ogg")
+
+
+def discover_audio(root: Path) -> list[Path]:
+    """Find audio under a mount root without assuming a mount layout.
+
+    Kaggle has used both ``/kaggle/input/<slug>/`` and the nested
+    ``/kaggle/input/datasets/<owner>/<slug>/`` layout, so search recursively.
+    Implemented locally (rather than relying on the harness dataset version) so
+    this kernel keeps working whichever harness revision gets mounted.
+    """
+    if not root.exists():
+        return []
+    found: list[Path] = []
+    for suffix in AUDIO_SUFFIXES:
+        found.extend(p for p in root.rglob(f"*{suffix}") if p.is_file())
+    return sorted(set(found))
+
+
+def layout_snapshot(root: Path, depth: int = 3) -> list[str]:
+    if not root.exists():
+        return [f"MISSING {root}"]
+    lines: list[str] = []
+
+    def walk(directory: Path, level: int) -> None:
+        if level > depth:
+            return
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError as exc:
+            lines.append(f"{'  ' * level}<unreadable {directory}: {exc}>")
+            return
+        for entry in entries:
+            if entry.is_dir():
+                lines.append(f"{'  ' * level}{entry.name}/")
+                walk(entry, level + 1)
+            else:
+                lines.append(f"{'  ' * level}{entry.name}")
+
+    walk(root, 0)
+    return lines
 
 
 def build_fixtures() -> tuple[list[tuple[str, Path]], dict[str, str]]:
-    """Returns (fixtures, provenance). Synthetic lengths make scaling measurable."""
+    """Returns (fixtures, provenance).
+
+    Real audio is discovered by recursive search rather than a fixed mount
+    prefix. Synthetic lengths (concatenated deterministic tone) exist purely to
+    make the length-scaling fit well conditioned; they carry no speech and are
+    speed fixtures, not accuracy corpora.
+    """
     fixtures: list[tuple[str, Path]] = []
     provenance: dict[str, str] = {}
 
-    real_short = find_fixture("diar-smoke-audio/**/*.wav")
-    real_mid = find_fixture("diar-real-audio-5/**/*.wav")
-    real_long = find_fixture("diar-real-audio-1/**/*.mp3")
+    audio = discover_audio(FIXTURE_ROOT)
+    REPORT["input_layout"] = layout_snapshot(FIXTURE_ROOT)
+    REPORT["discovered_audio"] = [str(p) for p in audio]
+
+    def pick(*needles: str) -> Path | None:
+        for path in audio:
+            text = str(path).lower()
+            if all(needle in text for needle in needles):
+                return path
+        return None
+
+    real_short = pick("smoke-audio") or pick("four-speakers")
+    real_mid = pick("real-audio-5")
+    real_long = pick("real-audio-1")
 
     for label, path in (("real_short", real_short), ("real_mid", real_mid)):
-        if path:
-            fixtures.append((f"{label}_{h.slugify(path.stem, 18)}", path))
-            provenance[f"{label}_{h.slugify(path.stem, 18)}"] = f"real audio: {path}"
+        if not path:
+            continue
+        if path.suffix.lower() == ".wav":
+            fixtures.append((f"{label}_{h.slugify(path.stem, 16)}", path))
+            provenance[label] = f"real audio: {path}"
+        else:
+            converted = h.WORK_ROOT / f"{label}.wav"
+            ok, message = h.to_wav16k(path, converted)
+            provenance[label] = f"real audio converted to 16k mono ({ok}): {message}"
+            if ok:
+                fixtures.append((label, converted))
 
     if real_long:
         converted = h.WORK_ROOT / "real_long.wav"
@@ -86,8 +178,9 @@ def build_fixtures() -> tuple[list[tuple[str, Path]], dict[str, str]]:
         target = h.WORK_ROOT / f"synth_{seconds}s.wav"
         h.concat_wav([unit] * repeats, target)
         fixtures.append((f"synth_{seconds}s", target))
-        provenance[f"synth_{seconds}s"] = f"{repeats}x concatenated 60s deterministic tone unit"
+        provenance[f"synth_{seconds}s"] = f"{repeats}x concatenated 60s deterministic tone unit (speed fixture, no speech)"
 
+    REPORT["fixture_provenance"] = provenance
     return fixtures, provenance
 
 
@@ -100,10 +193,14 @@ def run_matrix(binary: Path, fixtures: list[tuple[str, Path]]) -> list[dict[str,
     return results
 
 
+def select(fixtures: list[tuple[str, Path]], prefix: str) -> list[tuple[str, Path]]:
+    return [item for item in fixtures if item[0].startswith(prefix)]
+
+
 def run_cpu(binary: Path, fixtures: list[tuple[str, Path]]) -> list[dict[str, object]]:
-    """CPU fallback cost - short fixtures only, the point is the ratio."""
+    """CPU fallback cost. One short real fixture: the point is the GPU ratio."""
     results = []
-    for label, audio in fixtures[:2]:
+    for label, audio in fixtures[:1]:
         entry = h.measure(
             binary, audio, f"cpu_{label}", device="cpu", preset=None,
             warmup=0, iterations=1, sample_gpu=False,
@@ -115,9 +212,9 @@ def run_cpu(binary: Path, fixtures: list[tuple[str, Path]]) -> list[dict[str, ob
 
 
 def run_offline(binary: Path, fixtures: list[tuple[str, Path]]) -> list[dict[str, object]]:
-    """Offline geometry is documented for short audio; compare cost on the same file."""
+    """Offline geometry is documented for short audio; compare cost on same files."""
     results = []
-    for label, audio in fixtures[:1]:
+    for label, audio in fixtures[:2]:
         entry = h.measure(
             binary, audio, f"offline_{label}", device="cuda:0", preset="offline",
             warmup=1, iterations=2,
@@ -211,21 +308,33 @@ def fit_scaling(entries: list[dict[str, object]]) -> dict[str, object]:
 
 
 def determinism(entries: list[dict[str, object]]) -> dict[str, object]:
-    """Same input, fresh output path, byte-identical RTTM?"""
+    """Same input, fresh output path, byte-identical RTTM?
+
+    Only fixtures that actually produced segments are informative: a fixture
+    with no speech yields an empty RTTM that is trivially identical across runs,
+    which would make an all-identical summary meaningless.
+    """
     checks = []
     for entry in entries:
         hashes = [r["output_sha256"] for r in entry["runs"] if r["returncode"] == 0]
+        segments = int(entry.get("rttm", {}).get("segments") or 0)
+        informative = segments > 0 and len(hashes) > 1
         checks.append({
             "label": entry["label"],
             "runs": len(hashes),
+            "segments": segments,
             "unique_hashes": len(set(hashes)),
             "identical": len(set(hashes)) == 1,
+            "informative": informative,
             "sha256": hashes[0] if hashes else None,
         })
+    informative = [c for c in checks if c["informative"]]
     return {
         "checks": checks,
-        "all_identical": all(c["identical"] for c in checks) if checks else False,
-        "note": "byte-level RTTM equality across repeated runs on the same fixture",
+        "informative_fixtures": len(informative),
+        "all_identical": bool(informative) and all(c["identical"] for c in informative),
+        "empty_output_fixtures": [c["label"] for c in checks if c["segments"] == 0],
+        "note": "byte-level RTTM equality across repeated runs; empty-output fixtures are excluded",
     }
 
 
@@ -306,13 +415,17 @@ def _main() -> None:
     gpu_entries = run_matrix(binary, fixtures)
     REPORT["gpu_streaming"] = gpu_entries
     REPORT["length_scaling_fit"] = fit_scaling(gpu_entries)
+    real_entries = select(gpu_entries, "real_")
+    real_fixtures = [(e["label"], Path(str(e["audio"]))) for e in real_entries]
+    if len(real_entries) >= 2:
+        REPORT["length_scaling_fit_real_only"] = fit_scaling(real_entries)
     REPORT["determinism"] = determinism(gpu_entries)
 
-    REPORT["gpu_offline_preset"] = run_offline(binary, fixtures)
-    REPORT["cpu_fallback"] = run_cpu(binary, fixtures)
+    REPORT["gpu_offline_preset"] = run_offline(binary, real_fixtures or fixtures)
+    REPORT["cpu_fallback"] = run_cpu(binary, real_fixtures or fixtures)
 
-    if fixtures:
-        REPORT["directory_concurrency"] = run_concurrency(binary, fixtures[0][1])
+    if real_fixtures:
+        REPORT["directory_concurrency"] = run_concurrency(binary, real_fixtures[0][1])
 
     REPORT["gpu_after"] = h.gpu_snapshot()
     REPORT["records"] = to_records(environment, gpu_entries, model)

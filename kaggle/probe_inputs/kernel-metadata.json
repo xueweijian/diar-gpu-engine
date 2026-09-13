@@ -1,0 +1,16 @@
+{
+  "id": "weijianxue/diar-probe-inputs",
+  "title": "diar-probe-inputs",
+  "code_file": "probe_inputs.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "dataset_sources": [
+    "weijianxue/diar-gpu-engine-harness",
+    "weijianxue/diar-smoke-audio",
+    "weijianxue/diar-real-audio-1",
+    "weijianxue/diar-real-audio-5"
+  ]
+}
