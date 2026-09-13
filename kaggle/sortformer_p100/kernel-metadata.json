@@ -7,5 +7,10 @@
   "is_private": true,
   "enable_gpu": true,
   "enable_internet": true,
-  "machine_shape": "NvidiaTeslaP100"
+  "machine_shape": "NvidiaTeslaP100",
+  "dataset_sources": [
+    "weijianxue/diar-smoke-audio",
+    "weijianxue/diar-real-audio-1",
+    "weijianxue/diar-real-audio-5"
+  ]
 }
