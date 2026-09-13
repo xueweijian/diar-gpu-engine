@@ -388,9 +388,14 @@ def download_model() -> dict[str, object]:
 # --------------------------------------------------------------------------
 # measurement
 # --------------------------------------------------------------------------
-def parse_rttm(path: Path) -> dict[str, object]:
-    speakers: dict[str, float] = {}
-    segments: list[dict[str, object]] = []
+def read_segments(path: Path) -> list[tuple[float, float, str]]:
+    """Segment bodies as (start, duration, speaker), recording-id stripped.
+
+    RTTM field 2 (recording id) is metadata, not diarization content: the
+    harness passes a per-output recording id, so whole-file sha256 can never
+    match across runs. Body-level comparison is the meaningful equality.
+    """
+    segments: list[tuple[float, float, str]] = []
     if path.exists():
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
@@ -399,15 +404,27 @@ def parse_rttm(path: Path) -> dict[str, object]:
             fields = line.split()
             if len(fields) < 8 or fields[0] != "SPEAKER":
                 continue
-            start, duration = float(fields[3]), float(fields[4])
-            speakers[fields[7]] = speakers.get(fields[7], 0.0) + duration
-            segments.append({"start": start, "duration": duration, "speaker": fields[7]})
+            segments.append((float(fields[3]), float(fields[4]), fields[7]))
+    return segments
+
+
+def rttm_body_sha256(path: Path) -> str:
+    """sha256 over segment bodies only (start/duration/speaker per line)."""
+    body = "\n".join(f"{s:.3f} {d:.3f} {spk}" for s, d, spk in read_segments(path))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def parse_rttm(path: Path) -> dict[str, object]:
+    speakers: dict[str, float] = {}
+    segments = read_segments(path)
+    for start, duration, speaker in segments:
+        speakers[speaker] = speakers.get(speaker, 0.0) + duration
     return {
         "segments": len(segments),
         "speaker_count": len(speakers),
         "speakers": sorted(speakers),
         "speech_seconds": {k: round(v, 3) for k, v in sorted(speakers.items())},
-        "last_end_seconds": round(max((s["start"] + s["duration"] for s in segments), default=0.0), 3),
+        "last_end_seconds": round(max((s + d for s, d, _ in segments), default=0.0), 3),
     }
 
 
@@ -437,12 +454,15 @@ def diarize_once(
     cpu_before = child_cpu_seconds()
     code, text, seconds = run(argv, cwd=REPO_DIR, timeout=timeout)
     cpu_after = child_cpu_seconds()
+    body_segments = read_segments(output) if output.exists() else []
     return {
         "returncode": code,
         "wall_seconds": round(seconds, 4),
         "cpu_seconds": round(cpu_after - cpu_before, 4),
         "output": str(output),
         "output_sha256": sha256(output) if output.exists() else None,
+        "output_body_sha256": rttm_body_sha256(output) if output.exists() else None,
+        "body_segments": len(body_segments),
         "tail": text[-1200:],
     }
 
@@ -471,6 +491,9 @@ def measure(
     ok = [r for r in runs if r["returncode"] == 0]
     wall = [float(r["wall_seconds"]) for r in ok]
     cpu = [float(r["cpu_seconds"]) for r in ok]
+    body_hashes = [r["output_body_sha256"] for r in ok if r.get("output_body_sha256")]
+    body_counts = {r.get("body_segments") for r in ok}
+    body_identical = len(set(body_hashes)) == 1 if len(body_hashes) == len(ok) and ok else False
     info = wav_info(audio)
     audio_seconds = float(info["seconds"])
     median_wall = statistics.median(wall) if wall else None
@@ -483,6 +506,14 @@ def measure(
         "preset": preset,
         "warmup": warmup_runs,
         "runs": runs,
+        "body_determinism": {
+            "runs_compared": len(ok),
+            "unique_body_hashes": len(set(body_hashes)),
+            "body_identical": body_identical,
+            "body_segments_consistent": len(body_counts) == 1,
+            "body_sha256": body_hashes[0] if body_hashes else None,
+            "note": "segment bodies (start/duration/speaker); RTTM recording-id excluded",
+        },
         "timing": {
             "iterations_ok": len(ok),
             "iterations_requested": iterations,

@@ -235,17 +235,64 @@ def run_concurrency(binary: Path, source: Path) -> dict[str, object]:
 
     ``-c`` lets directory work share a model and batch compatible GPU steps, so
     this measures whether that batching is worth anything on a single P100.
+
+    Three variants, all covering the same audio, in wall-clock order:
+    ``file/chunks`` (glued RTTM vs whole-file RTTM body equality tells whether
+    chunking changes content), ``dir-c1`` and ``dir-c4`` (directory batching).
+    The directory CLI has no ``--recording-id`` (rejected for directory input),
+    so per-file recording ids are the input stems; the single-file baseline is
+    run with ``--recording-id`` fixed to the first chunk stem so bodies are
+    comparable byte-for-byte.
     """
+    import hashlib
+
     directory = h.WORK_ROOT / "concurrency"
     directory.mkdir(parents=True, exist_ok=True)
     for stale in directory.glob("*.wav"):
         stale.unlink()
     total = h.wav_info(source)["seconds"]
     chunk = total / 4.0
+    chunk_paths = []
     for index in range(4):
-        cut_wav(source, directory / f"chunk{index}.wav", index * chunk, chunk)
+        chunk_paths.append(cut_wav(source, directory / f"chunk{index}.wav", index * chunk, chunk))
 
-    outcomes = []
+    def body_of(rttm: Path) -> str:
+        return "\n".join(f"{s:.3f} {d:.3f} {spk}" for s, d, spk in h.read_segments(rttm))
+
+    # Variant A: single-file baseline over the same chunks (fixed recording id).
+    file_out = h.WORK_ROOT / "conc_file_out"
+    file_out.mkdir(parents=True, exist_ok=True)
+    for stale in file_out.glob("*.rttm"):
+        stale.unlink()
+    file_seconds = 0.0
+    file_run_ok = True
+    for chunk_path in chunk_paths:
+        code, text, seconds = h.run([
+            str(binary), "diarize", str(chunk_path),
+            "--diar-model", str(h.MODEL_PATH),
+            "--device", "cuda:0", "--format", "rttm",
+            "--output", str(file_out / f"{chunk_path.stem}.rttm"),
+            "--recording-id", "chunk0",
+        ], cwd=h.REPO_DIR, timeout=3600)
+        file_seconds += seconds
+        if code != 0:
+            file_run_ok = False
+    file_bodies = {p.stem: body_of(p) for p in sorted(file_out.glob("*.rttm"))}
+
+    outcomes = [{
+        "variant": "file_sequential_same_chunks",
+        "concurrency": 1,
+        "returncode": 0 if file_run_ok else 1,
+        "wall_seconds": round(file_seconds, 4),
+        "audio_seconds": sum(h.wav_info(p)["seconds"] for p in chunk_paths),
+        "rtf": round(file_seconds / total, 6) if total else None,
+        "realtime_x": round(total / file_seconds, 3) if file_seconds else None,
+        "files_produced": sorted(p.name for p in file_out.glob("*.rttm")),
+        "note": "sum of 4 sequential single-file runs (own process each); baseline for chunk-vs-whole",
+    }]
+    print(f"[file/chunks] wall={file_seconds:.3f}s files={len(file_bodies)}", flush=True)
+
+    glued_bodies: dict[str, str] = {}
     for concurrency in (1, 4):
         out_dir = h.WORK_ROOT / f"conc_out_{concurrency}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -260,7 +307,15 @@ def run_concurrency(binary: Path, source: Path) -> dict[str, object]:
             "--concurrency", str(concurrency),
         ], cwd=h.REPO_DIR, timeout=3600)
         produced = sorted(p.name for p in out_dir.glob("*.rttm"))
+        dir_bodies = {p.stem: body_of(p) for p in sorted(out_dir.glob("*.rttm"))}
+        if concurrency == 1:
+            glued_bodies = dir_bodies
+        body_match = (
+            set(dir_bodies) == set(file_bodies)
+            and all(dir_bodies[k] == file_bodies[k] for k in file_bodies)
+        ) if file_bodies and dir_bodies else False
         outcomes.append({
+            "variant": f"dir_c{concurrency}",
             "concurrency": concurrency,
             "returncode": code,
             "wall_seconds": round(seconds, 4),
@@ -268,16 +323,57 @@ def run_concurrency(binary: Path, source: Path) -> dict[str, object]:
             "rtf": round(seconds / audio_seconds, 6) if audio_seconds else None,
             "realtime_x": round(audio_seconds / seconds, 3) if seconds else None,
             "files_produced": produced,
+            "bodies_match_file_baseline": body_match,
             "tail": text[-600:],
         })
         print(f"[concurrency={concurrency}] wall={seconds:.3f}s files={len(produced)}", flush=True)
+
+    # Whole-file rerun of the same source (fixed recording id chunk0) so a
+    # glued chunk timeline can be compared against uninterrupted streaming.
+    whole_out = h.WORK_ROOT / "conc_whole.rttm"
+    whole_out.unlink(missing_ok=True)
+    code, text, seconds = h.run([
+        str(binary), "diarize", str(source),
+        "--diar-model", str(h.MODEL_PATH),
+        "--device", "cuda:0", "--format", "rttm",
+        "--output", str(whole_out),
+        "--recording-id", "chunk0",
+    ], cwd=h.REPO_DIR, timeout=3600)
+    whole_body = body_of(whole_out) if whole_out.exists() else ""
+    glued: list[str] = []
+    for index in range(4):
+        chunk_body = glued_bodies.get(f"chunk{index}", "")
+        offset = index * chunk
+        for line in chunk_body.splitlines():
+            s, d, spk = line.split()
+            glued.append(f"{float(s) + offset:.3f} {d} {spk}")
+    glued_text = "\n".join(glued)
+    glue_hash = hashlib.sha256(glued_text.encode()).hexdigest() if glued_text else None
+    whole_hash = hashlib.sha256(whole_body.encode()).hexdigest() if whole_body else None
+    chunk_vs_whole = {
+        "whole_wall_seconds": round(seconds, 4),
+        "whole_returncode": code,
+        "glued_segments": len(glued),
+        "whole_segments": len(whole_body.splitlines()) if whole_body else 0,
+        "glued_body_sha256": glue_hash,
+        "whole_body_sha256": whole_hash,
+        "identical": bool(glue_hash) and glue_hash == whole_hash,
+        "note": ("chunk timelines shifted by chunk offsets and concatenated, "
+                 "compared against one uninterrupted run of the same source"),
+    }
+    print(f"[chunk-vs-whole] glued={len(glued)} whole={chunk_vs_whole['whole_segments']} "
+          f"identical={chunk_vs_whole['identical']}", flush=True)
+
+    dir_c1 = outcomes[1]["wall_seconds"] if len(outcomes) > 1 else None
+    dir_c4 = outcomes[2]["wall_seconds"] if len(outcomes) > 2 else None
     return {
         "chunks": [str(p) for p in sorted(directory.glob("*.wav"))],
         "chunk_seconds": chunk,
+        "source": str(source),
         "outcomes": outcomes,
+        "chunk_vs_whole": chunk_vs_whole,
         "speedup_4_vs_1": (
-            round(outcomes[0]["wall_seconds"] / outcomes[1]["wall_seconds"], 4)
-            if len(outcomes) == 2 and outcomes[1]["wall_seconds"] else None
+            round(dir_c1 / dir_c4, 4) if dir_c1 and dir_c4 else None
         ),
     }
 
@@ -314,15 +410,18 @@ def fit_scaling(entries: list[dict[str, object]]) -> dict[str, object]:
 
 
 def determinism(entries: list[dict[str, object]]) -> dict[str, object]:
-    """Same input, fresh output path, byte-identical RTTM?
+    """Same input, repeated runs: are the segment bodies identical?
 
-    Only fixtures that actually produced segments are informative: a fixture
-    with no speech yields an empty RTTM that is trivially identical across runs,
-    which would make an all-identical summary meaningless.
+    Compares RTTM segment bodies (start/duration/speaker) with the RTTM
+    recording-id field excluded: the harness passes a per-output recording id
+    (``--recording-id <output.stem>``), so whole-file sha256 differs across
+    runs by construction and can never answer the determinism question.
+    Both views are reported; the body view is the verdict.
     """
     checks = []
     for entry in entries:
         hashes = [r["output_sha256"] for r in entry["runs"] if r["returncode"] == 0]
+        body = entry.get("body_determinism") or {}
         segments = int(entry.get("rttm", {}).get("segments") or 0)
         informative = segments > 0 and len(hashes) > 1
         checks.append({
@@ -333,14 +432,21 @@ def determinism(entries: list[dict[str, object]]) -> dict[str, object]:
             "identical": len(set(hashes)) == 1,
             "informative": informative,
             "sha256": hashes[0] if hashes else None,
+            "body_unique_hashes": body.get("unique_body_hashes"),
+            "body_identical": body.get("body_identical"),
+            "body_segments_consistent": body.get("body_segments_consistent"),
+            "body_sha256": body.get("body_sha256"),
         })
     informative = [c for c in checks if c["informative"]]
     return {
         "checks": checks,
         "informative_fixtures": len(informative),
         "all_identical": bool(informative) and all(c["identical"] for c in informative),
+        "all_body_identical": bool(informative) and all(c.get("body_identical") for c in informative),
         "empty_output_fixtures": [c["label"] for c in checks if c["segments"] == 0],
-        "note": "byte-level RTTM equality across repeated runs; empty-output fixtures are excluded",
+        "note": ("whole-file RTTM equality (recording-id included) vs segment-body "
+                 "equality (recording-id excluded); body view is the verdict; "
+                 "empty-output fixtures are excluded"),
     }
 
 

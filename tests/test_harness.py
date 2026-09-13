@@ -85,6 +85,46 @@ def test_parse_rttm_handles_empty_and_missing(tmp_work):
     assert harness.parse_rttm(empty)["speaker_count"] == 0
 
 
+def test_rttm_body_hash_ignores_recording_id(tmp_work):
+    """v4 determinism confound: per-run recording ids break whole-file sha.
+
+    Same segment bodies under different recording ids must hash equal at the
+    body level while differing at the whole-file level.
+    """
+    first = tmp_work / "run0.rttm"
+    second = tmp_work / "run1.rttm"
+    first.write_text(
+        "SPEAKER run0 1 0.000 1.500 <NA> <NA> speaker_1 <NA> <NA>\n"
+        "SPEAKER run0 1 2.000 0.500 <NA> <NA> speaker_2 <NA> <NA>\n",
+        encoding="utf-8",
+    )
+    second.write_text(
+        "SPEAKER run1 1 0.000 1.500 <NA> <NA> speaker_1 <NA> <NA>\n"
+        "SPEAKER run1 1 2.000 0.500 <NA> <NA> speaker_2 <NA> <NA>\n",
+        encoding="utf-8",
+    )
+    assert harness.sha256(first) != harness.sha256(second)
+    assert harness.rttm_body_sha256(first) == harness.rttm_body_sha256(second)
+    assert harness.read_segments(first) == harness.read_segments(second)
+
+
+def test_rttm_body_hash_distinguishes_content(tmp_work):
+    first = tmp_work / "a.rttm"
+    second = tmp_work / "b.rttm"
+    first.write_text("SPEAKER rec 1 0.000 1.500 <NA> <NA> speaker_1 <NA> <NA>\n", encoding="utf-8")
+    second.write_text("SPEAKER rec 1 0.000 1.501 <NA> <NA> speaker_1 <NA> <NA>\n", encoding="utf-8")
+    assert harness.rttm_body_sha256(first) != harness.rttm_body_sha256(second)
+
+
+def test_read_segments_skips_comments_and_malformed(tmp_work):
+    path = tmp_work / "m.rttm"
+    path.write_text(
+        ";; comment\nGARBAGE LINE\nSPEAKER rec 1 1.000 2.000 <NA> <NA> spk <NA> <NA>\n",
+        encoding="utf-8",
+    )
+    assert harness.read_segments(path) == [(1.0, 2.0, "spk")]
+
+
 def test_slugify_normalises_unsafe_characters():
     assert harness.slugify("../../etc/passwd") == ".._.._etc_passwd"
     assert harness.slugify("中文 audio 1") == "___audio_1"
