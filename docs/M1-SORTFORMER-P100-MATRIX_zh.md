@@ -2,7 +2,8 @@
 
 内核 `kaggle/sortformer_matrix` v4，状态 pass（2026-09-13，
 04:23–05:09 UTC，约 46 分钟；其中构建 ~993s）。
-原始报告：`benchmarks/results/m1-sortformer-p100-matrix-report.json`；
+原始报告（Kaggle 产出物 `sortformer_matrix_report.json`，随内核输出存档，
+按 `.gitignore` 约定不进 git，见 benchmarks/README 说明）；
 6 条 schema 记录：`benchmarks/results/m1-sortformer-p100-matrix.jsonl`。
 
 范围重申：纯说话人日志（no ASR/tokenizer/转写）。本轮只测时间，
