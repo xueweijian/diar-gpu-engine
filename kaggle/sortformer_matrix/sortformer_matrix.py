@@ -11,6 +11,10 @@ run answers the questions that actually drive engine design:
 5. Does the same input produce a byte-identical RTTM across runs (a hard
    prerequisite before any parity claim)?
 6. Does `--concurrency` batch directory work usefully on one P100?
+7. (v6) Which layer drifts? Same-audio env-knob sweep (CUDA_LAUNCH_BLOCKING,
+   CUBLAS_WORKSPACE_CONFIG, GGML_SKINNY_Q8_CUBLAS_F16) on short-streaming,
+   mid-offline and mid-streaming isolates the nondeterminism source without
+   touching the engine.
 
 Everything is pure diarization: no ASR, tokenizer, or transcription path.
 Artifacts are small reports; build trees and weights stay in /tmp.
@@ -18,7 +22,7 @@ Artifacts are small reports; build trees and weights stay in /tmp.
 from __future__ import annotations
 
 import json
-
+import os
 import sys
 import time
 import wave
@@ -62,12 +66,28 @@ FIXTURE_ROOT = Path("/kaggle/input")
 COMMIT = "d00a769"
 
 REPORT: dict[str, object] = {
-    "schema_version": 2,
+    "schema_version": 3,
     "scope": "pure_speaker_diarization",
     "job": "sortformer_v2_p100_matrix",
     "harness_source": "diar_harness.py resolved at runtime from /kaggle/input",
     "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
 }
+
+# v6 determinism probes: same binary, same audio, only the child-process env
+# differs between sets. A knob that collapses run-to-run drift identifies the
+# layer that drifts; a knob that changes nothing eliminates its layer.
+# (CUBLAS_WORKSPACE_CONFIG=:4096:8 is cuBLAS's documented deterministic
+# setting, cf. PyTorch determinism guides.)
+DET_SETS: list[tuple[str, dict[str, str]]] = [
+    ("baseline", {}),
+    ("cuda_blocking", {"CUDA_LAUNCH_BLOCKING": "1"}),
+    ("cublas_workspace", {
+        "CUDA_LAUNCH_BLOCKING": "1",
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    }),
+    ("no_f16_cublas", {"GGML_SKINNY_Q8_CUBLAS_F16": "0"}),
+]
+N_DET_REPEAT = int(os.environ.get("DIAR_DET_REPEAT", "3"))
 
 
 def cut_wav(source: Path, destination: Path, start_seconds: float, seconds: float) -> Path:
@@ -201,6 +221,72 @@ def select_entries(entries: list[dict[str, object]], prefix: str) -> list[dict[s
     matrix had already completed. Entry filtering is string-based by design.)
     """
     return [entry for entry in entries if str(entry.get("label", "")).startswith(prefix)]
+
+
+def run_det_sweep(
+    binary: Path,
+    cases: list[tuple[str, Path, str | None]],
+) -> dict[str, object]:
+    """v6: same audio x env-knob sets, repeated sequential single-file runs.
+
+    Each case is (label, audio, preset). Inside one case the binary, audio,
+    preset, recording-id and working directory are all fixed; the only thing
+    that varies between sets is the child env (see DET_SETS). Every set runs
+    N_DET_REPEAT sequential `diarize` invocations so the verdict compares
+    like with like: does this knob collapse the run-to-run drift that v5
+    measured, or leave it untouched?
+    """
+    import hashlib
+
+    sweep: dict[str, object] = {"sets": DET_SETS, "repeat": N_DET_REPEAT, "cases": []}
+    for label, audio, preset in cases:
+        case_dir = h.WORK_ROOT / "det_sweep" / label
+        case_dir.mkdir(parents=True, exist_ok=True)
+        case_entry: dict[str, object] = {"label": label, "preset": preset, "sets": []}
+        for set_name, env in DET_SETS:
+            bodies: list[str] = []
+            hashes: list[str] = []
+            walls: list[float] = []
+            ok = True
+            for rep in range(N_DET_REPEAT):
+                out = case_dir / f"{set_name}.rep{rep}.rttm"
+                result = h.diarize_once(
+                    binary, audio, out, device="cuda:0", preset=preset,
+                    extra_args=None, timeout=3600, env=dict(env),
+                )
+                if result["returncode"] != 0:
+                    ok = False
+                    break
+                body = "\n".join(
+                    f"{s:.3f} {d:.3f} {spk}" for s, d, spk in h.read_segments(out))
+                bodies.append(body)
+                hashes.append(hashlib.sha256(body.encode()).hexdigest())
+                walls.append(float(result["wall_seconds"]))
+            unique = sorted(set(hashes))
+            case_entry["sets"].append({
+                "name": set_name,
+                "env": dict(env),
+                "returncode_ok": ok,
+                "runs": N_DET_REPEAT if ok else len(hashes),
+                "unique_body_hashes": len(unique),
+                "body_identical": ok and len(unique) == 1,
+                "pairwise_with_rep0": (
+                    round(sum(1 for x in hashes if x == hashes[0]) / len(hashes), 4)
+                    if hashes else None
+                ),
+                "cross_set_matches_baseline_rep0": (
+                    hashes[0] == case_entry["sets"][0].get("rep0_hash")
+                    if case_entry["sets"] and hashes else None
+                ),
+                "rep0_hash": hashes[0] if hashes else None,
+                "wall_seconds": walls,
+                "wall_median": (
+                    round(sorted(walls)[len(walls) // 2], 4) if walls else None),
+            })
+            print(f"[det] {label}/{set_name}: unique={len(unique)} "
+                  f"identical={ok and len(unique) == 1} walls={walls}", flush=True)
+        sweep["cases"].append(case_entry)
+    return sweep
 
 
 def run_cpu(binary: Path, fixtures: list[tuple[str, Path]]) -> list[dict[str, object]]:
@@ -538,6 +624,28 @@ def _main() -> None:
 
     if real_fixtures:
         REPORT["directory_concurrency"] = run_concurrency(binary, real_fixtures[0][1])
+
+    # v6 determinism sweep: short-streaming (known-good control), mid-offline
+    # (single forward, no AOSC loop) and mid-streaming (v5's drifter). Runs
+    # AFTER the matrix so the timing numbers above stay comparable to v4/v5.
+    det_cases: list[tuple[str, Path, str | None]] = []
+    by_label = {e["label"]: e for e in gpu_entries}
+    short_entries = [e for e in gpu_entries if e["label"].startswith("real_short")]
+    mid_entries = [e for e in gpu_entries if e["label"].startswith("real_mid")]
+    _ = by_label
+    if short_entries:
+        det_cases.append((
+            "short_streaming",
+            Path(str(short_entries[0]["audio"])), None))
+    if mid_entries:
+        det_cases.append((
+            "mid_streaming",
+            Path(str(mid_entries[0]["audio"])), None))
+        det_cases.append((
+            "mid_offline",
+            Path(str(mid_entries[0]["audio"])), "offline"))
+    if det_cases:
+        REPORT["determinism_sweep"] = run_det_sweep(binary, det_cases)
 
     REPORT["gpu_after"] = h.gpu_snapshot()
     REPORT["records"] = to_records(environment, gpu_entries, model)

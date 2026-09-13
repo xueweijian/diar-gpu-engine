@@ -5,9 +5,11 @@ Run:  python3 -m pytest tests/test_harness.py -q
 from __future__ import annotations
 
 import json
+import os
 import sys
 import wave
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -179,6 +181,50 @@ def test_run_reports_missing_executable(tmp_work):
     code, text, _ = harness.run(["definitely-not-a-real-binary-xyz"], timeout=10)
     assert code == 127
     assert "missing executable" in text
+
+
+def test_run_merges_env_over_os_environ(tmp_work):
+    """Determinism probes toggle CUDA/cuBLAS knobs per experiment (v6).
+
+    run(env=...) must reach the child without mutating os.environ.
+    """
+    seen: dict[str, str] = {}
+
+    real_run = __import__("subprocess").run
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs.get("env") or {})
+        class P:
+            returncode = 0
+            stdout = ""
+        return P()
+
+    with mock.patch.object(harness.subprocess, "run", side_effect=fake_run):
+        with mock.patch.dict(os.environ, {"DIAR_PROBE_PARENT": "keep"}, clear=False):
+            harness.run(["true"], env={"DIAR_PROBE_CHILD": "1"})
+    assert seen.get("DIAR_PROBE_CHILD") == "1"
+    assert seen.get("DIAR_PROBE_PARENT") == "keep"
+    assert "DIAR_PROBE_CHILD" not in os.environ
+
+
+def test_diarize_once_records_env_and_passes_it_to_child(tmp_work, monkeypatch):
+    """Each run carries its env fingerprint so reports show which knob ran."""
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, cwd=None, timeout=1800, env=None):
+        captured["env"] = env
+        return 0, "", 0.01
+
+    monkeypatch.setattr(harness, "run", fake_run)
+    monkeypatch.setattr(harness, "REPO_DIR", tmp_work)
+    out = tmp_work / "x.rttm"
+    result = harness.diarize_once(
+        Path("/nope/binary"), Path("/nope/a.wav"), out, env={"CUDA_LAUNCH_BLOCKING": "1"})
+    assert result["returncode"] == 0
+    assert result["env"] == {"CUDA_LAUNCH_BLOCKING": "1"}
+    assert captured["env"] == {"CUDA_LAUNCH_BLOCKING": "1"}
+    defaulted = harness.diarize_once(Path("/nope/binary"), Path("/nope/a.wav"), out)
+    assert defaulted["env"] == {}
 
 
 def test_discover_audio_handles_both_mount_layouts(tmp_path):

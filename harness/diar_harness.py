@@ -78,13 +78,24 @@ def reset_workspace() -> None:
     LOG_PATH.write_text("", encoding="utf-8")
 
 
-def run(argv: list[str], cwd: Path | None = None, timeout: int = 1800) -> tuple[int, str, float]:
-    """Run a command, append its output to the runtime log, return (rc, text, seconds)."""
+def run(argv: list[str], cwd: Path | None = None, timeout: int = 1800,
+        env: dict[str, str] | None = None) -> tuple[int, str, float]:
+    """Run a command, append its output to the runtime log, return (rc, text, seconds).
+
+    ``env`` (when given) is merged over ``os.environ`` for the child only,
+    so determinism probes can toggle CUDA/cuBLAS knobs per experiment while
+    the provenance stays in the report.
+    """
     started = time.perf_counter()
+    merged: dict[str, str] | None = None
+    if env:
+        merged = os.environ.copy()
+        merged.update({k: str(v) for k, v in env.items()})
     try:
         proc = subprocess.run(
             argv, cwd=str(cwd) if cwd else None, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, check=False,
+            env=merged,
         )
         code, text = proc.returncode, proc.stdout or ""
     except FileNotFoundError as exc:
@@ -436,6 +447,7 @@ def diarize_once(
     preset: str | None = None,
     extra_args: list[str] | None = None,
     timeout: int = 3600,
+    env: dict[str, str] | None = None,
 ) -> dict[str, object]:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.unlink(missing_ok=True)
@@ -452,7 +464,7 @@ def diarize_once(
     if extra_args:
         argv += extra_args
     cpu_before = child_cpu_seconds()
-    code, text, seconds = run(argv, cwd=REPO_DIR, timeout=timeout)
+    code, text, seconds = run(argv, cwd=REPO_DIR, timeout=timeout, env=env)
     cpu_after = child_cpu_seconds()
     body_segments = read_segments(output) if output.exists() else []
     return {
@@ -460,6 +472,7 @@ def diarize_once(
         "wall_seconds": round(seconds, 4),
         "cpu_seconds": round(cpu_after - cpu_before, 4),
         "output": str(output),
+        "env": dict(env) if env else {},
         "output_sha256": sha256(output) if output.exists() else None,
         "output_body_sha256": rttm_body_sha256(output) if output.exists() else None,
         "body_segments": len(body_segments),
@@ -494,6 +507,14 @@ def measure(
     body_hashes = [r["output_body_sha256"] for r in ok if r.get("output_body_sha256")]
     body_counts = {r.get("body_segments") for r in ok}
     body_identical = len(set(body_hashes)) == 1 if len(body_hashes) == len(ok) and ok else False
+    # Same-input same-process-pairwise frame agreement (when available):
+    # fraction of runs whose segment-body hash equals run0's. 1.0 = the
+    # whole batch agrees with the representative run whose RTTM is parsed
+    # below; < 1.0 = drift inside an otherwise "pass" measurement.
+    pairwise_with_run0 = (
+        round(sum(1 for b in body_hashes if b == body_hashes[0]) / len(body_hashes), 4)
+        if body_hashes else None
+    )
     info = wav_info(audio)
     audio_seconds = float(info["seconds"])
     median_wall = statistics.median(wall) if wall else None
@@ -510,6 +531,7 @@ def measure(
             "runs_compared": len(ok),
             "unique_body_hashes": len(set(body_hashes)),
             "body_identical": body_identical,
+            "pairwise_with_run0": pairwise_with_run0,
             "body_segments_consistent": len(body_counts) == 1,
             "body_sha256": body_hashes[0] if body_hashes else None,
             "note": "segment bodies (start/duration/speaker); RTTM recording-id excluded",
