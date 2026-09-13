@@ -1,0 +1,17 @@
+{
+  "id": "weijianxue/diar-gpu-engine-sortformer-matrix",
+  "title": "diar-gpu-engine-sortformer-matrix",
+  "code_file": "sortformer_matrix.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaP100",
+  "dataset_sources": [
+    "weijianxue/diar-gpu-engine-harness",
+    "weijianxue/diar-smoke-audio",
+    "weijianxue/diar-real-audio-1",
+    "weijianxue/diar-real-audio-5"
+  ]
+}
