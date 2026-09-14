@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace diar {
 namespace {
@@ -140,15 +141,70 @@ std::vector<Segment> to_segments(
     }
 
     std::sort(segments.begin(), segments.end(), [](const Segment& lhs, const Segment& rhs) {
-        if (lhs.start_sec != rhs.start_sec) {
-            return lhs.start_sec < rhs.start_sec;
-        }
-        if (lhs.end_sec != rhs.end_sec) {
-            return lhs.end_sec < rhs.end_sec;
-        }
-        return lhs.speaker < rhs.speaker;
+        return lhs.start_sec < rhs.start_sec;
     });
     return segments;
+}
+
+// Upstream-faithful port of NeMo-Speech.cpp's diar_segments_from_probs
+// (src/asr/diar/diar_pipeline.cpp @ a5b6953). Differences from to_segments:
+//  - hysteresis edges are strict inequalities (p > onset opens, p < offset
+//    closes; equality keeps the current state), while to_segments opens on
+//    >= and closes on <;
+//  - segment end clamps to the timeline total (n * frame_duration_sec);
+//  - merge condition is strict (< min_gap_sec): a gap exactly equal to the
+//    threshold does NOT merge, while to_segments merges on <=;
+//  - final sort is by start time only (std::sort is not stable), matching
+//    upstream's single-key comparator.
+// New code must use this port when comparing against upstream RTTMs;
+// to_segments stays for the existing local contract tests.
+std::vector<Segment> upstream_segments_from_probs(
+    const FrameProbabilities& probabilities, const SegmentationConfig& config) {
+    probabilities.validate();
+    validate_config(config);
+    const std::size_t frames = probabilities.frames();
+    const std::size_t speakers = probabilities.speakers();
+    const double frame_sec = config.frame_duration_sec;
+    const double total = static_cast<double>(frames) * frame_sec;
+    std::vector<Segment> out;
+    for (std::size_t speaker = 0; speaker < speakers; ++speaker) {
+        std::vector<std::pair<double, double>> segs;
+        bool active = false;
+        std::size_t start = 0;
+        for (std::size_t frame = 0; frame < frames; ++frame) {
+            const float p = probabilities.at(frame, speaker);
+            if (!active && p > config.onset) {
+                active = true;
+                start = frame;
+            } else if (active && p < config.offset) {
+                active = false;
+                segs.emplace_back(
+                    std::max(0.0, static_cast<double>(start) * frame_sec - config.pad_onset_sec),
+                    std::min(total, static_cast<double>(frame) * frame_sec + config.pad_offset_sec));
+            }
+        }
+        if (active) {
+            segs.emplace_back(
+                std::max(0.0, static_cast<double>(start) * frame_sec - config.pad_onset_sec), total);
+        }
+        std::vector<std::pair<double, double>> merged;
+        for (const auto& sg : segs) {
+            if (!merged.empty() && sg.first - merged.back().second < config.min_gap_sec) {
+                merged.back().second = std::max(merged.back().second, sg.second);
+            } else {
+                merged.push_back(sg);
+            }
+        }
+        for (const auto& sg : merged) {
+            if (sg.second - sg.first >= config.min_duration_sec) {
+                out.push_back({sg.first, sg.second, static_cast<std::uint32_t>(speaker + 1)});
+            }
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const Segment& lhs, const Segment& rhs) {
+        return lhs.start_sec < rhs.start_sec;
+    });
+    return out;
 }
 
 ProbabilityMetrics compare_probabilities(

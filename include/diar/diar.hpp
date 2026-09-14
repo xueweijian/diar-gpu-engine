@@ -53,6 +53,14 @@ std::vector<std::uint8_t> hysteresis_activity(
 std::vector<Segment> to_segments(
     const FrameProbabilities& probabilities, const SegmentationConfig& config);
 
+// Faithful port of upstream diar_segments_from_probs
+// (NeMo-Speech.cpp src/asr/diar/diar_pipeline.cpp @ a5b6953): strict
+// inequalities on hysteresis edges, end clamped to the timeline total,
+// strict < on gap merge, start-only sort. Use this for any upstream RTTM
+// comparison; to_segments keeps the pre-existing local contract.
+std::vector<Segment> upstream_segments_from_probs(
+    const FrameProbabilities& probabilities, const SegmentationConfig& config);
+
 struct ProbabilityMetrics {
     float max_abs_error = 0.0F;
     double mean_abs_error = 0.0;
