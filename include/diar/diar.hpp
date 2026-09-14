@@ -104,4 +104,32 @@ ProbabilityMetrics compare_probabilities(
     const FrameProbabilities& expected, const FrameProbabilities& actual,
     const SegmentationConfig& config);
 
+// Streaming geometry in 80 ms encoder frames, mirroring upstream
+// DiarGeometry (NeMo-Speech.cpp a5b6953 src/asr/diar/aosc_state.h).
+// Defaults ARE the streaming preset (riva_streaming returns {}); the
+// offline preset is still AOSC streaming with larger chunks/caches —
+// it is NOT the full-attention --offline path (see diar_pipeline.h).
+struct StreamGeometry {
+    int spkcache_len = 160;
+    int fifo_len = 80;
+    int chunk_len = 20;
+    int spkcache_update_period = 80;
+    int chunk_left_context = 0;
+    int chunk_right_context = 0;
+
+    static StreamGeometry streaming();
+    static StreamGeometry offline_preset();
+};
+
+// Throws std::invalid_argument on unknown names ("streaming" | "offline").
+StreamGeometry stream_geometry_preset(const char* name);
+
+// Mirrors DiarGeometry::validate: positive chunk/update sizes, non-negative
+// fifo/contexts, speaker-cache budget (1+sil_frames_per_spk)*n_spk, and the
+// rel-pos table limit. Throws std::invalid_argument with a "diar geometry: "
+// prefix like upstream.
+void validate_stream_geometry(
+    const StreamGeometry& geometry, int num_speakers, int sil_frames_per_spk,
+    int pos_emb_max_len);
+
 } // namespace diar

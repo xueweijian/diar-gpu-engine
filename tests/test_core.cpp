@@ -192,6 +192,69 @@ void test_frontend_config_matches_upstream_diar_wiring() {
     expect_near(cfg.offline_peak_eps, 1e-3, 1e-9, "offline peak eps");
 }
 
+void test_stream_geometry_presets_and_validation() {
+    // Pinned against NeMo-Speech.cpp a5b6953 src/asr/diar/aosc_state.h/cpp:
+    // defaults == streaming preset; offline preset is still AOSC streaming
+    // (NOT the full-attention --offline path).
+    const auto streaming = diar::StreamGeometry::streaming();
+    expect(streaming.chunk_len == 20, "streaming chunk_len");
+    expect(streaming.fifo_len == 80, "streaming fifo_len");
+    expect(streaming.spkcache_len == 160, "streaming spkcache_len");
+    expect(streaming.spkcache_update_period == 80, "streaming update period");
+    expect(streaming.chunk_left_context == 0, "streaming lc");
+    expect(streaming.chunk_right_context == 0, "streaming rc");
+
+    const auto offline = diar::StreamGeometry::offline_preset();
+    expect(offline.chunk_len == 100, "offline-preset chunk_len");
+    expect(offline.fifo_len == 100, "offline-preset fifo_len");
+    expect(offline.spkcache_len == 312, "offline-preset spkcache_len");
+    expect(offline.spkcache_update_period == 100, "offline-preset update period");
+
+    expect(diar::stream_geometry_preset("streaming").chunk_len == 20,
+           "preset streaming resolves");
+    expect(diar::stream_geometry_preset("offline").spkcache_len == 312,
+           "preset offline resolves");
+    bool threw = false;
+    try {
+        diar::stream_geometry_preset("full-attention");
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    expect(threw, "unknown preset must throw");
+
+    // Upstream DiarGeometry::validate contract (n_spk=4, sil=3, posmax=5000):
+    // budget (1+3)*4=16; streaming window 160+80+0+20+0=260 <= 5000.
+    diar::validate_stream_geometry(streaming, 4, 3, 5000);
+    diar::validate_stream_geometry(offline, 4, 3, 5000);
+    threw = false;
+    try {
+        auto bad = streaming;
+        bad.chunk_len = 0;
+        diar::validate_stream_geometry(bad, 4, 3, 5000);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    expect(threw, "chunk_len < 1 must throw");
+    threw = false;
+    try {
+        auto bad = streaming;
+        bad.spkcache_len = 15;  // budget is 16
+        diar::validate_stream_geometry(bad, 4, 3, 5000);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    expect(threw, "spkcache below budget must throw");
+    threw = false;
+    try {
+        auto bad = streaming;
+        bad.chunk_len = 5000;  // window 160+80+5000 > 5000
+        diar::validate_stream_geometry(bad, 4, 3, 5000);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    expect(threw, "window above rel-pos table must throw");
+}
+
 } // namespace
 
 int main() {
@@ -201,6 +264,7 @@ int main() {
     test_metrics_and_validation();
     test_upstream_port_matches_reference_vectors();
     test_frontend_config_matches_upstream_diar_wiring();
+    test_stream_geometry_presets_and_validation();
     std::cout << "PASS: pure diarization core tests\n";
     return 0;
 }

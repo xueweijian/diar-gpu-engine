@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <cstring>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace diar {
@@ -238,6 +240,54 @@ ProbabilityMetrics compare_probabilities(
     metrics.frame_agreement = static_cast<double>(equal) /
         static_cast<double>(expected_activity.size());
     return metrics;
+}
+
+StreamGeometry StreamGeometry::streaming() { return {}; }
+
+StreamGeometry StreamGeometry::offline_preset() { return {312, 100, 100, 100, 0, 0}; }
+
+StreamGeometry stream_geometry_preset(const char* name) {
+    if (name != nullptr && std::strcmp(name, "streaming") == 0) {
+        return StreamGeometry::streaming();
+    }
+    if (name != nullptr && std::strcmp(name, "offline") == 0) {
+        return StreamGeometry::offline_preset();
+    }
+    std::string what = "unknown diarizer geometry preset '";
+    what += (name != nullptr ? name : "");
+    what += "' (expected streaming | offline)";
+    throw std::invalid_argument(what);
+}
+
+void validate_stream_geometry(
+    const StreamGeometry& geometry, int num_speakers, int sil_frames_per_spk,
+    int pos_emb_max_len) {
+    const auto fail = [](const std::string& message) {
+        throw std::invalid_argument("diar geometry: " + message);
+    };
+    if (geometry.chunk_len < 1) {
+        fail("chunk_len must be >= 1 (got " + std::to_string(geometry.chunk_len) + ")");
+    }
+    if (geometry.spkcache_update_period < 1) {
+        fail("spkcache_update_period must be >= 1 (got " +
+             std::to_string(geometry.spkcache_update_period) + ")");
+    }
+    if (geometry.fifo_len < 0 || geometry.chunk_left_context < 0 ||
+        geometry.chunk_right_context < 0) {
+        fail("fifo_len and contexts must be >= 0");
+    }
+    const int min_spkcache = (1 + sil_frames_per_spk) * num_speakers;
+    if (geometry.spkcache_len < min_spkcache) {
+        fail("spkcache_len must be >= (1 + sil_frames_per_spk) * n_spk = " +
+             std::to_string(min_spkcache) + " (got " + std::to_string(geometry.spkcache_len) +
+             ")");
+    }
+    const int total = geometry.spkcache_len + geometry.fifo_len +
+        geometry.chunk_left_context + geometry.chunk_len + geometry.chunk_right_context;
+    if (total > pos_emb_max_len) {
+        fail("streaming window " + std::to_string(total) + " exceeds the rel-pos table (" +
+             std::to_string(pos_emb_max_len) + ")");
+    }
 }
 
 } // namespace diar
