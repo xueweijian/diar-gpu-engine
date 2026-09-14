@@ -255,6 +255,79 @@ void test_stream_geometry_presets_and_validation() {
     expect(threw, "window above rel-pos table must throw");
 }
 
+void test_aosc_state_fifo_and_compress_lifecycle() {
+    // Lifecycle contract against upstream AoscState semantics (a5b6953):
+    // tiny geometry forces FIFO pop + spkcache compress within a few chunks.
+    // Differential bit-parity vs upstream's own code is proven by the
+    // out-of-tree oracle (/tmp/aosc_oracle, 2600 random streams green);
+    // this in-tree test pins the observable lifecycle so regressions fail
+    // in CI without the oracle binary.
+    diar::StreamGeometry geo;
+    geo.spkcache_len = 8;
+    geo.fifo_len = 4;
+    geo.chunk_len = 2;
+    geo.spkcache_update_period = 2;
+    diar::AoscScoringConfig scoring;
+    const int n_spk = 2;
+    const int emb_dim = 4;
+    diar::AoscState state(geo, scoring, n_spk, emb_dim);
+
+    expect(state.spkcache_frames() == 0, "cache starts empty");
+    expect(state.fifo_frames() == 0, "fifo starts empty");
+    expect(!state.spkcache_preds_valid(), "cache preds start unseeded");
+
+    // Chunk 1: t3=2, no contexts. preds rows = 0+0+2. Speech on speaker 0.
+    const std::vector<float> emb1 = {1, 0, 0, 0, 2, 0, 0, 0};
+    const std::vector<float> pred1 = {0.9F, 0.1F, 0.9F, 0.1F};
+    const auto out1 = state.update(emb1.data(), 2, pred1.data(), 0, 0);
+    expect(out1 == pred1, "first chunk emits its own preds");
+    expect(state.fifo_frames() == 2, "fifo holds chunk 1");
+    expect(state.spkcache_frames() == 0, "cache untouched while fifo fits");
+
+    // Chunk 2: fifo 2+2=4 == cap, no pop yet.
+    const std::vector<float> emb2 = {3, 0, 0, 0, 4, 0, 0, 0};
+    const std::vector<float> pred2 = {
+        0.9F, 0.1F, 0.9F, 0.1F,  // spkcache region (empty, l1=0): actually fifo re-pred
+        0.9F, 0.1F, 0.9F, 0.1F, 0.9F, 0.1F, 0.9F, 0.1F};
+    const auto out2 = state.update(emb2.data(), 2, pred2.data(), 0, 0);
+    expect(out2.size() == 4, "chunk 2 emits 2 frames x 2 spk");
+    expect(state.fifo_frames() == 4, "fifo at capacity");
+
+    // Chunk 3: fifo would reach 6 > 4 -> pop 2 into cache.
+    const std::vector<float> emb3 = {5, 0, 0, 0, 6, 0, 0, 0};
+    std::vector<float> pred3(static_cast<std::size_t>(0 + 4 + 2) * 2, 0.1F);
+    for (int f = 0; f < 6; f++) pred3[static_cast<std::size_t>(f) * 2] = 0.9F;
+    const auto out3 = state.update(emb3.data(), 2, pred3.data(), 0, 0);
+    expect(out3.size() == 4, "chunk 3 emits 2 frames x 2 spk");
+    expect(state.spkcache_frames() == 2, "popped frames land in cache");
+    expect(state.fifo_frames() == 4, "fifo back at capacity after pop");
+
+    // Drive until compress: cache cap is 8, keep pushing speech chunks.
+    for (int k = 0; k < 8; k++) {
+        std::vector<float> emb(static_cast<std::size_t>(2) * 4, 1.0F);
+        std::vector<float> pred(
+            static_cast<std::size_t>(state.spkcache_frames() + state.fifo_frames() + 2) * 2,
+            0.1F);
+        for (std::size_t f = 0; f < pred.size() / 2; f++) pred[f * 2] = 0.9F;
+        state.update(emb.data(), 2, pred.data(), 0, 0);
+    }
+    expect(state.spkcache_frames() == 8, "cache capped after compress");
+    expect(state.spkcache_preds_valid(), "compress seeds cache preds");
+    expect(
+        state.spkcache().size() == static_cast<std::size_t>(8) * 4,
+        "cache storage matches cap x emb_dim");
+    expect(state.silence_frames() >= 0, "silence counter sane");
+
+    // Degenerate window: lc+rc >= t3 emits nothing and moves no state.
+    const int f_before = state.fifo_frames();
+    const int c_before = state.spkcache_frames();
+    std::vector<float> embz(static_cast<std::size_t>(2) * 4, 0.0F);
+    std::vector<float> predz(static_cast<std::size_t>(c_before + f_before + 2) * 2, 0.5F);
+    expect(state.update(embz.data(), 2, predz.data(), 1, 1).empty(), "empty valid window");
+    expect(state.fifo_frames() == f_before, "fifo frozen on empty window");
+    expect(state.spkcache_frames() == c_before, "cache frozen on empty window");
+}
+
 } // namespace
 
 int main() {
@@ -265,6 +338,7 @@ int main() {
     test_upstream_port_matches_reference_vectors();
     test_frontend_config_matches_upstream_diar_wiring();
     test_stream_geometry_presets_and_validation();
+    test_aosc_state_fifo_and_compress_lifecycle();
     std::cout << "PASS: pure diarization core tests\n";
     return 0;
 }

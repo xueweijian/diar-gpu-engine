@@ -132,4 +132,63 @@ void validate_stream_geometry(
     const StreamGeometry& geometry, int num_speakers, int sil_frames_per_spk,
     int pos_emb_max_len);
 
+// AOSC scoring constants, model-tied (from GGUF sortformer.scoring.*).
+// Pinned against NeMo-Speech.cpp a5b6953 sortformer_model.h DiarScoringConfig.
+struct AoscScoringConfig {
+    int sil_frames_per_spk = 3;
+    float pred_score_threshold = 0.25F;
+    float scores_boost_latest = 0.05F;
+    float sil_threshold = 0.2F;
+    float strong_boost_rate = 0.75F;
+    float weak_boost_rate = 1.5F;
+    float min_pos_scores_rate = 0.5F;
+};
+
+// Arrival-Order Speaker Cache streaming state, mirroring upstream AoscState
+// (NeMo-Speech.cpp a5b6953 src/asr/diar/aosc_state.h/.cpp — host-side port
+// of NeMo's SortformerModules.streaming_update / _compress_spkcache).
+// Pure host-side float logic, no model dependency: update/compress move
+// embeddings and predictions between FIFO and speaker cache. Embeddings are
+// opaque blobs here (emb_dim floats per frame); the engine fills them in M2.
+class AoscState {
+public:
+    AoscState(
+        const StreamGeometry& geometry, const AoscScoringConfig& scoring, int num_speakers,
+        int emb_dim);
+
+    // One streaming update after a model chunk. chunk_embs holds t3 frames of
+    // emb_dim (including lc/rc, trimmed internally); preds holds
+    // (spkcache_frames + fifo_frames + t3) x num_speakers. Returns the
+    // emitted chunk predictions ((t3 - lc - rc) x num_speakers), empty when
+    // the valid window is non-positive.
+    std::vector<float> update(
+        const float* chunk_embs, int t3, const float* preds, int lc, int rc);
+
+    int spkcache_frames() const { return spk_frames_; }
+    int fifo_frames() const { return fifo_frames_; }
+    const std::vector<float>& spkcache() const { return spkcache_; }
+    const std::vector<float>& fifo() const { return fifo_; }
+    bool spkcache_preds_valid() const { return !spkcache_preds_.empty(); }
+    const std::vector<float>& spkcache_preds() const { return spkcache_preds_; }
+    const std::vector<float>& mean_sil_emb() const { return mean_sil_emb_; }
+    long long silence_frames() const { return silence_frames_; }
+
+private:
+    void accumulate_silence(const float* embs, const float* preds, int n);
+    void compress(const std::vector<float>& cache_preds);
+
+    StreamGeometry geometry_;
+    AoscScoringConfig scoring_;
+    int num_speakers_;
+    int emb_dim_;
+
+    std::vector<float> spkcache_;
+    std::vector<float> spkcache_preds_;
+    int spk_frames_ = 0;
+    std::vector<float> fifo_;
+    int fifo_frames_ = 0;
+    std::vector<float> mean_sil_emb_;
+    long long silence_frames_ = 0;
+};
+
 } // namespace diar
