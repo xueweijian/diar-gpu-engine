@@ -8,12 +8,16 @@ v7（commit `1d2a77e`，determinism env-knob sweep）状态 pass
 （2026-09-14，00:37–01:27 UTC，约 50 分钟）：v6 因 harness dataset
 版本 skew（`diarize_once() got an unexpected keyword argument 'env'`）
 ERROR（12.8B/s 传了 31 分钟推新版 harness 后重推 v7 通过）。
+v8（commit `bac5183`，pipeline-knob sweep：batching/几何/offline 全注意力）
+状态 pass（2026-09-14，10:48–11:41 UTC，约 53 分钟；构建 ~1082s；
+report schema v3）。
 原始报告（Kaggle 产出物 `sortformer_matrix_report.json`，随内核输出存档，
 按 `.gitignore` 约定不进 git，见 benchmarks/README 说明；
 v5 报告另存 `/var/minis/shared/diar-gpu-engine/v5-sortformer_matrix_report.json`，
-v7 报告另存 `/var/minis/shared/diar-gpu-engine/v7-sortformer_matrix_report.json`）；
-18 条 schema 记录：`benchmarks/results/m1-sortformer-p100-matrix.jsonl`
-（1–6 行 v4，7–12 行 v5，13–18 行 v7 streaming round；
+v7 报告另存 `/var/minis/shared/diar-gpu-engine/v7-sortformer_matrix_report.json`，
+v8 报告另存 `/var/minis/shared/diar-gpu-engine/v8-sortformer_matrix_report.json`）；
+24 条 schema 记录：`benchmarks/results/m1-sortformer-p100-matrix.jsonl`
+（1–6 行 v4，7–12 行 v5，13–18 行 v7 streaming round，19–24 行 v8 streaming round；
 `commit` 字段 hardcode `d00a769` 为旧值，数字不受影响）。
 
 范围重申：纯说话人日志（no ASR/tokenizer/转写）。本轮只测时间，
@@ -180,6 +184,58 @@ blocking+`CUBLAS_WORKSPACE_CONFIG=:4096:8` /
 （+33%）、mid_offline 5.84s→6.52s（+12%）；no_f16 几乎无代价
 （10.30s→10.30s / 5.84s→5.84s）但同样不收敛。
 
+## 9. v8 pipeline-knob sweep（2026-09-14 pass，10:48–11:41 UTC）
+
+v8 streaming round 六点（jsonl 19–24 行）与 v4/v5/v7 同量级，
+timing 基线第四次复现：short 2.08s（RTF 0.0367，9 段 3 spk）/
+mid 11.09s（RTF 0.0310，41 段 3 spk——段数继续漂）/
+long 321.2s（RTF 0.0499，1420 段 **1 spk**——v7 也是 1419 段 1 spk，
+mid/long 跑间漂移已是常态）/
+synth 9.23/28.71/62.55s。计时稳定，可继续复用为 engine 基线。
+
+sweep 设计：3 个 case（short_streaming / mid_streaming /
+mid_offline=`--preset offline`）× 4 套 pipeline 旋钮
+（baseline / `--no-batching` / 显式 `--diar-chunk 20 --diar-fifo 80
+--diar-spkcache 160` 即 streaming 几何 / `--offline` 全注意力单 pass），
+每套 3 跑，共 36 次 diar 化。本地测试锁定四项契约
+（baseline-first 顺序 / flag 白名单 / fixed==preset 几何 /
+extra_args 透传到子进程 + verdict/knob 传播两用例）。
+
+| case | baseline（3 跑） | no_batching | fixed_chunk | offline_full | 结论 |
+|---|---|---|---|---|---|
+| short_streaming | 1 hash（确定） | 同 hash ✓ | 同 hash ✓ | 自洽 1 hash，与 stream 不同 ✗ | streaming 三套**完全同一 body**（9/9 同 hash）；offline 自确定但不同输出 |
+| mid_streaming | 3 hash（漂） | 3 hash，全与 baseline 不同 ✗ | 3 hash，全不同 ✗ | 自洽 1 hash，与 stream 不同 ✗ | batching/显式几何**全没收敛**（各 3 hash 互不相交） |
+| mid_offline | 3 hash（漂） | 2 hash（漂） | 3 hash，全不同 ✗ | 自洽 1 hash，**跨 preset 与 mid_streaming 的 offline_full 同一 hash** ✓ | AOSC 几何三套全漂；全注意力单 pass 两次跨 preset 完全一致 |
+
+四点结论：
+
+1. **排除项（新证据）**：目录 batching（workers>1 才生效，单文件恒不
+   batch——no_batching 与 baseline 同 hash / 不同 hash 的对照本身证明了
+   batching 路径无辜）、chunk/fifo/spkcache 显式几何传参
+   （fixed_chunk 与 preset 默认几何同 hash / 各自漂移，传参层无辜）。
+   若漂移来自这两层，至少一套旋钮应收敛或与 baseline 对齐。
+2. **最大发现：`--offline` 全注意力单 pass 是确定的**——mid 在两个
+   preset 下（mid_streaming.offline_full 与 mid_offline.offline_full）
+   rep0 hash 完全一致（`999fb4ba…`），各自 3 跑 unique=1。
+   而 AOSC 路径（streaming preset 默认几何 + offline preset 大 chunk）
+   在同一文件上全部跑间漂移。**漂移定位到 AOSC 流式状态路径**，
+   全注意力单 pass 无此问题。
+3. **对 parity 的含义**：AOSC 路径的跑间漂移从 5 轮证据变成 7 轮
+   （v4/v5/v7-stream/v7-mid-off/v7-sweep/v8-stream/v8-off——
+   offline preset 同样漂，排除"只是 streaming 小 chunk 竞争"）。
+   反过来，全注意力 `--offline` 给出了一条**确定性对照基线**：
+   精度门可先在 offline_full 上做单点对比（确定），AOSC 路径仍须分布。
+4. **速度 side**：short offline_full 1.00s vs streaming 2.07s（2.07x）；
+   mid offline_full 6.90s vs streaming 11.01s（1.60x）；
+   mid_offline preset AOSC 6.44s vs streaming AOSC 11.01s（1.71x，
+   大 chunk 几何本身快）；并发 c1→c4 1.24x 复现（v4/v5 第三次）；
+   chunk-vs-whole 仍不等价（同 9 段不同 body，边界效应复现）。
+
+附带：mid_offline.no_batching 一套内 2 hash（非 3）——仍是漂，
+只是两次跑偶然撞同 hash，不读作收敛（pairwise_with_rep0=0.33 同级）。
+offline preset 下 `--offline`（6.90s）反而比 AOSC 大 chunk（6.44s）慢——
+全注意力单 pass 的计算量大于大 chunk 流式，速度/确定性各有代价。
+
 ## 给 engine 设计的输入（M2 可用）
 
 - P100 + Q8_0 + batch 1 streaming：短/中 ~30–34x 实时，长语音密集输入 ~21x。
@@ -199,8 +255,13 @@ blocking+`CUBLAS_WORKSPACE_CONFIG=:4096:8` /
    剩余归因：real_long 超线性中"长度 vs 内容"仍未完全分开
    （synth 无语音对照已有，缺"同长度不同语音密度"的中间点）。
 3. offline vs streaming 的精度对照（DER/frame agreement），进 M1 parity 门——
-   前提是先接受"同一几何内部亦有跑间漂移"（§5、§8 五轮证据），
-   精度门须用多次跑的分布而非单点。
-4. 非确定来源下一批旋钮：`CUDNN_DETERMINISTIC=1`、batch/并发粒度、
-   固定 chunk 几何对照（v8 候选）。
+   前提是先接受"同一几何内部亦有跑间漂移"（§5、§8 七轮证据），
+   精度门须用多次跑的分布而非单点；**但 `--offline` 全注意力确定
+   （§9），可先做单点对照**。
+4. ~~非确定来源下一批旋钮：`CUDNN_DETERMINISTIC=1`、batch/并发粒度、
+   固定 chunk 几何对照（v8 候选）~~ ✓ v8 已做后两项（见 §9）：
+   batching/几何传参排除，漂移定位到 AOSC 流式状态路径。
+   剩余候选：`CUDNN_DETERMINISTIC=1`、Thrust/归约顺序
+   （仅 AOSC 路径漂、全注意力不漂的对照已大幅缩小范围——
+   若漂移在 GEMM/归约底层，全注意力同样应漂）。
 5. 以上均为 timing/结构实验，不动 engine 实现。
