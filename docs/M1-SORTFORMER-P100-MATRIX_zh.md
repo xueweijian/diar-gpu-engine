@@ -4,11 +4,17 @@
 04:23–05:09 UTC，约 46 分钟；其中构建 ~993s）。
 v5（commit `5440375`）状态 pass（2026-09-13，05:55–06:42 UTC，
 约 47 分钟；构建 ~976s；report schema v2）。
+v7（commit `1d2a77e`，determinism env-knob sweep）状态 pass
+（2026-09-14，00:37–01:27 UTC，约 50 分钟）：v6 因 harness dataset
+版本 skew（`diarize_once() got an unexpected keyword argument 'env'`）
+ERROR（12.8B/s 传了 31 分钟推新版 harness 后重推 v7 通过）。
 原始报告（Kaggle 产出物 `sortformer_matrix_report.json`，随内核输出存档，
 按 `.gitignore` 约定不进 git，见 benchmarks/README 说明；
-v5 报告另存 `/var/minis/shared/diar-gpu-engine/v5-sortformer_matrix_report.json`）；
-12 条 schema 记录：`benchmarks/results/m1-sortformer-p100-matrix.jsonl`
-（1–6 行 v4，7–12 行 v5；`commit` 字段 hardcode `d00a769` 为旧值，数字不受影响）。
+v5 报告另存 `/var/minis/shared/diar-gpu-engine/v5-sortformer_matrix_report.json`，
+v7 报告另存 `/var/minis/shared/diar-gpu-engine/v7-sortformer_matrix_report.json`）；
+18 条 schema 记录：`benchmarks/results/m1-sortformer-p100-matrix.jsonl`
+（1–6 行 v4，7–12 行 v5，13–18 行 v7 streaming round；
+`commit` 字段 hardcode `d00a769` 为旧值，数字不受影响）。
 
 范围重申：纯说话人日志（no ASR/tokenizer/转写）。本轮只测时间，
 DER/JER/frame agreement 一律未评分（`accuracy.status: not_scored`）。
@@ -125,7 +131,6 @@ engine 改动的差异。
 语义（边界重叠/投票）并进 parity 门单独记账，不能默认等价。
 
 ## 7. v5 附带观测
-
 - offline 短输入 body 确定（两跑同 hash，9 段 4 spk）；
   offline 中输入两跑段数一致（34/34）但 body 不同——offline 也不完全确定。
 - off/stream 分歧复现：short 4 spk vs 3 spk（与 v4 一致），
@@ -135,6 +140,45 @@ engine 改动的差异。
 - 长度拟合（v5 streaming 六点）：marginal RTF ≈ 0.050（~20x），
   截距 −11.05s（全量）/ −3.98s（仅真实）——负截距复现，
   超线性结论不变。
+
+## 8. v7 determinism env-knob sweep（2026-09-14 pass，00:37–01:27 UTC）
+
+v7 streaming round 六点（jsonl 13–18 行）与 v4/v5 同量级，
+timing 基线三次复现一致：short 1.91s（RTF 0.0336）/
+mid 10.22s（RTF 0.0286，39 段 3 spk）/
+long 309.4s（RTF 0.0481，1419 段 1 spk——段数/说话人数继续漂）/
+synth 8.70/26.96/58.94s。计时稳定，可继续复用为 engine 基线。
+
+sweep 设计：3 个 case（short_streaming / mid_streaming / mid_offline）
+× 4 套 env（baseline 空对照 / `CUDA_LAUNCH_BLOCKING=1` /
+blocking+`CUBLAS_WORKSPACE_CONFIG=:4096:8` /
+`GGML_SKINNY_Q8_CUBLAS_F16=0`），每套 3 跑，共 36 次 diar 化。
+`DET_SETS[0]` 为空 baseline 的契约由本地测试锁定
+（`tests/test_sortformer_matrix.py::test_det_sets_first_is_empty_baseline`）。
+
+| case | baseline（3 跑） | cuda_blocking | cublas_workspace | no_f16_cublas | 结论 |
+|---|---|---|---|---|---|
+| short_streaming | 1 hash（确定） | 同 baseline hash ✓ | 同 baseline hash ✓ | 同 baseline hash ✓ | 短输入在四套 env 下**完全一致**（12/12 同一 body） |
+| mid_streaming | 3 hash（漂） | 3 hash，与 baseline rep0 全不同 ✗ | 3 hash，全不同 ✗ | 3 hash，全不同 ✗ | 同步执行/cuBLAS 确定性 workspace/禁 F16 **三个全没收敛** |
+| mid_offline | 3 hash（漂） | 3 hash，全不同 ✗ | 3 hash，全不同 ✗ | 3 hash，全不同 ✗ | offline 同样不收敛——漂移不在 streaming 独有路径 |
+
+三点结论：
+
+1. **排除项（新证据）**：CUDA 内核异步发射顺序、cuBLAS workspace
+   算法选择、Q8 skinny GEMM 的 F16 累加——三层全不是 mid 漂移的主因。
+   若漂移来自这三层，至少一套旋钮应收敛到 unique=1 或与 baseline 对齐。
+2. **剩余候选上移**：cuDNN（sortformer 用卷积下采样/Conformer 卷积模块）、
+   Thrust/归约顺序、batch 粒度/AOSC 状态竞争、chunk 边界条件。
+   下一步 sweep 应换这批旋钮（`CUDNN_DETERMINISTIC=1`、
+   不同 batch/并发、固定 chunk 几何对照）。
+3. **对 parity 的含义不变且更硬**：mid 在 streaming/offline、开/关确定性
+   旋钮下全部 3-hash 全漂——"同一几何内部亦有跑间漂移"（§5）从 2 轮证据
+   变成 5 轮（v4/v5/v7-stream/v7-mid-off/v7-sweep）。精度门必须用多次跑
+   的分布，单点 DER 对比无意义。
+
+附带：blocking 旋钮 wall 代价可测——mid_streaming 10.30s→13.69s
+（+33%）、mid_offline 5.84s→6.52s（+12%）；no_f16 几乎无代价
+（10.30s→10.30s / 5.84s→5.84s）但同样不收敛。
 
 ## 给 engine 设计的输入（M2 可用）
 
@@ -155,5 +199,8 @@ engine 改动的差异。
    剩余归因：real_long 超线性中"长度 vs 内容"仍未完全分开
    （synth 无语音对照已有，缺"同长度不同语音密度"的中间点）。
 3. offline vs streaming 的精度对照（DER/frame agreement），进 M1 parity 门——
-   前提是先接受"同一几何内部亦有跑间漂移"（§5），精度门须用多次跑的分布而非单点。
-4. 以上均为 timing/结构实验，不动 engine 实现。
+   前提是先接受"同一几何内部亦有跑间漂移"（§5、§8 五轮证据），
+   精度门须用多次跑的分布而非单点。
+4. 非确定来源下一批旋钮：`CUDNN_DETERMINISTIC=1`、batch/并发粒度、
+   固定 chunk 几何对照（v8 候选）。
+5. 以上均为 timing/结构实验，不动 engine 实现。
