@@ -328,6 +328,73 @@ void test_aosc_state_fifo_and_compress_lifecycle() {
     expect(state.spkcache_frames() == c_before, "cache frozen on empty window");
 }
 
+void test_channel_birth_gate_lifecycle() {
+    // Lifecycle contract against upstream ChannelBirthGate (a5b6953).
+    // Differential bit-parity vs upstream's own code is proven by the
+    // out-of-tree oracle (/tmp/birth_oracle, 7000 episode streams green);
+    // this in-tree test pins the observable lifecycle for CI.
+    diar::ChannelBirthGate gate(2);
+    expect(!gate.is_established(0), "no channel established at start");
+    expect(!gate.is_established(1), "no channel established at start");
+    expect(!gate.is_established(-1) && !gate.is_established(2),
+           "out-of-range speaker is never established");
+
+    bool threw = false;
+    try {
+        std::vector<float> timeline;
+        gate.append({0.5F}, timeline);  // 1 value, n_spk=2 -> incomplete
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    expect(threw, "incomplete probability frame must throw");
+
+    // Clean birth: channel 0 at 0.96 with channel 1 quiet, 4 frames.
+    std::vector<float> timeline;
+    for (int f = 0; f < 4; f++) {
+        gate.append({0.96F, 0.01F}, timeline);
+    }
+    expect(gate.is_established(0), "clean run establishes channel 0");
+    expect(!gate.is_established(1), "quiet channel stays unestablished");
+    expect(timeline.size() == 8, "timeline holds 4 frames x 2 spk");
+
+    // Unestablished channel folds into the strongest established one.
+    gate.append({0.10F, 0.80F}, timeline);
+    const std::size_t n = timeline.size();
+    expect(timeline[n - 2] == 0.80F, "established keeps max folded prob");
+    expect(timeline[n - 1] == 0.0F, "unestablished folds to zero");
+
+    // Fading handoff: fresh gate, channel 0 established, then channel 1
+    // at 0.91 while channel 0 stays at 0.10 (<= 0.15) for 20 frames.
+    diar::ChannelBirthGate gate2(2);
+    std::vector<float> t2;
+    for (int f = 0; f < 4; f++) {
+        gate2.append({0.96F, 0.01F}, t2);
+    }
+    expect(gate2.is_established(0), "gate2 channel 0 established");
+    for (int f = 0; f < 20; f++) {
+        gate2.append({0.10F, 0.91F}, t2);
+    }
+    expect(gate2.is_established(1), "fading handoff establishes channel 1");
+
+    // Revision: the late birth rewrites the tail from raw, so the folded
+    // frames before establishment come back as raw probabilities.
+    bool found_raw = false;
+    for (std::size_t i = 8; i < t2.size(); i += 2) {
+        if (t2[i] == 0.10F && t2[i + 1] == 0.91F) {
+            found_raw = true;
+            break;
+        }
+    }
+    expect(found_raw, "revision restores raw tail after new establishment");
+
+    // Reset returns to the initial state.
+    gate2.reset();
+    expect(!gate2.is_established(0) && !gate2.is_established(1), "reset clears");
+    std::vector<float> t3;
+    gate2.append({0.10F, 0.80F}, t3);  // nobody established -> passthrough
+    expect(t3[0] == 0.10F && t3[1] == 0.80F, "no establishment means no relabel");
+}
+
 } // namespace
 
 int main() {
@@ -339,6 +406,7 @@ int main() {
     test_frontend_config_matches_upstream_diar_wiring();
     test_stream_geometry_presets_and_validation();
     test_aosc_state_fifo_and_compress_lifecycle();
+    test_channel_birth_gate_lifecycle();
     std::cout << "PASS: pure diarization core tests\n";
     return 0;
 }

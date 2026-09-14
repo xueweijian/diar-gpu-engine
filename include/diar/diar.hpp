@@ -191,4 +191,39 @@ private:
     long long silence_frames_ = 0;
 };
 
+// Transient-channel guard, mirroring upstream ChannelBirthGate
+// (NeMo-Speech.cpp a5b6953 src/asr/diar/aosc_state.h/.cpp).
+// A channel becomes established only after a short clean run
+// (4 frames >= 0.95 while established channels stay <= 0.02) or a
+// fading handoff (20 frames >= 0.90 while established stay <= 0.15);
+// an episode gap of 25 frames resets the counters. Until established,
+// a channel's probability is folded into the strongest established
+// channel (relabel). When a channel newly establishes, the last
+// 128 frames of the timeline are rewritten from raw and relabeled.
+// Pure host-side float logic, no model dependency.
+class ChannelBirthGate {
+public:
+    explicit ChannelBirthGate(int num_speakers);
+
+    void reset();
+    // Appends raw chunk probs (multiple of num_speakers) to timeline,
+    // relabeling new frames and revising the tail on new establishments.
+    // Throws std::invalid_argument on an incomplete probability frame.
+    void append(const std::vector<float>& raw, std::vector<float>& timeline);
+    bool is_established(int speaker) const;
+
+private:
+    bool observe(const float* probs);
+    void relabel(float* probs) const;
+    void push_raw(const float* probs);
+
+    int num_speakers_;
+    long long frame_ = 0;
+    std::vector<std::uint8_t> established_;
+    std::vector<int> clean_frames_;
+    std::vector<int> fading_frames_;
+    std::vector<long long> last_win_;
+    std::vector<float> raw_ring_;
+};
+
 } // namespace diar
