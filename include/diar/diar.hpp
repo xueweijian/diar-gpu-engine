@@ -44,6 +44,39 @@ struct Segment {
     std::uint32_t speaker = 0; // Public labels are 1-based.
 };
 
+// Sortformer v2 frontend configuration, mirroring the pinned upstream
+// (NeMo-Speech.cpp a5b6953: sortformer_model.h SortformerModelConfig FE
+// block + src/asr/features/fe.h MelSpecConfig + the diarizer's own wiring
+// in src/asr/diar/diar_pipeline.cpp make_fe_cfg). Only the fields the M2
+// engine needs to reproduce byte-compatible mel frames are listed.
+// Diar-specific wiring (differs from MelSpecConfig defaults and from the
+// ASR path — verified in diar_pipeline.cpp, not assumed):
+//   stft_center_window=true + hann_periodic=false (NeMo torch.stft parity);
+//   per-feature normalize=false (FE-internal); offline peak-normalizes the
+//   waveform first (x * 1/(max(x)+1e-3)), streaming does NOT.
+struct FrontendConfig {
+    int sample_rate = 16000;
+    float window_size_sec = 0.025F;
+    float window_stride_sec = 0.01F;
+    int n_fft = 512;
+    int n_mels = 128;
+    float preemph = 0.97F;
+    // NeMo FilterbankFeatures "add"-type guard: silence bins land on the
+    // log floor, so this exact 2^-24 value matters for parity, not just
+    // any small epsilon.
+    float log_zero_guard = 5.9604645e-8F;
+    // Diar wiring: centered STFT + symmetric (non-periodic) Hann.
+    bool hann_periodic = false;
+    bool center_window = true;
+    bool reflect_pad_left = true;
+    // FE-internal per-feature normalization is off; normalization lives
+    // outside the FE (offline peak gain only, streaming none).
+    bool normalize_per_feature = false;
+    // Offline-only peak normalization: x * 1/(max(x) + eps), eps = 1e-3.
+    bool offline_peak_normalize = true;
+    float offline_peak_eps = 1e-3F;
+};
+
 // Returns frame-major 0/1 activity after per-speaker hysteresis.
 std::vector<std::uint8_t> hysteresis_activity(
     const FrameProbabilities& probabilities, const SegmentationConfig& config);

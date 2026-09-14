@@ -169,6 +169,29 @@ void test_upstream_port_matches_reference_vectors() {
     expect(gap_segs.size() == 2, "gap equal to threshold must not merge");
 }
 
+void test_frontend_config_matches_upstream_diar_wiring() {
+    // Pinned against NeMo-Speech.cpp a5b6953:
+    // sortformer_model.h SortformerModelConfig (FE values) +
+    // src/asr/diar/diar_pipeline.cpp make_fe_cfg (diar wiring, NOT the
+    // MelSpecConfig defaults and NOT the ASR path's legacy placement).
+    // If upstream changes any value, this test forces us to update the
+    // struct instead of silently drifting out of parity.
+    diar::FrontendConfig cfg;
+    expect(cfg.sample_rate == 16000, "frontend sample rate");
+    expect(cfg.n_fft == 512, "frontend n_fft");
+    expect(cfg.n_mels == 128, "frontend n_mels (diar, not the 80 default)");
+    expect_near(cfg.window_size_sec, 0.025, 1e-9, "frontend window size");
+    expect_near(cfg.window_stride_sec, 0.01, 1e-9, "frontend window stride");
+    expect_near(cfg.preemph, 0.97, 1e-6, "frontend preemphasis");
+    expect_near(cfg.log_zero_guard, 5.9604645e-8, 1e-15, "frontend log guard 2^-24");
+    // Diar wiring — the three fields that differ from naive defaults:
+    expect(cfg.center_window, "diar uses centered STFT");
+    expect(!cfg.hann_periodic, "diar uses symmetric (non-periodic) Hann");
+    expect(!cfg.normalize_per_feature, "FE-internal normalize is off for diar");
+    expect(cfg.offline_peak_normalize, "offline peak-normalizes the waveform");
+    expect_near(cfg.offline_peak_eps, 1e-3, 1e-9, "offline peak eps");
+}
+
 } // namespace
 
 int main() {
@@ -177,6 +200,7 @@ int main() {
     test_gap_fill_and_min_duration();
     test_metrics_and_validation();
     test_upstream_port_matches_reference_vectors();
+    test_frontend_config_matches_upstream_diar_wiring();
     std::cout << "PASS: pure diarization core tests\n";
     return 0;
 }
