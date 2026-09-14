@@ -73,19 +73,34 @@ REPORT: dict[str, object] = {
     "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
 }
 
-# v6 determinism probes: same binary, same audio, only the child-process env
-# differs between sets. A knob that collapses run-to-run drift identifies the
-# layer that drifts; a knob that changes nothing eliminates its layer.
-# (CUBLAS_WORKSPACE_CONFIG=:4096:8 is cuBLAS's documented deterministic
-# setting, cf. PyTorch determinism guides.)
-DET_SETS: list[tuple[str, dict[str, str]]] = [
-    ("baseline", {}),
-    ("cuda_blocking", {"CUDA_LAUNCH_BLOCKING": "1"}),
-    ("cublas_workspace", {
-        "CUDA_LAUNCH_BLOCKING": "1",
-        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-    }),
-    ("no_f16_cublas", {"GGML_SKINNY_Q8_CUBLAS_F16": "0"}),
+# v8 pipeline-knob sweep: same binary, same audio, only the CLI flags/env
+# differ between sets. v7 excluded the CUDA/cuBLAS layer (async launch,
+# workspace algorithm choice, F16 accumulation); v8 moves the probes up to
+# the diarization pipeline itself, all via flags the pinned CLI accepts
+# (NeMo-Speech.cpp a5b6953 app/diarize.cpp):
+#   baseline    — no knobs (control; set[0] must stay knob-free, the
+#                 cross-set comparison keys on it);
+#   no_batching — --no-batching isolates GPU dynamic-batching nondeterminism.
+#                 NOTE: batching only engages when workers > 1 (directory
+#                 input, diarize.cpp:222); single-file runs never batch, so
+#                 this set is expected to match baseline on single-file cases
+#                 and only informative on directory/concurrency probes;
+#   fixed_chunk — explicit --diar-chunk 20 --diar-fifo 80 --diar-spkcache 160
+#                 (= streaming preset defaults in aosc_state.h) isolates
+#                 chunk-boundary vs AOSC-state drift: if preset resolution
+#                 itself drifts, explicit geometry diverges from baseline;
+#   offline_full— --offline = full-attention single pass with NO streaming
+#                 state, vs --preset offline (= larger AOSC streaming chunks).
+#                 If offline_full is identical across reps while streaming
+#                 drifts, the drift lives in AOSC state, not the model.
+# Each set is (name, extra_args, env): extra_args reach nemo-speech via
+# h.diarize_once(extra_args=...), env reaches the child via h.run(env=...).
+DET_SETS_V8: list[tuple[str, list[str], dict[str, str]]] = [
+    ("baseline", [], {}),
+    ("no_batching", ["--no-batching"], {}),
+    ("fixed_chunk", ["--diar-chunk", "20", "--diar-fifo", "80",
+                     "--diar-spkcache", "160"], {}),
+    ("offline_full", ["--offline"], {}),
 ]
 N_DET_REPEAT = int(os.environ.get("DIAR_DET_REPEAT", "3"))
 
@@ -227,23 +242,23 @@ def run_det_sweep(
     binary: Path,
     cases: list[tuple[str, Path, str | None]],
 ) -> dict[str, object]:
-    """v6: same audio x env-knob sets, repeated sequential single-file runs.
+    """v8: same audio x pipeline-knob sets, repeated sequential single-file runs.
 
     Each case is (label, audio, preset). Inside one case the binary, audio,
     preset, recording-id and working directory are all fixed; the only thing
-    that varies between sets is the child env (see DET_SETS). Every set runs
-    N_DET_REPEAT sequential `diarize` invocations so the verdict compares
-    like with like: does this knob collapse the run-to-run drift that v5
-    measured, or leave it untouched?
+    that varies between sets is extra CLI flags / child env (see DET_SETS_V8).
+    Every set runs N_DET_REPEAT sequential `diarize` invocations so the verdict
+    compares like with like: does this knob collapse the run-to-run drift that
+    v5/v7 measured, or leave it untouched?
     """
     import hashlib
 
-    sweep: dict[str, object] = {"sets": DET_SETS, "repeat": N_DET_REPEAT, "cases": []}
+    sweep: dict[str, object] = {"sets": DET_SETS_V8, "repeat": N_DET_REPEAT, "cases": []}
     for label, audio, preset in cases:
         case_dir = h.WORK_ROOT / "det_sweep" / label
         case_dir.mkdir(parents=True, exist_ok=True)
         case_entry: dict[str, object] = {"label": label, "preset": preset, "sets": []}
-        for set_name, env in DET_SETS:
+        for set_name, extra_args, env in DET_SETS_V8:
             bodies: list[str] = []
             hashes: list[str] = []
             walls: list[float] = []
@@ -252,7 +267,7 @@ def run_det_sweep(
                 out = case_dir / f"{set_name}.rep{rep}.rttm"
                 result = h.diarize_once(
                     binary, audio, out, device="cuda:0", preset=preset,
-                    extra_args=None, timeout=3600, env=dict(env),
+                    extra_args=list(extra_args), timeout=3600, env=dict(env),
                 )
                 if result["returncode"] != 0:
                     ok = False
@@ -265,6 +280,7 @@ def run_det_sweep(
             unique = sorted(set(hashes))
             case_entry["sets"].append({
                 "name": set_name,
+                "extra_args": list(extra_args),
                 "env": dict(env),
                 "returncode_ok": ok,
                 "runs": N_DET_REPEAT if ok else len(hashes),
