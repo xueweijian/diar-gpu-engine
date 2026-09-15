@@ -14,4 +14,4 @@ ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   -I"$ROOT/include" "$ROOT/src/fe.cpp" "$ROOT/tests/fe_oracle.cpp" -o "$BUILD/fe_oracle"
 "$BUILD/fe_oracle"
-python3 -m pytest "$ROOT/tests/test_harness.py" "$ROOT/tests/test_sortformer_matrix.py" "$ROOT/tests/test_probdump.py" "$ROOT/tests/test_prob_sweep.py" -q
+python3 -m pytest "$ROOT/tests/test_harness.py" "$ROOT/tests/test_sortformer_matrix.py" "$ROOT/tests/test_probdump.py" "$ROOT/tests/test_prob_sweep.py" "$ROOT/tests/test_parity.py" -q
