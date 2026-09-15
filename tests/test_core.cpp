@@ -2,9 +2,11 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -395,6 +397,124 @@ void test_channel_birth_gate_lifecycle() {
     expect(t3[0] == 0.10F && t3[1] == 0.80F, "no establishment means no relabel");
 }
 
+void test_frontend_lengths_and_frame_counts() {
+    const diar::FrontendConfig cfg;
+    const diar::MelSpectrogramExtractor fe(cfg);
+    expect(fe.hop_length() == 160, "hop = 0.01 s * 16000 + 0.5 -> 160");
+    expect(fe.win_length() == 400, "win = 0.025 s * 16000 + 0.5 -> 400");
+    expect(fe.n_fft() == 512 && fe.n_mels() == 128, "diar wiring dims");
+
+    // n_frames = (padded.size() - n_fft)/hop + 1; reflect pads n_fft/2 left.
+    const std::vector<float> silence(16000, 0.0F);
+    std::vector<float> features;
+    int n_frames = 0;
+    fe.compute(silence.data(), silence.size(), features, n_frames,
+               /*reflect_left=*/true, /*normalize=*/false);
+    expect(n_frames == 101, "16 s of silence: 16000/160 + 1 frames");
+
+    fe.compute(nullptr, 0, features, n_frames, true, false);
+    expect(n_frames == 1, "empty input still emits one zero-padded frame");
+
+    std::vector<float> tiny(160, 0.25F);
+    fe.compute(tiny.data(), tiny.size(), features, n_frames, true, false);
+    expect(n_frames == 2, "one hop of audio: 2 frames");
+
+    // reflect_left=false drops the left pad -> one fewer hop of frames.
+    fe.compute(silence.data(), silence.size(), features, n_frames, false, false);
+    expect(n_frames == 99, "no left pad: (16000 + 256 - 512)/160 + 1 = 99");
+
+    // Silence must land exactly on the log guard floor.
+    expect(features[0] == std::log(0.0F + cfg.log_zero_guard),
+           "silent bins sit on log(guard) exactly");
+}
+
+void test_frontend_symmetric_hann() {
+    const diar::MelSpectrogramExtractor fe(diar::FrontendConfig{});
+    const auto& w = fe.window();
+    expect(w.size() == 400, "symmetric hann length 400");
+    expect(w[0] == 0.0F, "hann edge is zero");
+    expect_near(w[399], 0.0F, 1e-6F, "hann far edge ~ 0");
+    // Even-length symmetric hann has no tap exactly at the peak: the true
+    // max sits between taps 199 and 200, so w[200] = 1 - (pi/399)^2/4.
+    expect_near(w[200], 1.0F, 2e-5F, "hann near-peak at center tap");
+}
+
+void test_frontend_validation_and_basis() {
+    diar::FrontendConfig bad;
+    bad.n_fft = 1000;  // not a power of two
+    bool threw = false;
+    try {
+        const diar::MelSpectrogramExtractor fe(bad);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    expect(threw, "non power-of-two n_fft rejected");
+
+    const diar::MelSpectrogramExtractor fe(diar::FrontendConfig{});
+    const std::vector<float> wrong_shape(10, 0.5F);
+    threw = false;
+    try {
+        diar::MelSpectrogramExtractor mutable_fe(diar::FrontendConfig{});
+        mutable_fe.set_mel_basis(wrong_shape.data(), 4, 2);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    expect(threw, "basis shape mismatch rejected");
+
+    // Padded call rejects valid > total.
+    std::vector<float> features;
+    int n_frames = 0;
+    threw = false;
+    try {
+        fe.compute_padded(nullptr, 4, 8, features, n_frames, true, false);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    expect(threw, "valid_samples > n_samples rejected");
+}
+
+void test_frontend_determinism_and_preemph_effect() {
+    const diar::FrontendConfig cfg;
+    const diar::MelSpectrogramExtractor fe(cfg);
+    std::vector<float> audio(4000);
+    for (std::size_t i = 0; i < audio.size(); ++i)
+        audio[i] = std::sin(static_cast<double>(i) * 0.01F) * 0.8F;
+
+    std::vector<float> run1, run2;
+    int n1 = 0, n2 = 0;
+    fe.compute(audio.data(), audio.size(), run1, n1, true, false);
+    fe.compute(audio.data(), audio.size(), run2, n2, true, false);
+    expect(n1 == n2 && run1.size() == run2.size() &&
+               std::memcmp(run1.data(), run2.data(), run1.size() * sizeof(float)) == 0,
+           "same input twice is bit-identical");
+
+    diar::FrontendConfig no_preemph = cfg;
+    no_preemph.preemph = 0.0F;
+    const diar::MelSpectrogramExtractor fe_flat(no_preemph);
+    std::vector<float> run3;
+    int n3 = 0;
+    fe_flat.compute(audio.data(), audio.size(), run3, n3, true, false);
+    expect(std::memcmp(run1.data(), run3.data(), run1.size() * sizeof(float)) != 0,
+           "preemph changes the features (y[0]=x[0] alone cannot reproduce it)");
+}
+
+void test_frontend_offline_peak_normalize() {
+    const float eps = 1e-3F;
+    const std::vector<float> x = {0.5F, -0.25F, 0.5F};
+    const auto y = diar::offline_peak_normalize(x.data(), x.size(), eps);
+    expect_near(y[0], 0.5F / (0.5F + eps), 1e-7, "peak gain scales first sample");
+    expect_near(y[1], -0.25F / (0.5F + eps), 1e-7, "same gain applies throughout");
+
+    // Upstream quirk kept verbatim: max ignores negatives, so a negative-only
+    // signal amplifies instead of being attenuated.
+    const std::vector<float> neg = {-0.1F, -0.5F};
+    const auto z = diar::offline_peak_normalize(neg.data(), neg.size(), eps);
+    expect(std::fabs(z[1]) > std::fabs(neg[1]), "negative-only audio amplifies (upstream quirk)");
+
+    const auto empty = diar::offline_peak_normalize(nullptr, 0, eps);
+    expect(empty.empty(), "empty in, empty out");
+}
+
 } // namespace
 
 int main() {
@@ -407,6 +527,11 @@ int main() {
     test_stream_geometry_presets_and_validation();
     test_aosc_state_fifo_and_compress_lifecycle();
     test_channel_birth_gate_lifecycle();
+    test_frontend_lengths_and_frame_counts();
+    test_frontend_symmetric_hann();
+    test_frontend_validation_and_basis();
+    test_frontend_determinism_and_preemph_effect();
+    test_frontend_offline_peak_normalize();
     std::cout << "PASS: pure diarization core tests\n";
     return 0;
 }

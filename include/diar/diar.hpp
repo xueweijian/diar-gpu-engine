@@ -75,7 +75,77 @@ struct FrontendConfig {
     // Offline-only peak normalization: x * 1/(max(x) + eps), eps = 1e-3.
     bool offline_peak_normalize = true;
     float offline_peak_eps = 1e-3F;
+    // Mel filterbank range in Hz. fmax <= 0 means sample_rate/2 (resolved
+    // in the extractor constructor, mirroring upstream).
+    float fmin = 0.0F;
+    float fmax = 0.0F;
+    // Zero out STFT frames whose center falls beyond the valid samples.
+    // Off for the diar wiring (centered STFT emits the trailing partial
+    // frame and the model consumes it unmasked).
+    bool mask_invalid_frames = false;
 };
+
+// Faithful port of upstream log-mel extraction, CPU path
+// (NeMo-Speech.cpp a5b6953 src/asr/features/fe.{h,cpp}, the branch used by
+// diar_pipeline.cpp: DiarModel constructs the FE with a null backend manager,
+// so the ggml GPU graph is never built). Semantics pinned by the differential
+// oracle in tests/fe_oracle.cpp against the mechanically reskinned upstream
+// code: pre-emphasis on the raw signal (backward loop, y[0]=x[0]), zero-pad
+// n_fft/2 per side (left pad only when reflect_left; the streaming caller
+// pre-prepends real left context instead), centered or right-aligned Hann
+// placement, iterative radix-2 FFT with float twiddles, power spectrum
+// projected through a (n_mels, n_fft/2+1) row-major basis, log(mel + guard),
+// optional tail-frame masking and per-feature z-score over the valid frames
+// only (unbiased variance, 1e-5 denominator, masked frames forced to 0).
+// Output layout is frame-major: features[m + f * n_mels].
+class MelSpectrogramExtractor {
+public:
+    // Resolves fmax <= 0 to sample_rate/2; throws std::runtime_error when
+    // n_fft is not a power of two.
+    explicit MelSpectrogramExtractor(const FrontendConfig& config);
+
+    // Replaces the mel basis; shape must be (n_mels, n_fft/2 + 1) row-major
+    // or std::runtime_error is thrown. The diar wiring calls this with the
+    // serialized "preprocessor.fb" tensor from the model GGUF.
+    void set_mel_basis(const float* filterbank, int n_mels, int n_bins);
+
+    void compute(const float* audio, std::size_t n_samples,
+        std::vector<float>& features, int& n_frames, bool reflect_left,
+        bool normalize) const;
+    // n_samples is the (possibly zero-)padded buffer length; valid_samples is
+    // how many are real audio. Valid samples drive pre-emphasis, masking and
+    // normalization statistics; padded tail samples still enter the STFT.
+    void compute_padded(const float* audio, std::size_t n_samples,
+        std::size_t valid_samples, std::vector<float>& features, int& n_frames,
+        bool reflect_left, bool normalize) const;
+
+    int n_fft() const { return config_.n_fft; }
+    int n_mels() const { return config_.n_mels; }
+    int win_length() const {
+        return static_cast<int>(config_.window_size_sec * config_.sample_rate + 0.5F);
+    }
+    int hop_length() const {
+        return static_cast<int>(config_.window_stride_sec * config_.sample_rate + 0.5F);
+    }
+    const std::vector<float>& window() const { return window_; }
+    const std::vector<float>& mel_basis() const { return mel_basis_; }
+    const FrontendConfig& config() const { return config_; }
+
+private:
+    void init_window();
+    void init_mel_basis();
+
+    FrontendConfig config_;
+    std::vector<float> window_;
+    std::vector<float> mel_basis_;
+};
+
+// Offline-path input prep ported from DiarModel::diarize_offline
+// (diar_pipeline.cpp @ a5b6953): scales by 1/(max(x) + eps). Note the
+// upstream quirk kept verbatim: the max ignores negative peaks, so a
+// negative-only signal amplifies. Streaming never calls this.
+std::vector<float> offline_peak_normalize(
+    const float* audio, std::size_t n_samples, float eps);
 
 // Returns frame-major 0/1 activity after per-speaker hysteresis.
 std::vector<std::uint8_t> hysteresis_activity(
