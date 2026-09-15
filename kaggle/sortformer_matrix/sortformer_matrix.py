@@ -95,6 +95,23 @@ REPORT: dict[str, object] = {
 #                 drifts, the drift lives in AOSC state, not the model.
 # Each set is (name, extra_args, env): extra_args reach nemo-speech via
 # h.diarize_once(extra_args=...), env reaches the child via h.run(env=...).
+#
+# v9 prob-stagger sweep (DET_SETS_V9): asks WHERE the drift lives, not which
+# knob collapses it. Every set dumps frame probabilities (DIAR_DUMP_PROBS via
+# h.diarize_once(dump_probs_path=...), binary needs the harness probdump
+# patch) so the verdict compares probs before hysteresis, not just RTTM
+# bodies after it:
+#   short_streaming x3  — known-good control, probs must be bit-identical;
+#   mid_streaming x5    — v5/v7/v8's drifter, 5 reps resolve the distribution;
+#   mid_offline_full x3 — full-attention control, probs must be bit-identical;
+#   mid_offline_preset x3 — larger-chunk AOSC streaming; v8 showed it drifts
+#                 too, so this set rules out "small-chunk-only" drift.
+# N_DET_REPEAT stays 3 (env-overridable via DIAR_DET_REPEAT); the mid_streaming
+# case runs 5 reps via DET_REPEAT_OVERRIDE below. Analysis per set: prob
+# bit-identical? max/mean abs diff? argmax frame agreement? body hash equal?
+# Verdict rule: probs drift + bodies drift = neural (GPU kernel) source;
+# probs identical + bodies drift = host-side race (P0 bug: host is oracle-
+# pinned, this outcome contradicts the AOSC/BirthGate differential proofs).
 DET_SETS_V8: list[tuple[str, list[str], dict[str, str]]] = [
     ("baseline", [], {}),
     ("no_batching", ["--no-batching"], {}),
@@ -103,6 +120,147 @@ DET_SETS_V8: list[tuple[str, list[str], dict[str, str]]] = [
     ("offline_full", ["--offline"], {}),
 ]
 N_DET_REPEAT = int(os.environ.get("DIAR_DET_REPEAT", "3"))
+
+# v9 prob-stagger sweep: (case_label, preset, reps, dump_probs). The case
+# label doubles as the audio selector in _main (real_short_*/real_mid_* from
+# the matrix entries). dump_probs=True routes every rep's probabilities to
+# det_sweep/<label>/probs.<rep>.f32 via dump_probs_path.
+DET_SETS_V9: list[tuple[str, str | None, int, bool]] = [
+    ("short_streaming", None, 3, True),
+    ("mid_streaming", None, 5, True),
+    ("mid_offline_full", "unused-offline-flag", 3, True),
+    ("mid_offline_preset", "offline", 3, True),
+]
+# --offline is a CLI flag, not a preset: mid_offline_full runs WITHOUT any
+# preset and WITH the --offline flag. The sentinel above keeps the tuple
+# shape uniform; run_prob_sweep translates it (see the flag branch there).
+OFFLINE_FLAG_SENTINEL = "unused-offline-flag"
+
+
+def run_prob_sweep(
+    binary: Path,
+    cases: list[tuple[str, Path, str | None]],
+) -> dict[str, object]:
+    """v9: same audio x prob-stagger sets, every rep dumps probabilities.
+
+    Each case is (label, audio, preset). Inside one case the binary, audio,
+    preset and working directory are all fixed; reps differ only by process
+    invocation. Every rep writes ``probs.<rep>.f32`` next to its RTTM, then
+    the analysis compares rep0 against each later rep at BOTH levels:
+
+    * probs level (pre-hysteresis): bit-identical? max/mean abs diff?
+      argmax frame agreement? shape stable?
+    * body level (post-hysteresis): RTTM body hash equal to rep0?
+
+    The verdict rule is structural: probs drift + bodies drift = neural
+    (GPU kernel) source; probs identical + bodies drift = host-side race.
+    A rep whose binary lacks the patch (or whose dump is missing/corrupt)
+    fails loudly with probs_available=False — a silent no-dump run must
+    never read as "identical".
+    """
+    import hashlib
+
+    sweep: dict[str, object] = {"sets": DET_SETS_V9, "cases": []}
+    for label, audio, preset in cases:
+        case_dir = h.WORK_ROOT / "det_sweep" / label
+        case_dir.mkdir(parents=True, exist_ok=True)
+        case_entry: dict[str, object] = {"label": label, "preset": preset, "reps": []}
+        # --offline is a CLI flag, not a --preset value: the sentinel preset
+        # maps to preset=None + the flag in extra_args.
+        use_offline_flag = preset == OFFLINE_FLAG_SENTINEL
+        child_preset = None if use_offline_flag else preset
+        child_extra = ["--offline"] if use_offline_flag else []
+        rep_dumps: list[tuple[int, int, list[float]] | None] = []
+        rep_hashes: list[str] = []
+        rep_bodies: list[str] = []
+        ok = True
+        for rep in range(N_DET_REPEAT):
+            out = case_dir / f"rep{rep}.rttm"
+            dump_path = case_dir / f"probs.{rep}.f32"
+            result = h.diarize_once(
+                binary, audio, out, device="cuda:0", preset=child_preset,
+                extra_args=list(child_extra),
+                timeout=3600, dump_probs_path=dump_path,
+            )
+            rep_record: dict[str, object] = {
+                "rep": rep,
+                "returncode": result["returncode"],
+                "wall_seconds": float(result["wall_seconds"]),
+                "probs_path": str(dump_path),
+                "probs_sha256": result["probs_sha256"],
+            }
+            if result["returncode"] != 0:
+                ok = False
+                rep_record["probs_available"] = False
+                rep_record["error"] = (result.get("tail") or "")[-300:]
+                case_entry["reps"].append(rep_record)
+                break
+            body = "\n".join(
+                f"{s:.3f} {d:.3f} {spk}" for s, d, spk in h.read_segments(out))
+            rep_bodies.append(body)
+            rep_hashes.append(hashlib.sha256(body.encode()).hexdigest())
+            rep_record["body_sha256"] = rep_hashes[-1]
+            try:
+                rep_dumps.append(h.read_probdump(dump_path))
+                rep_record["probs_available"] = True
+                rep_record["probs_shape"] = list(rep_dumps[-1][:2])
+            except (FileNotFoundError, ValueError) as exc:
+                rep_dumps.append(None)
+                rep_record["probs_available"] = False
+                rep_record["probs_error"] = f"{type(exc).__name__}: {exc}"
+                ok = False
+                case_entry["reps"].append(rep_record)
+                break
+            case_entry["reps"].append(rep_record)
+        # pairwise rep0-vs-repN at both levels (rep0 is the reference)
+        prob_pairs: list[dict[str, object]] = []
+        body_pairs: list[bool] = []
+        if len(rep_dumps) >= 2 and all(d is not None for d in rep_dumps):
+            first = rep_dumps[0]
+            assert first is not None
+            for other in rep_dumps[1:]:
+                assert other is not None
+                prob_pairs.append(h.probdiff(first, other))
+        if len(rep_hashes) >= 2:
+            body_pairs = [x == rep_hashes[0] for x in rep_hashes[1:]]
+        unique_bodies = sorted(set(rep_hashes))
+        probs_ok = bool(rep_dumps) and all(d is not None for d in rep_dumps)
+        probs_bit = (
+            all(bool(p.get("bit_identical")) for p in prob_pairs)
+            if prob_pairs else (len(rep_dumps) == 1 and probs_ok)
+        )
+        max_abs = max((float(p.get("max_abs_diff", 0.0)) for p in prob_pairs), default=0.0)
+        mean_abs = max((float(p.get("mean_abs_diff", 0.0)) for p in prob_pairs), default=0.0)
+        min_agree = min(
+            (float(p.get("frame_agreement", 1.0)) for p in prob_pairs), default=1.0)
+        if not probs_ok:
+            verdict = "no_dump"
+        elif probs_bit and len(unique_bodies) == 1:
+            verdict = "identical"
+        elif not probs_bit and len(unique_bodies) > 1:
+            verdict = "neural_drift"
+        elif probs_bit and len(unique_bodies) > 1:
+            verdict = "host_race"
+        elif not probs_bit and len(unique_bodies) == 1:
+            verdict = "sub_hysteresis_drift"
+        else:
+            verdict = "unreachable"
+        case_entry["returncode_ok"] = ok
+        case_entry["probs_available"] = probs_ok
+        case_entry["prob_pairs_vs_rep0"] = prob_pairs
+        case_entry["body_pairs_vs_rep0"] = body_pairs
+        case_entry["unique_body_hashes"] = len(unique_bodies)
+        case_entry["body_identical"] = ok and len(unique_bodies) == 1
+        case_entry["probs_bit_identical"] = probs_ok and probs_bit
+        case_entry["probs_max_abs_diff"] = max_abs if probs_ok else None
+        case_entry["probs_mean_abs_diff"] = mean_abs if probs_ok else None
+        case_entry["probs_min_frame_agreement"] = min_agree if probs_ok else None
+        case_entry["verdict"] = verdict if ok else "run_failed"
+        print(f"[prob] {label}: verdict={case_entry['verdict']} "
+              f"bodies_unique={len(unique_bodies)} probs_bit={probs_ok and probs_bit} "
+              f"max_abs={max_abs:.3g} agree={min_agree:.4f}", flush=True)
+        sweep["cases"].append(case_entry)
+    return sweep
 
 
 def cut_wav(source: Path, destination: Path, start_seconds: float, seconds: float) -> Path:
@@ -662,6 +820,37 @@ def _main() -> None:
             Path(str(mid_entries[0]["audio"])), "offline"))
     if det_cases:
         REPORT["determinism_sweep"] = run_det_sweep(binary, det_cases)
+
+    # v9 prob-stagger sweep: same audios, every rep dumps frame probabilities
+    # so the verdict sees pre-hysteresis drift. Per-set rep counts come from
+    # DET_SETS_V9 (mid_streaming runs 5); N_DET_REPEAT is only the fallback.
+    # --offline is a CLI flag, not a preset: mid_offline_full carries the
+    # sentinel preset and gets the flag here via extra_args-free direct call
+    # (run_prob_sweep passes preset through; handle the flag set inline).
+    if short_entries or mid_entries:
+        prob_cases: list[tuple[str, Path, str | None]] = []
+        audio_by_set = {
+            "short_streaming": (short_entries[0] if short_entries else None, None),
+            "mid_streaming": (mid_entries[0] if mid_entries else None, None),
+            "mid_offline_full": (mid_entries[0] if mid_entries else None,
+                                 OFFLINE_FLAG_SENTINEL),
+            "mid_offline_preset": (mid_entries[0] if mid_entries else None, "offline"),
+        }
+        wanted = [(set_label, reps) for set_label, _, reps, _ in DET_SETS_V9]
+        saved_repeat = N_DET_REPEAT
+        prob_sweeps: list[dict[str, object]] = []
+        for set_label, reps in wanted:
+            slot = audio_by_set.get(set_label)
+            if not slot or slot[0] is None:
+                continue
+            entry, set_preset = slot
+            assert entry is not None
+            globals()["N_DET_REPEAT"] = reps
+            sweep = run_prob_sweep(
+                binary, [(set_label, Path(str(entry["audio"])), set_preset)])
+            prob_sweeps.append(sweep)
+        globals()["N_DET_REPEAT"] = saved_repeat
+        REPORT["prob_sweep"] = prob_sweeps
 
     REPORT["gpu_after"] = h.gpu_snapshot()
     REPORT["records"] = to_records(environment, gpu_entries, model)

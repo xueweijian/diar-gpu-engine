@@ -333,6 +333,173 @@ def install_build_dependencies() -> None:
         raise RuntimeError("could not install sentencepiece development files")
 
 
+DIAR_DUMP_PROBS = "DIAR_DUMP_PROBS"
+"""Child env key selecting the frame-probability dump path.
+
+When nemo-speech runs with this variable set to a file path, the patched
+``app/diarize.cpp`` (see PROBDUMP_PATCH, applied by ``apply_probdump_patch``
+after clone) writes the per-frame speaker probabilities of that run to the
+path in the probdump binary format (``read_probdump`` below). Unset/empty =
+no dump, binary behaves exactly like upstream. The path is chosen per call
+by ``diarize_once(dump_probs_path=...)`` so concurrent staggers never share
+a file.
+"""
+
+# --------------------------------------------------------------------------
+# probdump patch (frame-probability observability for the v9 verdict)
+# --------------------------------------------------------------------------
+# Pinned against NeMo-Speech.cpp a5b6953 app/diarize.cpp. The C++ write
+# helper is verified standalone first: tests/probdump_oracle.cpp contains
+# this exact block between BEGIN/END markers and must print
+# PROBDUMP_ORACLE_PASS (see run_local_tests.sh). The call-site anchor is the
+# unique line `for (auto& worker : worker_threads) worker.join();`.
+PROBDUMP_ANCHOR = "for (auto& worker : worker_threads) worker.join();"
+PROBDUMP_WRITE_HELPER = """static bool diar_probdump_write(
+    const char* path, const float* probs, int64_t n_frames, int n_spk) {
+    if (!path || !probs || n_frames <= 0 || n_spk <= 0)
+        return false;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out)
+        return false;
+    out.write(reinterpret_cast<const char*>(&n_frames), sizeof(n_frames));
+    int32_t spk = static_cast<int32_t>(n_spk);
+    out.write(reinterpret_cast<const char*>(&spk), sizeof(spk));
+    out.write(
+        reinterpret_cast<const char*>(probs),
+        static_cast<std::streamsize>(n_frames) * n_spk * sizeof(float));
+    out.close();
+    return static_cast<bool>(out);
+}
+"""
+PROBDUMP_CALL_SITE = """    if (const char* diar_probdump_path = std::getenv("DIAR_DUMP_PROBS")) {
+        if (!diar_probdump_path[0])
+            continue;
+        const auto& diar_probdump_probs = results[i].frame_probabilities;
+        if (!diar_probdump_probs.empty() && results[i].frame_count > 0 &&
+            results[i].num_speakers > 0) {
+            std::string diar_probdump_file = diar_probdump_path;
+            if (results.size() > 1)
+                diar_probdump_file += "." + std::to_string(i);
+            diar_probdump_write(
+                diar_probdump_file.c_str(), diar_probdump_probs.data(),
+                results[i].frame_count, results[i].num_speakers);
+        }
+    }
+"""
+
+
+def apply_probdump_patch(repo: Path | str = REPO_DIR) -> dict[str, object]:
+    """Inject the probdump block into a fresh NeMo-Speech.cpp clone.
+
+    Idempotent: a second call on an already-patched tree is a no-op
+    (``already_patched=True``). Raises ``RuntimeError`` when the anchor is
+    missing (upstream moved it) or appears more than once (ambiguous site)
+    — both cases must fail loudly here, not as a silent no-dump kernel.
+    """
+    target = Path(repo) / "app" / "diarize.cpp"
+    text = target.read_text(encoding="utf-8")
+    if "diar_probdump_write" in text:
+        return {"patched": False, "already_patched": True, "file": str(target)}
+    if text.count(PROBDUMP_ANCHOR) != 1:
+        raise RuntimeError(
+            f"probdump anchor not unique in {target}: "
+            f"count={text.count(PROBDUMP_ANCHOR)} (upstream moved it?)"
+        )
+    patched = text.replace(
+        "#include <cstdio>",
+        "#include <cstdint>\n#include <cstdio>\n#include <cstdlib>\n#include <fstream>",
+        1,
+    )
+    if patched.count("for (auto& worker : worker_threads) worker.join();") != 1:
+        raise RuntimeError("probdump include patch broke the join anchor")
+    patched = patched.replace(
+        PROBDUMP_ANCHOR,
+        PROBDUMP_ANCHOR + "\n\n" + PROBDUMP_WRITE_HELPER,
+        1,
+    )
+    # The dump runs in the single-threaded result loop, after all workers
+    # joined: results[i] is fully written, and DIAR_DUMP_PROBS unset/empty
+    # is a zero-cost no-op (getenv miss first, then empty-path skip).
+    loop_anchor = "written_in_this_run[i] = true;"
+    if patched.count(loop_anchor) != 1:
+        raise RuntimeError(
+            f"probdump loop anchor not unique: count={patched.count(loop_anchor)}"
+        )
+    patched = patched.replace(
+        loop_anchor, loop_anchor + "\n" + PROBDUMP_CALL_SITE, 1
+    )
+    target.write_text(patched, encoding="utf-8")
+    return {"patched": True, "already_patched": False, "file": str(target)}
+
+
+def read_probdump(path: Path) -> tuple[int, int, list[float]]:
+    """Read a probdump file -> (n_frames, n_spk, row-major floats).
+
+    Raises FileNotFoundError / ValueError on missing path, short header,
+    non-positive shape, or truncated payload — a partial dump must never
+    parse as valid data.
+    """
+    import struct
+
+    raw = Path(path).read_bytes()
+    if len(raw) < 12:
+        raise ValueError(f"probdump {path}: short header ({len(raw)} bytes)")
+    n_frames, n_spk = struct.unpack("<qi", raw[:12])
+    if n_frames <= 0 or n_spk <= 0:
+        raise ValueError(f"probdump {path}: bad shape frames={n_frames} spk={n_spk}")
+    expect = 12 + n_frames * n_spk * 4
+    if len(raw) < expect:
+        raise ValueError(
+            f"probdump {path}: truncated payload ({len(raw)} < {expect} bytes)")
+    values = list(struct.unpack(f"<{n_frames * n_spk}f", raw[12:expect]))
+    return n_frames, n_spk, values
+
+
+def probdiff(
+    first: tuple[int, int, list[float]], second: tuple[int, int, list[float]]
+) -> dict[str, object]:
+    """Compare two probdumps: shape gate, then max/mean abs diff + agreement.
+
+    Bit-identical short-circuit first (exact bytes, no float tolerance);
+    otherwise float64 accumulation over abs diffs. ``frame_agreement`` is the
+    fraction of frames whose argmax speaker matches (the quantity that feeds
+    the segmentation hysteresis — 1.0 with bit_different=True means the dump
+    caught sub-hysteresis drift the RTTM bodies cannot see).
+    """
+    import math
+
+    (f0, s0, a), (f1, s1, b) = first, second
+    if (f0, s0) != (f1, s1):
+        return {"shape_equal": False, "shapes": [(f0, s0), (f1, s1)]}
+    n = len(a)
+    bit = a == b
+    if bit:
+        return {
+            "shape_equal": True, "frames": f0, "n_spk": s0,
+            "bit_identical": True, "max_abs_diff": 0.0, "mean_abs_diff": 0.0,
+            "frame_agreement": 1.0,
+        }
+    maxd = 0.0
+    total = 0.0
+    agree = 0
+    for f in range(f0):
+        row0 = a[f * s0:(f + 1) * s0]
+        row1 = b[f * s0:(f + 1) * s0]
+        for x, y in zip(row0, row1):
+            d = abs(float(x) - float(y))
+            if d > maxd:
+                maxd = d
+            total += d
+        if max(range(s0), key=lambda k: row0[k]) == max(range(s0), key=lambda k: row1[k]):
+            agree += 1
+    return {
+        "shape_equal": True, "frames": f0, "n_spk": s0,
+        "bit_identical": False, "max_abs_diff": maxd,
+        "mean_abs_diff": total / n if n else 0.0,
+        "frame_agreement": agree / f0 if f0 else 0.0,
+    }
+
+
 def clone_runtime() -> str:
     code, _, _ = run([
         "git", "clone", "--depth", "1", "--recurse-submodules", "--shallow-submodules",
@@ -343,12 +510,23 @@ def clone_runtime() -> str:
     return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(REPO_DIR), text=True).strip()
 
 
-def build_runtime(preset: str = "cuda-diar", cuda_architectures: str = "60") -> dict[str, object]:
-    """Configure and build. Returns a record of the build with timings."""
+def build_runtime(
+    preset: str = "cuda-diar",
+    cuda_architectures: str = "60",
+    apply_patch: bool = True,
+) -> dict[str, object]:
+    """Configure and build. Returns a record of the build with timings.
+
+    ``apply_patch`` (default True) injects the probdump block after clone;
+    pass False for a pristine upstream build. The patch record lands in the
+    return dict so reports show whether this binary can dump probabilities.
+    """
     if shutil.which("cmake") is None or shutil.which("ninja") is None:
         raise RuntimeError("cmake/ninja missing from the image")
     install_build_dependencies()
     commit = clone_runtime()
+    patch = apply_probdump_patch() if apply_patch else {
+        "patched": False, "already_patched": False, "file": None}
     shim = prepare_cuda_driver_shim()
     shutil.rmtree(REPO_DIR / "build", ignore_errors=True)
     code, configure_text, configure_seconds = run([
@@ -368,6 +546,7 @@ def build_runtime(preset: str = "cuda-diar", cuda_architectures: str = "60") -> 
     return {
         "runtime_commit": commit, "preset": preset, "binary": str(binary),
         "cuda_architectures": cuda_architectures,
+        "probdump_patch": patch,
         "configure_seconds": round(configure_seconds, 3),
         "build_seconds": round(build_seconds, 3),
     }
@@ -448,9 +627,24 @@ def diarize_once(
     extra_args: list[str] | None = None,
     timeout: int = 3600,
     env: dict[str, str] | None = None,
+    dump_probs_path: Path | str | None = None,
 ) -> dict[str, object]:
+    """Run one single-file diarization; return wall/cpu/sha/tail record.
+
+    ``dump_probs_path`` selects the probdump file for this run: it is passed
+    to the child as ``DIAR_DUMP_PROBS`` (merged over ``env``) and, when the
+    binary carries the probdump patch, the child writes its frame
+    probabilities there. The path's sha256 lands in the return record as
+    ``probs_sha256`` (None when no dump was requested or produced).
+    """
     output.parent.mkdir(parents=True, exist_ok=True)
     output.unlink(missing_ok=True)
+    child_env = dict(env) if env else {}
+    probs_path = Path(dump_probs_path) if dump_probs_path else None
+    if probs_path is not None:
+        probs_path.parent.mkdir(parents=True, exist_ok=True)
+        probs_path.unlink(missing_ok=True)
+        child_env[DIAR_DUMP_PROBS] = str(probs_path)
     argv = [
         str(binary), "diarize", str(audio),
         "--diar-model", str(MODEL_PATH),
@@ -464,7 +658,7 @@ def diarize_once(
     if extra_args:
         argv += extra_args
     cpu_before = child_cpu_seconds()
-    code, text, seconds = run(argv, cwd=REPO_DIR, timeout=timeout, env=env)
+    code, text, seconds = run(argv, cwd=REPO_DIR, timeout=timeout, env=child_env)
     cpu_after = child_cpu_seconds()
     body_segments = read_segments(output) if output.exists() else []
     return {
@@ -473,6 +667,8 @@ def diarize_once(
         "cpu_seconds": round(cpu_after - cpu_before, 4),
         "output": str(output),
         "env": dict(env) if env else {},
+        "dump_probs_path": str(probs_path) if probs_path else None,
+        "probs_sha256": sha256(probs_path) if probs_path and probs_path.exists() else None,
         "output_sha256": sha256(output) if output.exists() else None,
         "output_body_sha256": rttm_body_sha256(output) if output.exists() else None,
         "body_segments": len(body_segments),
