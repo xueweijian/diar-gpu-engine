@@ -351,9 +351,18 @@ a file.
 # Pinned against NeMo-Speech.cpp a5b6953 app/diarize.cpp. The C++ write
 # helper is verified standalone first: tests/probdump_oracle.cpp contains
 # this exact block between BEGIN/END markers and must print
-# PROBDUMP_ORACLE_PASS (see run_local_tests.sh). The call-site anchor is the
-# unique line `for (auto& worker : worker_threads) worker.join();`.
-PROBDUMP_ANCHOR = "for (auto& worker : worker_threads) worker.join();"
+# PROBDUMP_ORACLE_PASS (see run_local_tests.sh).
+#
+# Anchors, both verified unique with brace-depth checks in apply_probdump_patch:
+#   - HELPER anchor: the file-local namespace close `}  // namespace` (depth 1).
+#     The helper MUST land at file scope: the join() line sits at brace depth 2
+#     (inside command_diarize), and a function definition injected there does
+#     not compile (v10 failure: "a function-definition is not allowed here").
+#   - CALL-SITE anchor: the unique `for (auto& worker : worker_threads)
+#     worker.join();` line inside command_diarize — dumps run after all
+#     workers joined, in the single-threaded result loop.
+PROBDUMP_ANCHOR = "}  // namespace"
+PROBDUMP_JOIN_ANCHOR = "for (auto& worker : worker_threads) worker.join();"
 PROBDUMP_WRITE_HELPER = """static bool diar_probdump_write(
     const char* path, const float* probs, int64_t n_frames, int n_spk) {
     if (!path || !probs || n_frames <= 0 || n_spk <= 0)
@@ -400,18 +409,25 @@ def apply_probdump_patch(repo: Path | str = REPO_DIR) -> dict[str, object]:
     text = target.read_text(encoding="utf-8")
     if "diar_probdump_write" in text:
         return {"patched": False, "already_patched": True, "file": str(target)}
-    if text.count(PROBDUMP_ANCHOR) != 1:
+    # Helper anchor must sit at brace depth 1 (file-local namespace), not
+    # inside a function — guard it explicitly so a future upstream move
+    # fails loudly here instead of producing a broken translation unit.
+    helper_anchor_at = text.find(PROBDUMP_ANCHOR)
+    if helper_anchor_at == -1 or text.count(PROBDUMP_ANCHOR) != 1:
         raise RuntimeError(
-            f"probdump anchor not unique in {target}: "
+            f"probdump helper anchor not unique in {target}: "
             f"count={text.count(PROBDUMP_ANCHOR)} (upstream moved it?)"
+        )
+    if text[:helper_anchor_at].count("{") - text[:helper_anchor_at].count("}") != 1:
+        raise RuntimeError(
+            f"probdump helper anchor is not at namespace depth in {target}: "
+            f"upstream structure changed; refusing to inject inside a function"
         )
     patched = text.replace(
         "#include <cstdio>",
         "#include <cstdint>\n#include <cstdio>\n#include <cstdlib>\n#include <fstream>",
         1,
     )
-    if patched.count("for (auto& worker : worker_threads) worker.join();") != 1:
-        raise RuntimeError("probdump include patch broke the join anchor")
     patched = patched.replace(
         PROBDUMP_ANCHOR,
         PROBDUMP_ANCHOR + "\n\n" + PROBDUMP_WRITE_HELPER,
@@ -420,6 +436,11 @@ def apply_probdump_patch(repo: Path | str = REPO_DIR) -> dict[str, object]:
     # The dump runs in the single-threaded result loop, after all workers
     # joined: results[i] is fully written, and DIAR_DUMP_PROBS unset/empty
     # is a zero-cost no-op (getenv miss first, then empty-path skip).
+    join_anchor = PROBDUMP_JOIN_ANCHOR
+    if patched.count(join_anchor) != 1:
+        raise RuntimeError(
+            f"probdump join anchor not unique: count={patched.count(join_anchor)}"
+        )
     loop_anchor = "written_in_this_run[i] = true;"
     if patched.count(loop_anchor) != 1:
         raise RuntimeError(

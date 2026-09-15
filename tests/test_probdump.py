@@ -60,6 +60,9 @@ def _fake_repo(tmp_path: Path, body: str) -> Path:
 
 _MINIMAL_CPP = (
     "#include <cstdio>\n"
+    "namespace {\n"
+    "struct Worker { void join(); };\n"
+    "}  // namespace\n"
     "int command_diarize() {\n"
     "    for (auto& worker : worker_threads) worker.join();\n"
     "    written_in_this_run[i] = true;\n"
@@ -98,23 +101,55 @@ def test_apply_probdump_patch_is_idempotent(tmp_path):
     assert text.count("static bool diar_probdump_write(") == 1
 
 
-def test_apply_probdump_patch_fails_loud_on_moved_anchor(tmp_path):
+def test_apply_probdump_patch_fails_loud_on_moved_helper_anchor(tmp_path):
     repo = _fake_repo(tmp_path, "#include <cstdio>\nint f() { return 0; }\n")
-    with pytest.raises(RuntimeError, match="anchor not unique"):
+    with pytest.raises(RuntimeError, match="helper anchor not unique"):
         harness.apply_probdump_patch(repo)
 
 
-def test_apply_probdump_patch_fails_loud_on_ambiguous_anchor(tmp_path):
+def test_apply_probdump_patch_fails_loud_on_ambiguous_helper_anchor(tmp_path):
     body = ("#include <cstdio>\n"
-            "void a() { for (auto& worker : worker_threads) worker.join(); }\n"
-            "void b() { for (auto& worker : worker_threads) worker.join(); }\n")
+            "namespace {\n"
+            "}  // namespace\n"
+            "}  // namespace\n")
     repo = _fake_repo(tmp_path, body)
-    with pytest.raises(RuntimeError, match="anchor not unique"):
+    with pytest.raises(RuntimeError, match="helper anchor not unique"):
+        harness.apply_probdump_patch(repo)
+
+
+def test_apply_probdump_patch_fails_loud_on_helper_anchor_inside_function(tmp_path):
+    """v10 regression: anchor line unique but at brace depth 2 (inside a
+    function) — the patch must refuse instead of injecting a nested
+    function definition that cannot compile."""
+    body = ("#include <cstdio>\n"
+            "int f() {\n"
+            "    if (x) { }  // namespace\n"
+            "}\n")
+    repo = _fake_repo(tmp_path, body)
+    with pytest.raises(RuntimeError, match="not at namespace depth"):
+        harness.apply_probdump_patch(repo)
+
+
+def test_apply_probdump_patch_fails_loud_on_moved_join_anchor(tmp_path):
+    body = ("#include <cstdio>\n"
+            "namespace {\n"
+            "}  // namespace\n"
+            "void a() { for (auto& w : worker_threads) w.join(); }\n"
+            "int f() {\n"
+            "    written_in_this_run[i] = true;\n"
+            "    for (auto& worker : worker_threads) worker.join();\n"
+            "    for (auto& worker : worker_threads) worker.join();\n"
+            "    return 0;\n"
+            "}\n")
+    repo = _fake_repo(tmp_path, body)
+    with pytest.raises(RuntimeError, match="join anchor"):
         harness.apply_probdump_patch(repo)
 
 
 def test_apply_probdump_patch_fails_loud_on_moved_loop_anchor(tmp_path):
     body = ("#include <cstdio>\n"
+            "namespace {\n"
+            "}  // namespace\n"
             "void a() { for (auto& worker : worker_threads) worker.join(); }\n")
     repo = _fake_repo(tmp_path, body)
     with pytest.raises(RuntimeError, match="loop anchor"):
