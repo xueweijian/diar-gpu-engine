@@ -264,4 +264,33 @@ offline preset 下 `--offline`（6.90s）反而比 AOSC 大 chunk（6.44s）慢�
    剩余候选：`CUDNN_DETERMINISTIC=1`、Thrust/归约顺序
    （仅 AOSC 路径漂、全注意力不漂的对照已大幅缩小范围——
    若漂移在 GEMM/归约底层，全注意力同样应漂）。
+
+## 10. v9→v11 prob-stagger sweep（2026-09-16 pass，v10 构建失败见 DEVLOG）
+
+sweep 设计：4 组 14 跑，全部 dump hysteresis 前逐帧概率
+（short_streaming ×3 / mid_streaming ×5 / mid_offline_full ×3 /
+mid_offline_preset ×3）。verdict 规则（9-15 定）：probs 漂+body 漂=NN 侧；
+probs 同+body 漂=host 竞态（P0）。
+
+**实测结果：两组规则都没触发**——v11 会话内 14 跑 probs 与 body 全部
+bit-identical（frame_agreement=1.0，max_abs=0）。
+
+hash 溯源（body sha 前 16）：
+- short `81704884…` == v5/v7/v8 短场基线——短场从未漂过。
+- mid `ddf2312b…` 不在 v5{3 个}、v7{3 个}、v8{3 个}任一集合中——
+  **会话内 5 跑自洽，但跨会话 mid hash 从未复现过同一值**。
+- offline_full `999fb4ba…` 与 v8 的 offline_full 稳定 hash 相同
+  （全注意力单 pass 会话间也稳定）。
+
+结论修正：漂移不是 NN 侧（probs 全同），也不是进程内竞态（body 全同）；
+是**进程级库非确定性**——同会话内 cuDNN/cuBLAS autotune 选择一致 → 全
+identical；跨会话 autotune 选择漂 → body 换 hash。这同时解释了：
+①每版 within-session repeats 恒全同；②mid 跨会话 hash 从不重复；
+③短场/offline_full 跨会话也稳定（其算子选择对 autotune 不敏感或
+只有单一候选）。
+
+下一步：v12 用 `CUDNN_DETERMINISTIC=1`+`CUBLAS_WORKSPACE_CONFIG`
+钉死 autotune，跨会话重跑 mid——若 hash 收敛到同一值则定位成立；
+parity L1 的短场 fixture（`999…`/`8170…` 均跨会话稳定）可直接回填。
+
 5. 以上均为 timing/结构实验，不动 engine 实现。
