@@ -28,3 +28,5 @@ compile_commands.json
 *.onnx
 *.gguf
 *.safetensors
+# Local staging for dataset upload (symlinks into /var/minis/shared, not source).
+kaggle/m2_ref_upload/
