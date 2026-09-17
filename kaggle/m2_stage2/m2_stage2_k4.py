@@ -257,16 +257,16 @@ def main() -> int:
             return _fn
 
         handles.append(enc.pos_enc.register_forward_hook(rec("posenc_out_x")))
-        # pos_emb is the 2nd element of pos_enc's output tuple: capture via wrapper
-        orig_pos_fwd = enc.pos_enc.forward
-
-        def pos_fwd_wrap(x, cache_len=0):
-            xo, pe = orig_pos_fwd(x, cache_len=cache_len)
+        # pos_emb is the 2nd element of pos_enc's output tuple: capture via
+        # a FORWARD HOOK (sees (x_out, pos_emb); a method wrapper would NOT
+        # fire because forward_internal calls self.pos_enc(...) — keep both
+        # belt and suspenders, but the hook is authoritative).
+        def pos_hook(mod, args, out):
+            xo, pe = out
             cap["pos_emb"] = pe.detach().cpu().numpy()
-            cap["pos_pe_store_rows"] = int(enc.pos_enc.pe.size(1))
-            return xo, pe
+            cap["pos_pe_store_rows"] = int(mod.pe.size(1))
 
-        enc.pos_enc.forward = pos_fwd_wrap  # type: ignore[method-assign]
+        handles.append(enc.pos_enc.register_forward_hook(pos_hook))
         handles.append(lay0.norm_feed_forward1.register_forward_hook(rec("n_ff1")))
         handles.append(lay0.feed_forward1.register_forward_hook(rec("ff1")))
         handles.append(lay0.norm_self_att.register_forward_hook(rec("n_sa")))
@@ -302,7 +302,6 @@ def main() -> int:
         finally:
             for hd in handles:
                 hd.remove()
-            enc.pos_enc.forward = orig_pos_fwd  # type: ignore[method-assign]
         REPORT["probe_fc_shape"] = list(fc_embs.shape)
         REPORT["probe_fc_lens"] = [int(v) for v in fc_lens.tolist()]
 
@@ -329,6 +328,9 @@ def main() -> int:
     REPORT["probe_pe_row0_best"] = int(_np.argmin(d0))
     REPORT["probe_pe_row0_best_mse"] = float(d0.min())
     REPORT["probe_pe_row0_mse_vs_same"] = float(d0[0])
+    # Store geometry pin: exact window arithmetic needs the live store rows
+    # (hook-captured above). The K2 fix mirrors THIS slice, not extend_pe(L).
+    REPORT["probe_store_rows"] = int(cap.get("pos_pe_store_rows", -1))
 
     p = f"encoder.layers.0."
     sd = model.state_dict()

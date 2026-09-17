@@ -78,7 +78,8 @@ def test_k4_stages_present() -> None:
     text = K4.read_text()
     for stage in ("P0_xscaled_input", "P1_pos_table", "P2_norm_ff1",
                   "P3a_mha_full_local", "P3b_mha_nemo_qkvp_local_formula",
-                  "P4_conv_on_nemo_input", "P5_full_layer_local", "P5_nemo_vs_dump"):
+                  "P4_conv_on_nemo_input", "P5_full_layer_local", "P5_nemo_vs_dump",
+                  "probe_store_rows", "pos_hook"):
         assert stage in text, f"K4 lost stage {stage}"
 
 
