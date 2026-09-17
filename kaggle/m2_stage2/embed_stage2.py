@@ -22,13 +22,14 @@ from pathlib import Path
 
 DIR = Path(__file__).parent
 RUNNER = DIR / "m2_stage2_run.py"
-GATES = ("m2_stage2_k1.py", "m2_stage2_k2.py", "m2_stage2_k3.py")
+GATES = ("m2_stage2_k1.py", "m2_stage2_k2.py", "m2_stage2_k3.py", "m2_stage2_k4.py")
 
 ANCHOR_PREFIX = "EMBEDDED_"
 ANCHOR_OF = {
     "m2_stage2_k1.py": "EMBEDDED_M2_STAGE2_K1",
     "m2_stage2_k2.py": "EMBEDDED_M2_STAGE2_K2",
     "m2_stage2_k3.py": "EMBEDDED_M2_STAGE2_K3",
+    "m2_stage2_k4.py": "EMBEDDED_M2_STAGE2_K4",
 }
 
 # The runner's dispatch table must call the materialized files by these
@@ -37,6 +38,7 @@ GATE_MODULE_OF = {
     "m2_stage2_k1.py": "m2_stage2_k1.py",
     "m2_stage2_k2.py": "m2_stage2_k2.py",
     "m2_stage2_k3.py": "m2_stage2_k3.py",
+    "m2_stage2_k4.py": "m2_stage2_k4.py",
 }
 
 SMOKE = "teacher-forced"  # every gate source must contain this marker
@@ -60,6 +62,7 @@ def _gate_guard(name: str) -> str:
         "m2_stage2_k1.py": "m2_stage2_k1_head_transformer",
         "m2_stage2_k2.py": "m2_stage2_k2_conformer",
         "m2_stage2_k3.py": "m2_stage2_k3_preencode",
+        "m2_stage2_k4.py": "m2_stage2_k4_probe",
     }
     return markers[name]
 
