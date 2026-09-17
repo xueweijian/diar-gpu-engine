@@ -81,16 +81,25 @@ Fallback（S0 任一步失败）：ggml probdump 第二弹——patch
 `sortformer_model.cpp` 逐 chunk 吐 pre_encode/fc/transformer/preds，
 真值源降格为 ggml q8，Stage 2 门阈值相应收紧（同实现自比，spread 小）。
 
-## 3. Stage 1 — CPU 张量核（本地+CI，零 GPU 预算）
+## 3. Stage 1 — CPU 张量核（本地+CI，零 GPU 预算）✅ DONE 2026-09-17
 
 `src/nn/`（新）：Linear、LayerNorm(eps 1e-5)、BatchNorm1d-infer、
-softmax、SiLU、ReLU、sigmoid、Conv1d/depthwise-conv、GLU（channel
-split）、rel-pos shift trick、sqrt-scale/xscale。全部 FP32，double
-累加只用在单测 oracle 里（防自证：op 单测用 naive 独立实现或解析值，
-如 softmax 归一性、LN 零均值单位方差、matmul 对三重循环）。
+softmax、SiLU、ReLU、sigmoid、Conv1d/depthwise-conv、Conv2d（pre_encode
+stem 用）、GLU（channel split）、rel-pos shift trick、sqrt-scale/xscale。
+全部 FP32，double 累加只用在单测 oracle 里（防自证：op 单测用 naive 独立
+实现或解析值，如 softmax 归一性、LN 零均值单位方差、matmul 对三重循环）。
 
 CI：合成小权重 op 级单测进 `ci.yml`（三 OS）。**真权重（147MB）永不
 进 git**，真权重门一律 kernel 侧——既定纪律。
+
+落盘记录（commit 待填）：`include/diar/nn.hpp` + `src/nn.cpp`（11 算子，
+布局契约钉死：activation [T,C] frame-major；Linear 权重 PyTorch [out,in]；
+Conv1d [out,in,K] 对称零垫；DW [C,K]；Conv2d [C,H,W]/[out,in,KH,KW]；
+rel-shift BD [(2T-1),T]→[T,T]），`tests/test_nn.cpp`（22 用例，全独立
+oracle：hand 解析值/double 重算/naive 零垫参考/性质检查/ggml 链暴力画像）。
+变异测试 5/5 抓获（LN-biased-vs-unbiased 有独立判别测试——性质测试本身
+看不见 /n 与 /n-1 的区别，教训已钉注释）。`test_nn` 已接入 CMake ctest +
+run_local_tests.sh。92 pytest + 双 C++ suite 全绿。
 
 ## 4. Stage 2 — 逐层 teacher-forced 对拍（M2 主体，3-4 kernel）
 

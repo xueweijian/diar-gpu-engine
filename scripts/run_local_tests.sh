@@ -5,9 +5,13 @@ BUILD="$ROOT/.local-build"
 rm -rf "$BUILD"
 mkdir -p "$BUILD"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
-  -I"$ROOT/include" "$ROOT/src/diar.cpp" "$ROOT/src/aosc.cpp" "$ROOT/src/birth_gate.cpp" "$ROOT/src/fe.cpp" "$ROOT/tests/test_core.cpp" \
+  -I"$ROOT/include" "$ROOT/src/diar.cpp" "$ROOT/src/aosc.cpp" "$ROOT/src/birth_gate.cpp" "$ROOT/src/fe.cpp" "$ROOT/src/nn.cpp" "$ROOT/tests/test_core.cpp" \
   -o "$BUILD/test_core"
 "$BUILD/test_core"
+${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
+  -I"$ROOT/include" "$ROOT/src/nn.cpp" "$ROOT/tests/test_nn.cpp" \
+  -o "$BUILD/test_nn"
+"$BUILD/test_nn"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   "$ROOT/tests/probdump_oracle.cpp" -o "$BUILD/probdump_oracle"
 "$BUILD/probdump_oracle"
