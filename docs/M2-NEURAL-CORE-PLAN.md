@@ -123,7 +123,7 @@ frame_probs，直接过现有 **4 fixture tolerance 门**。这一绿，
 **M2 功能闭合**，manifest 升 schema v2（加中间层 tensor pin，
 v1 fixture 保持有效，loader 向后兼容）。
 
-## 6. Stage 0 spike 结论（2026-09-17，kernel v2 `nemo-ok`）
+## 6. Stage 0 spike 结论（2026-09-17，kernel v5 `nemo-ok`，0aee04e）
 
 - S0-a：HF 仓有 `.nemo`（`diar_streaming_sortformer_4spk-v2.nemo`，
   471MB，Kaggle 可直拉）。S0-b：`pip install nemo_toolkit[asr]` 在
@@ -146,7 +146,11 @@ v1 fixture 保持有效，loader 向后兼容）。
   counts 断言 17/18；`--max-sec` 按音频实际长度传（spike 报告音频秒数，
   dump 侧校验 `total_preds` 帧数 == ggml fixture 帧数，不等即 verdict
   `truncated`）。
-- `.npz`（short/mid 各 ~18MB）落 `/tmp/m2s0_out/`，本地分析用，不进 git。
+- `.npz`（short 25MB / mid 148MB + verdict）落
+  `shared/diar-gpu-engine/m2-ref/`，本地分析用，不进 git。
+  最终 inventory：short 541 数组/36 chunk，mid 2797 数组/224 chunk；
+  deep（逐 block）= chunk000-002；17 conformer + 18 transformer 全中；
+  total_preds 短 712 / 中 4468（各含 1 帧全静音 tail，admitted）。
 
 P100 真机，FP32 先行；FP16-storage+FP32-accum 按 ADR-0002 跟上；
 CUDA Graph 只在 streaming 几何稳定后（M3 §6）。
