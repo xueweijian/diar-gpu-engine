@@ -196,6 +196,12 @@ def main() -> int:
         "short": 711,   # parity/fixtures/v12-short-streaming-r0
         "mid": 4467,    # parity/fixtures/v13-mid-streaming-r0
     }
+    # Tail admission (v4 finding): NeMo total_preds carries exactly one
+    # extra all-silent tail frame vs the ggml DiarStream timeline (NeMo
+    # streaming_update emits the final partial window incl. trailing
+    # silence; ggml's finish() path trims it). Admit total_preds == 711+1
+    # with frame 711 all-silent; anything else is verdict `truncated`.
+    TAIL_ADMIT_EXTRA = 1
 
     def _wav_seconds(path: Path) -> float:
         with _wave.open(str(path), "rb") as wf:
@@ -243,12 +249,18 @@ def main() -> int:
             return 0
         # Frame-count ouroboros: the reference must cover exactly the same
         # frames as the pinned fixture (same audio, same geometry). A
-        # truncated prefix would silently poison Stage 2 gates.
+        # truncated prefix would silently poison Stage 2 gates. Admits the
+        # one known tail difference (see TAIL_ADMIT_EXTRA above).
         import numpy as _np
-        got_frames = int(_np.load(str(out_npz))["total_preds"].shape[0])
+        _arr = _np.load(str(out_npz))
+        got_frames = int(_arr["total_preds"].shape[0])
         want_frames = EXPECTED_FRAMES[label]
         REPORT[f"s0_c_dump_{label}_frames"] = got_frames
-        if got_frames != want_frames:
+        tail_ok = (
+            got_frames == want_frames + TAIL_ADMIT_EXTRA
+            and bool((_arr["total_preds"][want_frames:] == 0).all()))
+        REPORT[f"s0_c_dump_{label}_tail_admitted"] = tail_ok
+        if got_frames != want_frames and not tail_ok:
             REPORT["verdict"] = "truncated"
             REPORT["note"] = (
                 f"{label}: total_preds has {got_frames} frames, fixture pins "
