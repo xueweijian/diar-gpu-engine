@@ -29,7 +29,10 @@ def load_prob_snippet():
     source = KERNEL.read_text(encoding="utf-8")
     start = source.index("# v8 pipeline-knob sweep:")
     end = source.index("def run_cpu(")
-    snippet = "from __future__ import annotations\nimport os\n" + source[start:end]
+    snippet = ("from __future__ import annotations\nimport os\n"
+               "import json\nimport time\nfrom pathlib import Path\n"
+               "COMMIT = 'testcommit'\n"
+               + source[start:end])
     module = types.ModuleType("matrix_prob_snippet")
     module.__dict__["__name__"] = "matrix_prob_snippet"
     exec(compile(snippet, str(KERNEL), "exec"), module.__dict__)  # noqa: S102 - local test fixture
@@ -58,6 +61,7 @@ def _stub_h(monkeypatch, tmp_path, bodies, prob_values=None, prob_error=None):
                           dump_probs_path=None):
         calls.append({"output": str(output), "preset": preset,
                       "extra_args": list(extra_args or []),
+                      "env": dict(env or {}),
                       "dump": str(dump_probs_path) if dump_probs_path else None})
         body = next(body_iter)
         output.parent.mkdir(parents=True, exist_ok=True)

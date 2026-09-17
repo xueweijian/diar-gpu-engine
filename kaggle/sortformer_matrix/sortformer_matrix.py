@@ -137,6 +137,91 @@ DET_SETS_V9: list[tuple[str, str | None, int, bool]] = [
 OFFLINE_FLAG_SENTINEL = "unused-offline-flag"
 
 
+def _export_parity_candidate(
+    label: str,
+    audio: Path,
+    preset: str | None,
+    sweep: dict[str, object],
+) -> dict[str, object] | None:
+    """v12: copy rep0's probs dump + RTTM + raw provenance into OUT.
+
+    The dumps are written under WORK_ROOT (harness) which dies with the
+    session — parity fixtures may only be backfilled from kernel OUTPUT
+    (truth discipline), so rep0's payloads must physically land in
+    /kaggle/working. Only rep0 is exported: a fixture pins ONE observation,
+    not the sweep. The local scripts/fill_parity_fixture.py turns the
+    candidate directory into a schema-v1 parity fixture.
+    """
+    import hashlib
+    import shutil
+
+    cases = sweep.get("cases") or []
+    if not cases:
+        return None
+    case = cases[0]
+    reps = case.get("reps") or []
+    if not reps or not reps[0].get("probs_available"):
+        print(f"[parity-candidate] {label}: rep0 has no probs dump, skipped",
+              flush=True)
+        return None
+    case_dir = h.WORK_ROOT / "det_sweep" / label
+    src_probs = case_dir / "probs.0.f32"
+    src_rttm = case_dir / "rep0.rttm"
+    if not src_probs.exists():
+        print(f"[parity-candidate] {label}: {src_probs} missing, skipped",
+              flush=True)
+        return None
+    dst = OUT / "parity_candidates" / label
+    dst.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_probs, dst / "probs.f32")
+    if src_rttm.exists():
+        shutil.copy2(src_rttm, dst / "rep0.rttm")
+    audio_sha = None
+    if Path(audio).exists():
+        audio_sha = hashlib.sha256(Path(audio).read_bytes()).hexdigest()
+    prov: dict[str, object] = {
+        "label": label,
+        "audio_path": str(audio),
+        "audio_sha256": audio_sha,
+        "preset": None if preset == OFFLINE_FLAG_SENTINEL else preset,
+        "offline_flag": preset == OFFLINE_FLAG_SENTINEL,
+        "env_pins": dict(V12_ENV_PINS),
+        "cross_session_stable": label in V11_SESSION_STABLE,
+        "reps": [
+            {k: r.get(k) for k in ("rep", "body_sha256", "probs_sha256",
+                                   "probs_shape", "probs_available")}
+            for r in reps
+        ],
+        "model_path": str(h.MODEL_PATH),
+        "runtime_version": REPORT.get("runtime_version_output"),
+        "gpu_before": REPORT.get("gpu_before"),
+        "upstream_commit": "a5b6953",
+        "harness_commit": COMMIT,
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    (dst / "candidate.json").write_text(
+        json.dumps(prov, indent=2, sort_keys=True) + "\n")
+    print(f"[parity-candidate] {label}: exported rep0 -> {dst}", flush=True)
+    return {"label": label, "dir": str(dst), "stable": prov["cross_session_stable"]}
+
+# v12 (2026-09-16 verdict): per-process library nondeterminism. v11 showed
+# within-session repeats are bit-identical at BOTH probs and body level while
+# cross-session mid hashes never repeat — the signature of autotune/algo
+# selection happening once per process. These pins force cuDNN to deterministic
+# kernel selection and cuBLAS to a fixed workspace split, so a cross-session
+# rerun (v12 vs v13, identical kernel) should converge mid to ONE hash.
+# Scoped to prob_sweep only: matrix rows keep running unpinned so their body
+# hashes stay comparable with the v4-v11 history.
+V12_ENV_PINS: dict[str, str] = {
+    "CUDNN_DETERMINISTIC": "1",
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+}
+# Cross-session-stable cases per the v11 hash lineage (short == v5/v7/v8
+# baseline; offline_full == v8's stable hash). These are the only legitimate
+# parity L1 fixture candidates; the mid cases churn across sessions.
+V11_SESSION_STABLE = ("short_streaming", "mid_offline_full")
+
+
 def run_prob_sweep(
     binary: Path,
     cases: list[tuple[str, Path, str | None]],
@@ -181,6 +266,7 @@ def run_prob_sweep(
                 binary, audio, out, device="cuda:0", preset=child_preset,
                 extra_args=list(child_extra),
                 timeout=3600, dump_probs_path=dump_path,
+                env=dict(V12_ENV_PINS),
             )
             rep_record: dict[str, object] = {
                 "rep": rep,
@@ -849,6 +935,10 @@ def _main() -> None:
             sweep = run_prob_sweep(
                 binary, [(set_label, Path(str(entry["audio"])), set_preset)])
             prob_sweeps.append(sweep)
+            exported = _export_parity_candidate(
+                set_label, Path(str(entry["audio"])), set_preset, sweep)
+            if exported is not None:
+                REPORT.setdefault("parity_candidates", []).append(exported)
         globals()["N_DET_REPEAT"] = saved_repeat
         REPORT["prob_sweep"] = prob_sweeps
 
