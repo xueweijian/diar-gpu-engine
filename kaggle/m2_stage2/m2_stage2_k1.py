@@ -59,6 +59,19 @@ import diar_harness as h  # noqa: E402
 
 OUT = Path("/kaggle/working")
 
+
+def find_ckpt() -> Path | None:
+    # Runner shares the resolved/downloaded ckpt via env (see
+    # m2_stage2_run._ensure_ckpt); fall back to dataset/working scan when
+    # a gate runs standalone (local mechanics never reach here).
+    env = os.environ.get("M2_STAGE2_CKPT")
+    if env and Path(env).exists():
+        return Path(env)
+    hits = sorted(Path("/kaggle/input").rglob("*.nemo"))
+    if not hits:
+        hits = sorted(Path("/kaggle/working").rglob("*.nemo"))
+    return hits[0] if hits else None
+
 REPORT: dict[str, object] = {
     "schema_version": 1,
     "scope": "pure_speaker_diarization",
@@ -227,8 +240,18 @@ def main() -> int:
     ckpts = sorted(Path("/kaggle/input").rglob("*.nemo"))
     if not ckpts:
         ckpts = sorted(Path("/kaggle/working").rglob("*.nemo"))
+    env_ckpt = os.environ.get("M2_STAGE2_CKPT")
+    if env_ckpt and Path(env_ckpt).exists():
+        ckpts = [Path(env_ckpt)]
+    if not ckpts:
+        REPORT["verdict"] = "ckpt-missing"
+        REPORT["note"] = ("no .nemo in /kaggle/input|working and no "
+                          "M2_STAGE2_CKPT from the runner (download failed?)")
+        REPORT["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        h.emit_report(REPORT, name="m2_stage2_k1_verdict.json")
+        return 0
     REPORT["ref_dir"] = str(ref_dir)
-    REPORT["ckpt"] = str(ckpts[0]) if ckpts else None
+    REPORT["ckpt"] = str(ckpts[0])
 
     sd = load_nemo_state_dict(str(ckpts[0]))
 

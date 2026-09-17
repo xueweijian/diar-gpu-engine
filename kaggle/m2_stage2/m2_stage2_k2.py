@@ -39,6 +39,7 @@ Verdict: K2-measured with worst_layer_max_abs. Thresholds pinned after.
 from __future__ import annotations
 
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -60,6 +61,19 @@ sys.path.insert(0, str(HARNESS_DIR))
 import diar_harness as h  # noqa: E402
 
 OUT = Path("/kaggle/working")
+
+
+def find_ckpt() -> Path | None:
+    # Runner shares the resolved/downloaded ckpt via env (see
+    # m2_stage2_run._ensure_ckpt); fall back to dataset/working scan when
+    # a gate runs standalone (local mechanics never reach here).
+    env = os.environ.get("M2_STAGE2_CKPT")
+    if env and Path(env).exists():
+        return Path(env)
+    hits = sorted(Path("/kaggle/input").rglob("*.nemo"))
+    if not hits:
+        hits = sorted(Path("/kaggle/working").rglob("*.nemo"))
+    return hits[0] if hits else None
 REPORT: dict[str, object] = {
     "schema_version": 1,
     "scope": "pure_speaker_diarization",
@@ -311,6 +325,9 @@ def main() -> int:
         sorted(Path("/kaggle/working").rglob("m2_ref_short.npz"))
     ckpts = sorted(Path("/kaggle/input").rglob("*.nemo")) or \
         sorted(Path("/kaggle/working").rglob("*.nemo"))
+    env_ckpt = os.environ.get("M2_STAGE2_CKPT")
+    if env_ckpt and Path(env_ckpt).exists():
+        ckpts = [Path(env_ckpt)]
     if not ref_hits or not ckpts:
         REPORT["verdict"] = "ref-or-ckpt-missing"
         REPORT["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
