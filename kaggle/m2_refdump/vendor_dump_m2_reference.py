@@ -76,8 +76,18 @@ NEW_FWD = """            handles, conf_outs, trans_outs = (
                 processed_signal_length=concat_lens,
                 bypass_pre_encode=True,
             )
+            # NOTE: handles stay registered through forward_infer: the 18
+            # transformer blocks fire there, not in frontend_encoder (v3
+            # removed too early and captured 0 transformer outputs).
+            preds = model.forward_infer(emb_seq=fc_embs, emb_seq_length=fc_lens)
+            preds = sm.apply_mask_to_preds(preds, fc_lens)
             for hd in handles:
                 hd.remove()"""
+
+OLD_POST = """            preds = model.forward_infer(emb_seq=fc_embs, emb_seq_length=fc_lens)
+            preds = sm.apply_mask_to_preds(preds, fc_lens)
+            out[p + "preds_full"] = preds[0].cpu().numpy()  # (L1+L2+L3, 4)"""
+NEW_POST = """            out[p + "preds_full"] = preds[0].cpu().numpy()  # (L1+L2+L3, 4)"""
 
 OLD_FC = """                out[p + "fc_encoder"] = fc_embs[0].cpu().numpy()"""
 NEW_FC = OLD_FC + """
@@ -107,6 +117,8 @@ def main() -> None:
     src = src.replace(anchor, HELPER.strip("\n") + "\n\n\n" + anchor, 1)
     assert OLD_FWD in src, "frontend_encoder call site missing"
     src = src.replace(OLD_FWD, NEW_FWD, 1)
+    assert OLD_POST in src, "preds post site missing"
+    src = src.replace(OLD_POST, NEW_POST, 1)
     assert OLD_FC in src, "fc_encoder site missing"
     src = src.replace(OLD_FC, NEW_FC, 1)
     lines = src.splitlines()

@@ -187,10 +187,13 @@ def main() -> int:
                 processed_signal_length=concat_lens,
                 bypass_pre_encode=True,
             )
-            for hd in handles:
-                hd.remove()
+            # NOTE: handles stay registered through forward_infer: the 18
+            # transformer blocks fire there, not in frontend_encoder (v3
+            # removed too early and captured 0 transformer outputs).
             preds = model.forward_infer(emb_seq=fc_embs, emb_seq_length=fc_lens)
             preds = sm.apply_mask_to_preds(preds, fc_lens)
+            for hd in handles:
+                hd.remove()
             out[p + "preds_full"] = preds[0].cpu().numpy()  # (L1+L2+L3, 4)
 
             deep = idx < args.deep_chunks
