@@ -310,11 +310,15 @@ def main() -> int:
     xs = math.sqrt(D_MODEL)
     pre_ref = z[chunk + "/pre_encode"].tolist()
     local_xscaled = [[v * xs for v in row] for row in pre_ref]
-    nemo_x = _np.asarray(cap["posenc_out_x"]).reshape(-1, D_MODEL)
+    nemo_x = _np.asarray(cap["posenc_out_x"])
+    assert nemo_x.shape[0] == 1, nemo_x.shape  # (B, T, C), B == 1
+    nemo_x = nemo_x.reshape(-1, D_MODEL)
     REPORT["probe_T"] = int(nemo_x.shape[0])
     probes["P0_xscaled_input"] = cmp(nemo_x, _np.asarray(local_xscaled)[:nemo_x.shape[0]])
 
-    pe_nemo = _np.asarray(cap["pos_emb"]).reshape(-1, D_MODEL)
+    pe_nemo = _np.asarray(cap["pos_emb"])
+    assert pe_nemo.shape[0] == 1, pe_nemo.shape  # (1, P, C)
+    pe_nemo = pe_nemo.reshape(-1, D_MODEL)
     REPORT["probe_pe_shape"] = [int(v) for v in pe_nemo.shape]
     T = int(nemo_x.shape[0])
     pe_local = _np.asarray(relpos_table(T, D_MODEL))
@@ -339,9 +343,9 @@ def main() -> int:
                "bv": v1(sd[p + "self_attn.pos_bias_v"]),
                "o_w": t2(sd[p + "self_attn.linear_out.weight"]),
                "ob": v1(sd[p + "self_attn.linear_out.bias"])}
-    n_sa = _np.asarray(cap["n_sa"])  # NeMo's own MHA input
-    mha_nemo = _np.asarray(cap["mha"])
-    probes["P2_norm_ff1"] = cmp(_np.asarray(cap["n_ff1"]),
+    n_sa = _np.asarray(cap["n_sa"]).reshape(-1, D_MODEL)  # (B,T,C) -> (T,C)
+    mha_nemo = _np.asarray(cap["mha"]).reshape(-1, D_MODEL)
+    probes["P2_norm_ff1"] = cmp(_np.asarray(cap["n_ff1"]).reshape(-1, D_MODEL),
                                 layernorm_np(_np.asarray(local_xscaled)[:T],
                                              v1(sd[p + "norm_feed_forward1.weight"]),
                                              v1(sd[p + "norm_feed_forward1.bias"])))
@@ -379,8 +383,8 @@ def main() -> int:
     q0 = _np.asarray(qkv["q"]).reshape(-1)
     REPORT["probe_q_span"] = [float(q0.min()), float(q0.max())]
 
-    n_conv = _np.asarray(cap["n_conv"])  # NeMo's own conv input
-    conv_nemo = _np.asarray(cap["conv"])
+    n_conv = _np.asarray(cap["n_conv"]).reshape(-1, D_MODEL)
+    conv_nemo = _np.asarray(cap["conv"]).reshape(-1, D_MODEL)
     _dw = _np.asarray(sd[p + "conv.depthwise_conv.weight"])
     REPORT["probe_dw_shape"] = list(_dw.shape)
     _pw1 = t2(sd[p + "conv.pointwise_conv1.weight"])
@@ -433,9 +437,11 @@ def main() -> int:
                                   ff2["w1"], ff2["bb1"], ff2["w2"], ff2["bb2"]))
     res = res + 0.5 * f2
     layer_local = layernorm_np(res, norms["go"], norms["bo"])
-    probes["P5_full_layer_local"] = cmp(_np.asarray(cap["layer_out"]), layer_local)
+    probes["P5_full_layer_local"] = cmp(_np.asarray(cap["layer_out"]).reshape(-1, D_MODEL),
+                                          layer_local)
     ref_b0 = _np.asarray(z[chunk + "/conformer_block_00"].tolist())
-    probes["P5_nemo_vs_dump"] = cmp(ref_b0[:T], _np.asarray(cap["layer_out"]))
+    probes["P5_nemo_vs_dump"] = cmp(ref_b0[:T],
+                                    _np.asarray(cap["layer_out"]).reshape(-1, D_MODEL))
     REPORT["probes"] = probes
     REPORT["verdict"] = "k4-measured"
     REPORT["note"] = ("NeMo-vs-local stage probe on short/chunk000 layer 00; "
