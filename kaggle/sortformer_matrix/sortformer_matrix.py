@@ -228,7 +228,7 @@ V12_ENV_PINS: dict[str, str] = {}
 #                               fixtures remain valid (production binary is
 #                               the patched one) but the root-cause file stays
 #                               open with a timing chapter.
-PROBDUMP_ENABLED = False  # v14: pristine upstream build (attribution, residual cause)
+PROBDUMP_ENABLED = True  # v14 verdict: patch proven timing-irrelevant (see matrix doc §13)
 # Cross-session-stable cases. Initially only short/offline_full (v11 lineage);
 # since then mid_streaming ddf2312b and mid_offline_preset 3f2258c5 reproduced
 # across THREE sessions (v11 unpinned = v12 pinned = v13 unpinned), so all

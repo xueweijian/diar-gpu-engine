@@ -351,4 +351,32 @@ mid fixture 回填（三会话收敛背书，candidate 标记 stable=false 属�
 parity L1 真值至此覆盖全部四个 sweep case：frame_probs 层的 M2 对拍可以
 开工。
 
+## 13. v14 关案：pristine upstream 四 case 全复现，根因=平台状态
+（2026-09-17 pass）
+
+v14 = `PROBDUMP_ENABLED=False`：pristine upstream 二进制（build record
+`probdump_patch.patched=false`），无 pins，body-only 判定
+（`identical_body_only`，dump 不请求、probs 标 unavailable）。结果
+**四 case body hash 全部复现 patched 时代的值**：
+
+- short `81704884` / mid `ddf2312b` / offline_full `999fb4ba` /
+  preset `3f2258c5`——与 v11/v12/v13（patched ± pins）逐字节一致。
+
+**根因结案（排除法收口）**：v4-v10"漂移时代"（mid 每会话 3 个 unique
+hash、跨会话从不复现）既非 NN 权重路径（v11 probs 全同）、非 host 侧
+逻辑（AOSC/BirthGate/FE/分段全部 oracle 对拍过）、非 autotune 选择
+（v13 pins no-op）、也非 probdump patch（v14 pristine 同值）——剩下的
+唯一变量是 **v11 之前 Kaggle 平台的库/驱动状态**，2026-09-16 起该状态
+进入确定性窗口。当前 epoch 的事实由四个会话（v11 未钉/v12 钉/v13 未钉/
+v14 pristine）背书：**同 config 逐字节稳定，跨会话、跨二进制、跨 pin
+状态全部收敛**。
+
+对 M2 的意义：parity fixture 的有效性不依赖我们控制不了的漂移回归——
+若未来平台状态再变，四 case hash 会集体迁移，届时重跑一次 sweep +
+重填 fixture 即可（fill 铁律已把流程钉死）。生产姿态恢复
+PROBDUMP_ENABLED=True。
+
+**M1 探针轨道到此关案。下一步：M2 神经算子 frame_probs 对拍**
+（四 case fixture 就绪，gate tolerance 档阈值已钉）。
+
 5. 以上均为 timing/结构实验，不动 engine 实现。
