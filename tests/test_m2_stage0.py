@@ -148,3 +148,18 @@ def test_spike_has_three_verdicts() -> None:
     for verdict in ("no-nemo-checkpoint", "nemo-not-installable", "nemo-ok"):
         assert verdict in text, f"spike verdict {verdict!r} missing"
     assert "dump_m2_reference.py" in text
+    assert "EMBEDDED_DUMP_M2_REFERENCE" in text
+
+
+def test_embedded_payload_round_trip() -> None:
+    tree = ast.parse(SPIKE.read_text())
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and node.targets
+                and getattr(node.targets[0], "id", "") == "EMBEDDED_DUMP_M2_REFERENCE"):
+            embedded = ast.literal_eval(node.value)
+            break
+    else:
+        raise AssertionError("EMBEDDED_DUMP_M2_REFERENCE missing")
+    sibling = DUMP.read_text()
+    assert embedded, "embedded payload empty — run embed_dump.py before push"
+    assert embedded == sibling, "embedded payload differs from sibling dump file"
