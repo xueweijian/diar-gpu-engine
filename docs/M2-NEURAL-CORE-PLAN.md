@@ -123,12 +123,40 @@ frame_probs，直接过现有 **4 fixture tolerance 门**。这一绿，
 **M2 功能闭合**，manifest 升 schema v2（加中间层 tensor pin，
 v1 fixture 保持有效，loader 向后兼容）。
 
-## 6. Stage 4 — CUDA sm_60（即 M3 开头，不在本计划内展开）
+## 6. Stage 0 spike 结论（2026-09-17，kernel v2 `nemo-ok`）
+
+- S0-a：HF 仓有 `.nemo`（`diar_streaming_sortformer_4spk-v2.nemo`，
+  471MB，Kaggle 可直拉）。S0-b：`pip install nemo_toolkit[asr]` 在
+  Kaggle T4 镜像一次成功，torch 2.10+cu128 CUDA 可用。**NeMo 路线
+  可行，ggml-probdump fallback 封存**。
+- S0-c（重要发现，省了一次误判）：NeMo `total_preds`（原始 sigmoid，
+  pre-gate）与 ggml fixture（`DiarStream::probs_`，POST-BirthGate
+  timeline，含 128 帧回溯改写）**不能直接比**。证据：
+  mid chunk7/8/10 NeMo raw argmax=1，gated=0（未建立通道被折叠归零，
+  mid ch1 在 4467 帧全零）；short 首 chunk max_abs 仅 0.004（q8 量化带内）。
+- 真值纪律更新：**Stage 2 的 teacher-forced 门一律用 `.npz` 内同层
+  输入/输出对**（`mel_window`→`pre_encode`→`conformer_block_NN`→
+  `fc_encoder`→`transformer_block_NN`→`preds_full`），free-running
+  端到端门才走 ggml fixture。两者各有其位，不再混比。
+- dump 缺陷（修好才算真值源）：hook 判类名漏了 NeMo 侧 transformer
+  block 的真实类名（`n_transformer_blocks=[0]`，conformer 17 个全中），
+  且 `--max-sec 40` 把 357s 的 mid 截成 502 帧（short 也被截成 502，
+  fixture 是 711）。修法：判类名改"执行期 ouroboros"（chunk 级输出
+  形状反推归属：(L,512)=conformer / (L,192)=transformer，不依赖类名），
+  counts 断言 17/18；`--max-sec` 按音频实际长度传（spike 报告音频秒数，
+  dump 侧校验 `total_preds` 帧数 == ggml fixture 帧数，不等即 verdict
+  `truncated`）。
+- `.npz`（short/mid 各 ~18MB）落 `/tmp/m2s0_out/`，本地分析用，不进 git。
 
 P100 真机，FP32 先行；FP16-storage+FP32-accum 按 ADR-0002 跟上；
 CUDA Graph 只在 streaming 几何稳定后（M3 §6）。
 
-## 7. 预算与纪律
+## 7. Stage 4 — CUDA sm_60（即 M3 开头，不在本计划内展开）
+
+P100 真机，FP32 先行；FP16-storage+FP32-accum 按 ADR-0002 跟上；
+CUDA Graph 只在 streaming 几何稳定后（M3 §6）。
+
+## 8. 预算与纪律
 
 - kernel 预算：Stage 0（1）+ Stage 2（3-4）+ Stage 3（1-2）≈ 5-7 个，
   每个 ~50min；本地工作零 GPU 开销。

@@ -42,29 +42,43 @@ def _capture_block_outputs(model):
 
     Hooks only observe: the NeMo forward path is untouched. Returns
     (handles, conf_outs, trans_outs); the caller removes handles right
-    after the forward. Layer identity is by execution: hooks fire in
-    forward order, so both lists are in stack order no matter where NeMo
-    nests the modules (no attribute-path assumptions). Expected
-    (sortformer v2): 17 ConformerLayer + 18 TransformerEncoderBlock;
-    actual counts are stored in the dump (n_conformer_blocks /
-    n_transformer_blocks) for the spike verdict.
+    after the forward.
+
+    Layer identity is by OUTPUT SHAPE (v3 ouroboros rule, Stage 0
+    finding): NeMo-side class names are not trusted. A block output of
+    (..., 512) is a conformer block, (..., 192) a transformer block;
+    anything else is recorded as unknown and fails the dump loudly
+    (never silently dropped). Hooks fire in forward order, so both
+    lists are in stack order.
     """
     conf_outs: list = []
     trans_outs: list = []
+    unknown_shapes: list = []
     handles = []
 
     def _mk(store):
         def _fn(module, args, output):
             out = output[0] if isinstance(output, (tuple, list)) else output
-            store.append(out.detach().cpu().numpy())
+            arr = out.detach().cpu().numpy()
+            if arr.shape[-1] == 512:
+                conf_outs.append(arr)
+            elif arr.shape[-1] == 192:
+                trans_outs.append(arr)
+            else:
+                unknown_shapes.append(arr.shape)
+                store.append(arr)
         return _fn
 
     for mod in model.modules():
         cls = type(mod).__name__
-        if cls == "ConformerLayer":
-            handles.append(mod.register_forward_hook(_mk(conf_outs)))
-        elif cls in ("TransformerEncoderBlock", "TransformerEncoderLayer"):
-            handles.append(mod.register_forward_hook(_mk(trans_outs)))
+        if cls in ("ConformerLayer", "TransformerEncoderBlock",
+                   "TransformerEncoderLayer", "TransformerLayer"):
+            handles.append(mod.register_forward_hook(_mk(conf_outs
+                                                          if cls == "ConformerLayer"
+                                                          else trans_outs)))
+    # Ouroboros: verify the class-name routing against shape routing on
+    # the first deep chunk is done by the caller via counts (17/18).
+    _capture_block_outputs.unknown_shapes = unknown_shapes
     return handles, conf_outs, trans_outs
 
 
@@ -184,6 +198,15 @@ def main() -> int:
                 # frontend_encoder applies encoder_proj, so this is the
                 # post-projection (L, 192) input to the transformer stack.
                 out[p + "fc_encoder"] = fc_embs[0].cpu().numpy()
+                if len(conf_outs) != 17 or len(trans_outs) != 18:
+                    raise RuntimeError(
+                        f"chunk{idx:03d}: ouroboros count mismatch: "
+                        f"{len(conf_outs)} conformer (want 17) / "
+                        f"{len(trans_outs)} transformer (want 18)")
+                if getattr(_capture_block_outputs, "unknown_shapes", None):
+                    raise RuntimeError(
+                        f"chunk{idx:03d}: unknown block shapes: "
+                        f"{_capture_block_outputs.unknown_shapes}")  # noqa: E501
                 for bi, arr in enumerate(conf_outs):
                     out[p + f"conformer_block_{bi:02d}"] = arr[0]
                 for bi, arr in enumerate(trans_outs):

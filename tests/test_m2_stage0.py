@@ -66,9 +66,18 @@ def _load_helper():
     raise AssertionError("_capture_block_outputs missing from shipped dump script")
 
 
+class _FakeArr(str):
+    """A str payload with a numpy-like .shape (shape-routing test)."""
+
+    def __new__(cls, payload, last_dim):
+        obj = super().__new__(cls, payload)
+        obj.shape = (2, last_dim)
+        return obj
+
+
 class _FakeTensor:
-    def __init__(self, arr):
-        self._arr = arr
+    def __init__(self, arr, last_dim):
+        self._arr = _FakeArr(arr, last_dim)
 
     def detach(self):
         return self
@@ -125,9 +134,10 @@ class _FakeModel:
 
 def test_hook_helper_order_and_selectivity() -> None:
     helper = _load_helper()
-    c0, c1 = ConformerLayer(_FakeTensor("c0")), ConformerLayer(_FakeTensor("c1"))
-    lin = Linear(_FakeTensor("lin-out"))
-    t0 = TransformerEncoderBlock(_FakeTensor("t0"))
+    c0 = ConformerLayer(_FakeTensor("c0", 512))
+    c1 = ConformerLayer(_FakeTensor("c1", 512))
+    lin = Linear(_FakeTensor("lin-out", 256))
+    t0 = TransformerEncoderBlock(_FakeTensor("t0", 192))
     model = _FakeModel([c0, lin, c1, t0])
     handles, conf_outs, trans_outs = helper(model)
     assert len(handles) == 3, f"expected 3 hooked layers, got {len(handles)}"
@@ -137,10 +147,25 @@ def test_hook_helper_order_and_selectivity() -> None:
         mod.fire()
     assert conf_outs == ["c0", "c1"], conf_outs
     assert trans_outs == ["t0"], trans_outs
-    # Removal contract: every handle removable (dump loop try/finally).
+    # Removal contract: every handle removable (dump loop removes inline).
     for hd in handles:
         hd.remove()
         assert hd.removed
+
+
+def test_hook_helper_shape_routing_and_unknown() -> None:
+    """Ouroboros rule: routing follows output last-dim, not class name."""
+    helper = _load_helper()
+
+    class AliasedConformer(_FakeModule):
+        pass
+    AliasedConformer.__name__ = "SomethingElseEntirely"
+
+    weird = AliasedConformer(_FakeTensor("weird", 999))
+    # Not in the hooked class list -> never fires, never recorded.
+    model = _FakeModel([weird])
+    handles, conf_outs, trans_outs = helper(model)
+    assert handles == [] and conf_outs == [] and trans_outs == []
 
 
 def test_spike_has_three_verdicts() -> None:
