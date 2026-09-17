@@ -148,7 +148,11 @@ def softmax_rows(x):
 
 
 def relpos_table(L, D):
-    div = [math.exp(i * -(math.log(10000.0) / D)) for i in range(D // 2)]
+    # NeMo create_pe: div_term = exp(arange(0,D,2) * -(log(1e4)/D)) -> pair-i
+    # frequency exp(2i*-(log(1e4)/D)). The i-only exponent was the v5-v11
+    # pos-table bug (v11 P1 fingerprint: cos 0.462031 vs live window; fixed
+    # form matches to 1.05e-6). Pinned by test_posenc fingerprint case.
+    div = [math.exp(2 * i * -(math.log(10000.0) / D)) for i in range(D // 2)]
     pe = []
     for r in range(2 * L - 1):
         pos = (L - 1) - r

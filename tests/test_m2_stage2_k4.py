@@ -4,7 +4,7 @@ Pins the probe contract that a kernel round-trip cannot cheaply re-verify:
 - K4 compiles and carries its job marker (embed guard needs it);
 - the K4-local MHA/conv/FF/LN helpers agree with the K2 gate helpers on
   synthetic weights (same transcription, no fork);
-- every probe stage P0..P5 is present in main() (a deleted stage would
+- every probe stage P0..P6 is present in main() (a deleted stage would
   silently narrow the probe);
 - embed round-trip covers K4 (anchor registered + marker guarded).
 """
@@ -79,6 +79,7 @@ def test_k4_stages_present() -> None:
     for stage in ("P0_xscaled_input", "P1_pos_table", "P2_norm_ff1",
                   "P3a_mha_full_local", "P3b_mha_nemo_qkvp_local_formula",
                   "P4_conv_on_nemo_input", "P5_full_layer_local", "P5_nemo_vs_dump",
+                  "P6_stem_tail_probe", "chunk035", "chunk223",
                   "probe_store_rows", "pos_hook"):
         assert stage in text, f"K4 lost stage {stage}"
 

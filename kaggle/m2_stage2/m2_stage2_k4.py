@@ -14,6 +14,10 @@ then compares, stage by stage through layer 00 only:
                              same input -> isolates input-vs-formula)
   P4  conv output
   P5  full layer output     (= old K2 L00/chunk000 gate, 0.45 anchor)
+  P6  stem tail probe       (v12) short/chunk035 + mid/chunk223: NeMo LIVE
+                             pre_encode(mel_window) vs dump vs local K3
+                             stem, PER ROW — splits dump-artifact vs
+                             mirror-bug for the K3 tail-chunk redness.
 
 Every comparison is teacher-forced on NeMo's own intermediate inputs
 (hooks observe, forward path untouched), so a FAIL localizes to one stage.
@@ -58,7 +62,9 @@ D_MODEL, N_HEADS = 512, 8
 
 
 def relpos_table(L, D):
-    div = [math.exp(i * -(math.log(10000.0) / D)) for i in range(D // 2)]
+    # Same fix as K2 (see its note): pair-i frequency exp(2i*-(log(1e4)/D)).
+    # The i-only exponent was the v5-v11 pos-table bug (v11 P1 fingerprint).
+    div = [math.exp(2 * i * -(math.log(10000.0) / D)) for i in range(D // 2)]
     pe = []
     for r in range(2 * L - 1):
         pos = (L - 1) - r
@@ -444,6 +450,86 @@ def main() -> int:
     ref_b0 = _np.asarray(z[chunk + "/conformer_block_00"].tolist())
     probes["P5_nemo_vs_dump"] = cmp(ref_b0[:T],
                                     _np.asarray(cap["layer_out"]).reshape(-1, D_MODEL))
+
+    # P6 stem tail probe (v12): short/chunk035 row 10 stays red at ~34.8
+    # under the K3 valid-row mask (mid/chunk223 went green with the same
+    # mask), so split dump-fidelity vs mirror-fidelity on the REAL stem:
+    # feed the stored mel_window through NeMo's live pre_encode
+    # (bypass_pre_encode=False -> transpose + ConvSubsampling inside
+    # forward_internal) and compare PER ROW (a) live vs dump,
+    # (b) local stem vs live. Local stem + weights come from the
+    # materialized K3 module (same WORK dir as this gate at runtime).
+    p6: dict[str, object] = {}
+    try:
+        here = Path(__file__).resolve().parent
+        if str(here) not in sys.path:
+            sys.path.insert(0, str(here))
+        import m2_stage2_k3 as k3mod  # noqa: E402
+        pk = "encoder.pre_encode."
+        wt3 = {"c0_w": k3mod.t2c(sd[pk + "conv.0.weight"]),
+               "c0_b": k3mod.v1(sd[pk + "conv.0.bias"]),
+               "dw1_w": k3mod.t2c(sd[pk + "conv.2.weight"]),
+               "dw1_b": k3mod.v1(sd[pk + "conv.2.bias"]),
+               "pw1_w": k3mod.t2(sd[pk + "conv.3.weight"]),
+               "pw1_b": k3mod.v1(sd[pk + "conv.3.bias"]),
+               "dw2_w": k3mod.t2c(sd[pk + "conv.5.weight"]),
+               "dw2_b": k3mod.v1(sd[pk + "conv.5.bias"]),
+               "pw2_w": k3mod.t2(sd[pk + "conv.6.weight"]),
+               "pw2_b": k3mod.v1(sd[pk + "conv.6.bias"]),
+               "out_w": k3mod.t2(sd[pk + "out.weight"]),
+               "out_b": k3mod.v1(sd[pk + "out.bias"])}
+        for kk in ("pw1_w", "pw2_w"):
+            w = wt3[kk]
+            if isinstance(w[0][0], list):
+                wt3[kk] = [[v[0][0] if isinstance(v[0], list) else v[0] for v in row]
+                           for row in w]
+        for kk in ("dw1_w", "dw2_w"):
+            w = wt3[kk]
+            if isinstance(w[0][0], list) and len(w[0]) == 1:
+                wt3[kk] = [ch[0] for ch in w]
+        for label, chunk6 in (("short", "chunk035"), ("mid", "chunk223")):
+            z6 = z if label == "short" else _np.load(
+                str(ref_dir / "m2_ref_mid.npz"), allow_pickle=True)
+            if chunk6 + "/mel_window" not in z6.files:
+                continue
+            mel6 = _np.asarray(z6[chunk6 + "/mel_window"], dtype=_np.float32)
+            feat_len6 = int(z6[chunk6 + "/feat_length"][0])
+            stem_cap: dict[str, object] = {}
+
+            def stem_hook(mod, args, out):
+                o = out[0] if isinstance(out, (tuple, list)) else out
+                stem_cap["stem"] = o.detach().cpu().numpy()
+
+            hh = enc.pre_encode.register_forward_hook(stem_hook)
+            try:
+                with torch.inference_mode():
+                    model.frontend_encoder(
+                        processed_signal=torch.from_numpy(mel6.T.copy()).unsqueeze(0).to(device),
+                        processed_signal_length=torch.tensor([feat_len6], device=device),
+                        bypass_pre_encode=False)
+            finally:
+                hh.remove()
+            live = _np.asarray(stem_cap["stem"], dtype=_np.float64).reshape(-1, D_MODEL)
+            dump6 = _np.asarray(z6[chunk6 + "/pre_encode"], dtype=_np.float64)
+            local6 = _np.asarray(k3mod.pre_encode(mel6.tolist(), wt3), dtype=_np.float64)
+            n_rows = int(min(live.shape[0], dump6.shape[0], local6.shape[0]))
+            p6[label] = {
+                "chunk": chunk6, "feat_len": feat_len6,
+                "n_valid": int(z6[chunk6 + "/state_lens_before"][2]),
+                "T_full": int(dump6.shape[0]), "rows_compared": n_rows,
+                "live_vs_dump_row_max": [float(_np.abs(live[i] - dump6[i]).max())
+                                         for i in range(n_rows)],
+                "local_vs_live_row_max": [float(_np.abs(local6[i] - live[i]).max())
+                                          for i in range(n_rows)],
+                "local_vs_dump_row_max": [float(_np.abs(local6[i] - dump6[i]).max())
+                                          for i in range(n_rows)],
+                "live_row_rms": [float(_np.sqrt((live[i] ** 2).mean()))
+                                 for i in range(n_rows)],
+                "live_shape": [int(v) for v in live.shape]}
+    except Exception as exc:  # a probe failure is data, never a gate kill
+        p6["error"] = repr(exc)
+    probes["P6_stem_tail_probe"] = p6
+
     REPORT["probes"] = probes
     REPORT["verdict"] = "k4-measured"
     REPORT["note"] = ("NeMo-vs-local stage probe on short/chunk000 layer 00; "
