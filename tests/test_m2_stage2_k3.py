@@ -34,6 +34,55 @@ def test_k3_compiles() -> None:
     py_compile.compile(str(K3), doraise=True)
 
 
+def test_k3_verdict_is_measured() -> None:
+    # K3 is a full pre_encode gate now, not a probe scaffold.
+    text = K3.read_text()
+    assert "k3-measured" in text
+    assert "k3-scaffold" not in text
+
+
+def test_k3_t2_helpers_keep_layout() -> None:
+    # Same transpose trap family: t2/t2c must not transpose.
+    ns = _load()
+    assert ns["t2"]([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]) == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    assert ns["t2c"]([[[[1.0]]]]) == [[[[1.0]]]]
+
+
+def test_k3_pre_encode_end_to_end() -> None:
+    # K3 pre_encode() full path on synthetic weights (mirrors the C++
+    # TestTranscription path in test_helpers_match_cpp_subsampling).
+    import random
+    ns = _load()
+    rng = random.Random(33)
+    TM, F, C, D = 8, 8, 4, 6
+    mel = [[rng.uniform(-0.5, 0.5) for _ in range(F)] for _ in range(TM)]
+
+    def mat4(co, ci):
+        return [[[[rng.uniform(-0.3, 0.3) for _ in range(3)] for _ in range(3)]
+                 for _ in range(ci)] for _ in range(co)]
+
+    def mat3(c):
+        return [[[rng.uniform(-0.3, 0.3) for _ in range(3)] for _ in range(3)]
+                for _ in range(c)]
+
+    def mat2(r, c):
+        return [[rng.uniform(-0.3, 0.3) for _ in range(c)] for _ in range(r)]
+
+    def vec(n):
+        return [rng.uniform(-0.2, 0.2) for _ in range(n)]
+
+    f3 = ns["ool"](ns["ool"](ns["ool"](F)))
+    wt = {"c0_w": mat4(C, 1), "c0_b": vec(C),
+          "dw1_w": mat3(C), "dw1_b": vec(C), "pw1_w": mat2(C, C), "pw1_b": vec(C),
+          "dw2_w": mat3(C), "dw2_b": vec(C), "pw2_w": mat2(C, C), "pw2_b": vec(C),
+          "out_w": mat2(D, C * f3), "out_b": vec(D)}
+    got = ns["pre_encode"](mel, wt, F=F, C=C, D=D)
+    t3 = ns["ool"](ns["ool"](ns["ool"](TM)))
+    assert len(got) == t3, (len(got), t3)
+    assert len(got[0]) == D
+    assert all(all(__import__("math").isfinite(v) for v in row) for row in got)
+
+
 def test_helpers_match_cpp_subsampling() -> None:
     import random
     ns = _load()
@@ -134,5 +183,56 @@ def test_helpers_match_cpp_subsampling() -> None:
 
 def test_key_fragments_documented() -> None:
     text = K3.read_text()
-    for frag in ("pre_encode", "conv.0", "pre_encode.out", "sampling_num"):
+    for frag in ("pre_encode", "conv.0", "pre_encode.out", "dw_striding"):
         assert frag in text, f"kernel missing key fragment {frag}"
+
+
+def test_pre_encode_matches_staged_helpers() -> None:
+    # pre_encode() must equal the staged conv2d/dw/pw/flat_cf/lin path on
+    # the SAME synthetic weights (guards the vectorized rewrite against
+    # stage-order or reshape drift; the staged path itself is pinned to
+    # C++ by test_helpers_match_cpp_subsampling).
+    import random
+    ns = _load()
+    rng = random.Random(37)
+    TM, F, C, D = 12, 8, 4, 6
+
+    def mat4(co, ci):
+        return [[[[rng.uniform(-0.3, 0.3) for _ in range(3)] for _ in range(3)]
+                 for _ in range(ci)] for _ in range(co)]
+
+    def mat3(c):
+        return [[[rng.uniform(-0.3, 0.3) for _ in range(3)] for _ in range(3)]
+                for _ in range(c)]
+
+    def mat2(r, c):
+        return [[rng.uniform(-0.3, 0.3) for _ in range(c)] for _ in range(r)]
+
+    def vec(n):
+        return [rng.uniform(-0.2, 0.2) for _ in range(n)]
+
+    mel = [[rng.uniform(-0.5, 0.5) for _ in range(F)] for _ in range(TM)]
+    wt = {"c0_w": mat4(C, 1), "c0_b": vec(C),
+          "dw1_w": mat3(C), "dw1_b": vec(C), "pw1_w": mat2(C, C), "pw1_b": vec(C),
+          "dw2_w": mat3(C), "dw2_b": vec(C), "pw2_w": mat2(C, C), "pw2_b": vec(C),
+          "out_w": mat2(D, C * ns["ool"](ns["ool"](ns["ool"](F)))), "out_b": vec(D)}
+    got = ns["pre_encode"](mel, wt, F=F, C=C, D=D)
+    # Staged path through the facades.
+    x = [[list(row) for row in mel]]
+    s0 = ns["conv2d"](x, wt["c0_w"], wt["c0_b"], 1, TM, F, C)
+    t1, f1 = ns["ool"](TM), ns["ool"](F)
+    d1 = ns["dw"](s0, wt["dw1_w"], wt["dw1_b"], C, t1, f1)
+    t2, f2 = ns["ool"](t1), ns["ool"](f1)
+    d1f = [[d1[cc][t][f] for t in range(t2) for f in range(f2)] for cc in range(C)]
+    s1 = ns["pw"](d1f, wt["pw1_w"], wt["pw1_b"], C)
+    s1c = [[[s1[cc][t * f2 + f] for f in range(f2)] for t in range(t2)] for cc in range(C)]
+    d2 = ns["dw"](s1c, wt["dw2_w"], wt["dw2_b"], C, t2, f2)
+    t3, f3 = ns["ool"](t2), ns["ool"](f2)
+    d2f = [[d2[cc][t][f] for t in range(t3) for f in range(f3)] for cc in range(C)]
+    s2 = ns["pw"](d2f, wt["pw2_w"], wt["pw2_b"], C)
+    s2c = [[[s2[cc][t * f3 + f] for f in range(f3)] for t in range(t3)] for cc in range(C)]
+    want = ns["lin"](ns["flat_cf"](s2c, C, t3, f3), wt["out_w"], wt["out_b"])
+    assert len(got) == len(want) == t3
+    for i in range(t3):
+        for j in range(D):
+            assert abs(got[i][j] - want[i][j]) < 1e-9, f"staged [{i},{j}]"

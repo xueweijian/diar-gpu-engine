@@ -51,6 +51,22 @@ def test_k2_compiles() -> None:
     py_compile.compile(str(K2), doraise=True)
 
 
+def test_t2_keeps_torch_layout() -> None:
+    # Same t2() transpose trap as K1 (fixed 2026-09-17): torch Linear
+    # [out,in] must reach matvec_rows WITHOUT transpose. Rectangular
+    # proof: [2,3] stays [2,3].
+    ns = _load()
+    assert ns["t2"]([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]) == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+
+
+def test_k2_verdict_is_measured() -> None:
+    # K2 is a full 17-layer gate now, not a probe scaffold.
+    text = K2.read_text()
+    assert '"k2-measured"' in text or "'k2-measured'" in text
+    assert "k2-scaffold" not in text.replace("not a probe scaffold", ""), \
+        "K2 still carries scaffold verdict"
+
+
 def test_shift_orientation() -> None:
     ns = _load()
     T = 3

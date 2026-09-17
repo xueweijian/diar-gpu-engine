@@ -30,7 +30,9 @@ REQUIRED_KEYS = (
                "layer_norm_2.weight", "layer_norm_2.bias",
                "second_sub_layer.dense_in.weight", "second_sub_layer.dense_in.bias",
                "second_sub_layer.dense_out.weight", "second_sub_layer.dense_out.bias")]
-    + ["sortformer_modules.first_hidden_to_hidden.weight",
+    + ["sortformer_modules.encoder_proj.weight",
+       "sortformer_modules.encoder_proj.bias",
+       "sortformer_modules.first_hidden_to_hidden.weight",
        "sortformer_modules.first_hidden_to_hidden.bias",
        "sortformer_modules.single_hidden_to_spks.weight",
        "sortformer_modules.single_hidden_to_spks.bias"]
@@ -52,12 +54,25 @@ def test_k1_compiles() -> None:
     py_compile.compile(str(K1), doraise=True)
 
 
+def test_t2_keeps_torch_layout() -> None:
+    # The t2() transpose trap (fixed 2026-09-17): torch Linear [out,in] must
+    # reach matvec_rows WITHOUT transpose. Rectangular weight [2,3] proves
+    # orientation (transpose would give [3,2] and crash matvec downstream).
+    ns = _load()
+    assert ns["t2"]([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]) == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    assert len(ns["t2"]([[1.0, 2.0], [3.0, 4.0]])) == 2
+
+
 def test_weight_keys_documented() -> None:
     text = K1.read_text()
     for key in ("first_sub_layer.query_net.weight", "second_sub_layer.dense_in.weight",
                 "layer_norm_1.weight", "first_hidden_to_hidden.weight",
-                "single_hidden_to_spks.weight"):
+                "single_hidden_to_spks.weight", "sortformer_modules.encoder_proj.weight"):
         assert key in text, f"kernel missing documented key fragment {key}"
+    # Every REQUIRED_KEYS entry must be literally readable from the kernel.
+    for key in REQUIRED_KEYS:
+        frag = key.split(".")[-2] + "." + key.split(".")[-1]
+        assert frag in text, f"kernel never reads {key}"
 
 
 def test_python_block_matches_cpp() -> None:

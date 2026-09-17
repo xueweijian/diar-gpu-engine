@@ -44,7 +44,7 @@ def main() -> int:
             results[gate] = "ran"
         except SystemExit as exc:
             results[gate] = f"exit-{exc.code}"
-        except Exception as exc:  # noqa: BLE001 — gate bugs must not kill siblings
+        except BaseException as exc:  # noqa: BLE001 — gate bugs must not kill siblings
             results[gate] = f"error: {exc!r}"
     print(f"[stage2] done in {time.time() - t0:.0f}s: {results}", flush=True)
     return 0

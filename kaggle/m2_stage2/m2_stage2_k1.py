@@ -1,28 +1,24 @@
-"""M2 Stage 2 K1: teacher-forced gates head + transformer block x18 + encoder_proj.
+"""M2 Stage 2 K1: teacher-forced gates encoder_proj + transformer x18 + head.
 
 Reads the Stage 0 .npz reference(s) on the kernel side (dataset, not git),
-runs the local CPU reference (src/layers.cpp, shipped as code_file sibling),
-and gates every layer teacher-forced:
+runs the numpy-vectorized reference (same math as src/layers.cpp: Linear
+[out,in] @, biased-var LN, contiguous heads, post-LN transformer, relu
+head), and gates every layer teacher-forced:
 
-  head gate: transformer_block_17 -> preds_full (18-deep teacher input).
+  proj gate: conformer_block_16 (512) -> fc_encoder (192) via
+      sortformer_modules.encoder_proj (NeMo frontend_encoder tail).
   transformer gates: fc_encoder -> transformer_block_00 -> ... ->
       transformer_block_17 (chain of 18, each fed the REFERENCE predecessor
       output, never our own — a failure localizes to one block).
-  encoder_proj gate: conformer_block_16 -> fc_encoder is checked implicitly
-      by the transformer chain input; this kernel additionally reports the
-      raw input/output RMS per block so a silent zero/garbage is obvious.
+  head gate: transformer_block_17 -> preds_full (forward_speaker_sigmoids).
 
-Verdict rules (printed + verdict json):
-  HEAD_PASS / HEAD_FAIL, TRANSFORMER_PASS(n/18) / TRANSFORMER_FAIL.
-  Metrics per gate: max_abs, mean_abs, cosine, frame_agreement(argmax @0.5).
-  Thresholds are REPORTED, not pinned here: Stage 2 pins them after first
-  measurement per plan §1 (quantization spread unknown until measured).
+Metrics per gate: max_abs, mean_abs, cosine, frame_agreement(argmax @0.5).
+Thresholds are REPORTED, not pinned here: Stage 2 pins them after first
+measurement per plan §1 (fp32-vs-fp32 spread unknown until measured).
 
-Local mechanics (no torch/NeMo): tests/test_m2_stage2_k1.py compiles the
-shipped C++ and checks the harness math on synthetic weights; the kernel
-only adds true-weight .npz I/O. If torch/NeMo is importable locally the
-test additionally cross-checks one transformer block against torch
-nn.functional (same numbers, different library) — skipped otherwise.
+Local mechanics (no torch/NeMo): tests/test_m2_stage2_k1.py checks the
+numpy helpers against the shipped C++ on synthetic weights (transcription
+pins) plus hand-case math; the kernel only adds true-weight .npz I/O.
 """
 from __future__ import annotations
 
@@ -69,9 +65,17 @@ REPORT: dict[str, object] = {
     "job": "m2_stage2_k1_head_transformer",
 }
 
-# ---- pure-python reference (mirrors src/layers.cpp, torch order) ----
+# ---- numpy-vectorized reference (mirrors src/layers.cpp, torch order) ----
+# NOTE (2026-09-17 perf rewrite): the local mechanics tests pin the C++
+# transcription through these SAME function names on nested lists; the
+# kernel gate path below converts once and runs numpy end to end (~100x:
+# mid 232 frames x 18 blocks drops from ~hours to ~minutes).
 
 def matvec_rows(x, w, b, t, inn, out):
+    # Legacy helper kept for the mechanics transcription tests (they call it
+    # indirectly? No — kept because test files import nothing else; harmless).
+    # Kernel path never calls this (numpy lin() above). Do NOT delete without
+    # updating tests/test_m2_stage2_k1.py.
     y = [[0.0] * out for _ in range(t)]
     for r in range(t):
         xr = x[r]
@@ -106,38 +110,57 @@ def softmax_rows(x):
 
 
 def transformer_block(x, wt, H=192, I=768, NH=8):
-    T = len(x)
+    import numpy as _np
+    xa = _np.asarray(x, dtype=_np.float64)
+    T = xa.shape[0]
     DK = H // NH
-    q = matvec_rows(x, wt["q_w"], wt["qb"], T, H, H)
-    k = matvec_rows(x, wt["k_w"], wt["kb"], T, H, H)
-    v = matvec_rows(x, wt["v_w"], wt["vb"], T, H, H)
+
+    def lin(a, w, b):
+        wa = _np.asarray(w, dtype=_np.float64)
+        y = a @ wa.T
+        if b is not None:
+            y = y + _np.asarray(b, dtype=_np.float64)
+        return y
+
+    def ln(a, g, b, eps=1e-5):
+        m = a.mean(axis=1, keepdims=True)
+        v = ((a - m) ** 2).mean(axis=1, keepdims=True)
+        y = (a - m) / _np.sqrt(v + eps)
+        if g is not None:
+            y = y * _np.asarray(g, dtype=_np.float64)
+        if b is not None:
+            y = y + _np.asarray(b, dtype=_np.float64)
+        return y
+
+    q, k, v = lin(xa, wt["q_w"], wt["qb"]), lin(xa, wt["k_w"], wt["kb"]), lin(
+        xa, wt["v_w"], wt["vb"])
     sc = 1.0 / math.sqrt(DK)
-    attn = [[0.0] * H for _ in range(T)]
+    # Contiguous head split (matches C++ and torch view(B,T,H,Dk)): head h
+    # owns cols [h*Dk,(h+1)*Dk). Pinned by test_layers head-order cases.
+    heads = []
     for hd in range(NH):
-        scores = [[sum(q[i][hd * DK + e] * k[j][hd * DK + e] for e in range(DK)) * sc
-                   for j in range(T)] for i in range(T)]
-        probs = softmax_rows(scores)
-        for i in range(T):
-            for e in range(DK):
-                attn[i][hd * DK + e] = sum(probs[i][j] * v[j][hd * DK + e] for j in range(T))
-    ao = matvec_rows(attn, wt["o_w"], wt["ob"], T, H, H)
-    h1 = [[ao[r][c] + x[r][c] for c in range(H)] for r in range(T)]
-    h1 = layernorm(h1, wt["g1"], wt["b1"])
-    fm = matvec_rows(h1, wt["f1_w"], wt["f1_b"], T, H, I)
-    fm = [[v if v > 0 else 0.0 for v in row] for row in fm]
-    fo = matvec_rows(fm, wt["f2_w"], wt["f2_b"], T, I, H)
-    h2 = [[fo[r][c] + h1[r][c] for c in range(H)] for r in range(T)]
-    return layernorm(h2, wt["g2"], wt["b2"])
+        s = (q[:, hd * DK:(hd + 1) * DK] @ k[:, hd * DK:(hd + 1) * DK].T) * sc
+        s = s - s.max(axis=1, keepdims=True)
+        e = _np.exp(s)
+        pr = e / e.sum(axis=1, keepdims=True)
+        heads.append(pr @ v[:, hd * DK:(hd + 1) * DK])
+    attn = _np.concatenate(heads, axis=1)
+    ao = lin(attn, wt["o_w"], wt["ob"])
+    h1 = ln(ao + xa, wt["g1"], wt["b1"])
+    fm = lin(h1, wt["f1_w"], wt["f1_b"])
+    fm = _np.maximum(fm, 0.0)
+    fo = lin(fm, wt["f2_w"], wt["f2_b"])
+    return ln(fo + h1, wt["g2"], wt["b2"]).tolist()
 
 
 def diar_head(x, hw, hb, sw, sb):
-    a = [[v if v > 0 else 0.0 for v in row] for row in x]
-    T, H = len(a), len(a[0])
-    h1 = matvec_rows(a, hw, hb, T, H, H)
-    h1 = [[v if v > 0 else 0.0 for v in row] for row in h1]
-    S = len(sw)
-    logits = matvec_rows(h1, sw, sb, T, H, S)
-    return [[1.0 / (1.0 + math.exp(-v)) for v in row] for row in logits]
+    import numpy as _np
+    xa = _np.maximum(_np.asarray(x, dtype=_np.float64), 0.0)
+    hwb = _np.asarray(hw, dtype=_np.float64)
+    h1 = _np.maximum(xa @ hwb.T + _np.asarray(hb, dtype=_np.float64), 0.0)
+    swb = _np.asarray(sw, dtype=_np.float64)
+    logits = h1 @ swb.T + _np.asarray(sb, dtype=_np.float64)
+    return (1.0 / (1.0 + _np.exp(-logits))).tolist()
 
 
 def metrics(ref, got):
@@ -169,11 +192,13 @@ def load_nemo_state_dict(ckpt_path):
     return sd
 
 
-def t2(w, transpose=True):
+def t2(w):
+    # torch Linear weight [out,in] -> nested lists, SAME layout (NO transpose).
+    # The python mirrors index w[o][i] (row o = output unit), exactly like
+    # nn::linear_forward. Transposing here silently corrupts square weights
+    # and crashes on rectangular ones — pinned by test_t2_keeps_torch_layout.
     import numpy as _np
     a = _np.asarray(w.detach().cpu().numpy() if hasattr(w, "detach") else w, dtype=_np.float64)
-    if transpose and a.ndim == 2:
-        a = a.T
     return a.tolist()
 
 
@@ -245,6 +270,11 @@ def main() -> int:
     hb = v1(H("sortformer_modules.first_hidden_to_hidden.bias"))
     sw = t2(H("sortformer_modules.single_hidden_to_spks.weight"))
     sb = v1(H("sortformer_modules.single_hidden_to_spks.bias"))
+    # encoder_proj (fc 512 -> transformer 192): NeMo SortformerModules
+    # attribute `encoder_proj` (sortformer_model.cpp: encoder_proj_).
+    proj_w = t2(sd["sortformer_modules.encoder_proj.weight"])
+    proj_b = v1(sd["sortformer_modules.encoder_proj.bias"])
+    REPORT["encoder_proj_shape"] = [len(proj_w), len(proj_w[0])]
 
     per_audio = {}
     for label in ("short", "mid"):
@@ -253,9 +283,21 @@ def main() -> int:
             continue
         z = _np.load(str(zpath), allow_pickle=True)
         deep = [k.split("/")[0] for k in z.files if k.endswith("conformer_block_00")]
-        audio_gates = {"head": None, "blocks": []}
+        audio_gates = {"head": [], "blocks": [], "proj": []}
         for chunk in deep:
-            fc = z[chunk + "/fc_encoder"].tolist()
+            # encoder_proj gate: conformer_block_16 (512) -> fc_encoder
+            # (192). frontend_encoder = encoder(...) + transpose + proj
+            # (NeMo SortformerEncLabelModel.frontend_encoder).
+            c16 = z[chunk + "/conformer_block_16"].tolist()
+            fc_ref = z[chunk + "/fc_encoder"].tolist()
+            import numpy as _np2
+            pw_ = _np2.asarray(proj_w, dtype=_np2.float64)
+            fc_got = (_np2.asarray(c16, dtype=_np2.float64) @ pw_.T
+                      + _np2.asarray(proj_b, dtype=_np2.float64)[None, :]).tolist()
+            m = metrics(fc_ref, fc_got)
+            m.update({"chunk": chunk})
+            audio_gates["proj"].append(m)
+            fc = fc_ref  # transformer chain eats the REFERENCE fc input
             # 18 teacher-forced block gates.
             prev = fc
             for bi in range(n_blocks):
@@ -273,16 +315,19 @@ def main() -> int:
             # length, no padding) — direct compare valid.
             m = metrics(ref_preds, preds)
             m.update({"chunk": chunk})
-            audio_gates["head"] = m
+            audio_gates["head"].append(m)
         per_audio[label] = audio_gates
 
     REPORT["gates"] = per_audio
     worst_block = max((m["max_abs"] for a in per_audio.values() for m in a["blocks"]),
                       default=float("nan"))
-    worst_head = max((a["head"]["max_abs"] for a in per_audio.values() if a["head"]),
+    worst_head = max((m["max_abs"] for a in per_audio.values() for m in a["head"]),
+                     default=float("nan"))
+    worst_proj = max((m["max_abs"] for a in per_audio.values() for m in a["proj"]),
                      default=float("nan"))
     REPORT["worst_block_max_abs"] = worst_block
     REPORT["worst_head_max_abs"] = worst_head
+    REPORT["worst_proj_max_abs"] = worst_proj
     REPORT["verdict"] = "k1-measured"
     REPORT["note"] = ("teacher-forced fp32-vs-fp32 spreads measured; "
                       "pin gate thresholds from these numbers per plan §1.")

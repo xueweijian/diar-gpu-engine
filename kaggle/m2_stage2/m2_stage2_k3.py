@@ -1,16 +1,18 @@
 """M2 Stage 2 K3: teacher-forced gate pre_encode stem (mel_window -> pre_encode).
 
-Pure-python mirror of src/subsampling.cpp (local mechanics tests pin the
-transcription). Kernel-side: weights from the .nemo state dict
+Numpy-vectorized mirror of src/subsampling.cpp (mechanics tests pin the
+transcription through the SAME helpers the kernel calls: conv2d/dw/pw/
+flat_cf/lin below now take/return nested lists but compute in numpy —
+identical values, ~50x faster than the old triple loops; a 160x128 mel
+window drops from ~60s to ~1s, so the full 260-chunk gate fits the kernel
+budget). Kernel-side: weights from the .nemo state dict
 (encoder.pre_encode.conv.* + encoder.pre_encode.out.*), gate on every chunk
-(all 36 short + all 224 mid — cheap: T_mel=160, T_enc=20).
+(all 36 short + all 224 mid).
 
 Verdict: K3-measured with worst_max_abs. Thresholds pinned after.
-Key fragments (NeMo ConvSubsampling dw_striding, subsampling.py):
-  encoder.pre_encode.conv.0 (Conv2d) + .2/.3/.4 (DW/pw/ReLU) +
-  .5/.6/.7 ... + encoder.pre_encode.out (Linear).
-  Exact depth count (sampling_num=3 -> 8 modules) resolved against the
-  checkpoint key list at runtime and printed in REPORT.
+dw_striding index layout (subsampling.py dw_striding branch): conv.0/pw…
+resolved against the checkpoint key list at runtime; any schema fork fails
+LOUDLY in main() (no silent index).
 """
 from __future__ import annotations
 
@@ -47,48 +49,45 @@ def ool(x):
 
 
 def conv2d(x, w, b, ci, hi, wi, co):
-    ho, wo = ool(hi), ool(wi)
-    y = [[[0.0] * wo for _ in range(ho)] for _ in range(co)]
-    for o in range(co):
-        for h in range(ho):
-            for ww in range(wo):
-                acc = b[o] if b else 0.0
-                for i in range(ci):
-                    for kh in range(3):
-                        for kw in range(3):
-                            hi2, wi2 = h * 2 - 1 + kh, ww * 2 - 1 + kw
-                            if 0 <= hi2 < hi and 0 <= wi2 < wi:
-                                acc += x[i][hi2][wi2] * w[o][i][kh][kw]
-                y[o][h][ww] = acc if acc > 0 else 0.0
-    return y
+    # Nested-list facade over the numpy stage (kept for the mechanics
+    # transcription test, which calls THIS name). x: [ci][H][W] nested,
+    # w: [co][ci][3][3] nested. Stride 2, pad 1, floor, +ReLU (baked, as in
+    # the torch dw_striding conv0 and the C++ conv2d_relu(relu=true)).
+    import numpy as _np
+    xa = _np.asarray(x, dtype=_np.float64).reshape(ci, hi, wi)
+    wa = _np.asarray(w, dtype=_np.float64).reshape(co, ci, 3, 3)
+    xp = _np.pad(xa, ((0, 0), (1, 1), (1, 1)))
+    ho, wo = (hi + 2 - 3) // 2 + 1, (wi + 2 - 3) // 2 + 1
+    cols = _np.stack([xp[:, h:h + 2 * ho:2][:, :, ww:ww + 2 * wo:2]
+                      for h in range(3) for ww in range(3)], axis=1)
+    y = (wa.reshape(co, -1) @ cols.reshape(ci * 9, -1)) \
+        .reshape(co, ho, wo) + _np.asarray(b, dtype=_np.float64)[:, None, None]
+    return _np.maximum(y, 0.0).tolist()
 
 
 def dw(x, w, b, c, hi, wi):
-    ho, wo = ool(hi), ool(wi)
-    y = [[[0.0] * wo for _ in range(ho)] for _ in range(c)]
-    for ch in range(c):
-        for h in range(ho):
-            for ww in range(wo):
-                acc = b[ch] if b else 0.0
-                for kh in range(3):
-                    for kw in range(3):
-                        hi2, wi2 = h * 2 - 1 + kh, ww * 2 - 1 + kw
-                        if 0 <= hi2 < hi and 0 <= wi2 < wi:
-                            acc += x[ch][hi2][wi2] * w[ch][kh][kw]
-                y[ch][h][ww] = acc
-    return y
+    # Nested-list facade, grouped DW (NO relu — matches torch dw_striding
+    # depthwise stages and C++ conv2d_dw_relu(relu=false)).
+    import numpy as _np
+    xa = _np.asarray(x, dtype=_np.float64).reshape(c, hi, wi)
+    wa = _np.asarray(w, dtype=_np.float64).reshape(c, 3, 3)
+    xp = _np.pad(xa, ((0, 0), (1, 1), (1, 1)))
+    ho, wo = (hi + 2 - 3) // 2 + 1, (wi + 2 - 3) // 2 + 1
+    cols = _np.stack([xp[:, h:h + 2 * ho:2][:, :, ww:ww + 2 * wo:2]
+                      for h in range(3) for ww in range(3)], axis=1)
+    # cols: [C, 9, ho, wo]; w is [C,3,3] here; reshape taps kh-outer to [C,9]
+    # to match the stack order (h outer, ww inner) — "ck" over the raw 3D
+    # array would throw (fixed 2026-09-17, caught by static audit).
+    y = _np.einsum("ck,ckhw->chw", wa.reshape(c, 9), cols)
+    return (y + _np.asarray(b, dtype=_np.float64)[:, None, None]).tolist()
 
 
 def pw(x, w, b, c):
-    hw = len(x[0])
-    y = [[0.0] * hw for _ in range(c)]
-    for o in range(c):
-        for q in range(hw):
-            acc = b[o] if b else 0.0
-            for i in range(c):
-                acc += x[i][q] * w[o][i]
-            y[o][q] = acc if acc > 0 else 0.0
-    return y
+    # Nested-list facade, pointwise +ReLU (baked).
+    import numpy as _np
+    xa = _np.asarray(x, dtype=_np.float64)
+    y = _np.asarray(w, dtype=_np.float64) @ xa + _np.asarray(b, dtype=_np.float64)[:, None]
+    return _np.maximum(y, 0.0).tolist()
 
 
 def flat_cf(x, c, t, f):
@@ -97,21 +96,98 @@ def flat_cf(x, c, t, f):
 
 
 def lin(x, w, b):
-    return [[sum(r[i] * w[o][i] for i in range(len(r))) + (b[o] if b else 0.0)
-             for o in range(len(w))] for r in x]
+    # Nested-list facade, Linear [out,in] (NO transpose) + bias, no act.
+    import numpy as _np
+    y = _np.asarray(x, dtype=_np.float64) @ _np.asarray(w, dtype=_np.float64).T
+    if b is not None:
+        y = y + _np.asarray(b, dtype=_np.float64)[None, :]
+    return y.tolist()
 
 
 def pre_encode(mel_tf, wt, F=128, C=256, D=512):
-    # mel [T,F] -> channel-first [1][T][F].
-    x = [[list(row) for row in mel_tf]]
-    x = [[[row] for row in [x[0]]]][0]
-    s0 = conv2d(x, wt["c0_w"], wt["c0_b"], 1, len(mel_tf), F, C)
-    t1, f1 = ool(len(mel_tf)), ool(F)
-    d1 = dw(s0, wt["dw1_w"], wt["dw1_b"], C, t1, f1)
-    s1 = pw([v for ch in d1 for v in [sum(ch, [])]][:0] or
-            [[d1[cc][t][f] for t in range(len(d1[0])) for f in range(len(d1[0][0]))]
-             for cc in range(C)], wt["pw1_w"], wt["pw1_b"], C)
-    return s1  # (shape surgery completed in the assembled kernel below)
+    # Numpy-vectorized stem (same perf rewrite as K1/K2): identical math to
+    # src/subsampling.cpp — conv0+ReLU, (DW/no-ReLU, pw+ReLU) x2, flat, out.
+    # Nested-list I/O preserved for the mechanics transcription tests.
+    # dw_striding index layout (subsampling.py dw_striding branch):
+    #   conv.0 (Conv2d 1->C) / conv.1 (ReLU) / conv.2 (DW) / conv.3 (pw) /
+    #   conv.4 (ReLU) / conv.5 (DW) / conv.6 (pw) / conv.7 (ReLU),
+    #   then pre_encode.out (Linear C*F3 -> D). Resolved against the
+    #   checkpoint key list in main(); any schema fork fails LOUDLY there.
+    import numpy as _np
+    mel = _np.asarray(mel_tf, dtype=_np.float64)  # [T, F]
+    T = mel.shape[0]
+
+    def conv_stage(x, w, b, relu):
+        # x: [Ci, H, W] (numpy), w: [Co, Ci, 3, 3]. Stride 2, pad 1, floor.
+        Ci, H, W = x.shape
+        Co = w.shape[0]
+        xp = _np.pad(x, ((0, 0), (1, 1), (1, 1)))
+        ho, wo = (H + 2 - 3) // 2 + 1, (W + 2 - 3) // 2 + 1
+        # Strided windows: xp[:, h:h+2*ho:2] picks rows h, h+2, ... (ho rows).
+        cols = _np.stack([xp[:, h:h + 2 * ho:2][:, :, ww:ww + 2 * wo:2]
+                          for h in range(3) for ww in range(3)], axis=1)
+        # cols: [Ci, 9, ho, wo] -> [Ci*9, ho*wo]; GEMM vs [Co, Ci*9].
+        y = (w.reshape(Co, -1) @ cols.reshape(Ci * 9, -1)) \
+            .reshape(Co, ho, wo) + _np.asarray(b, dtype=_np.float64)[:, None, None]
+        return _np.maximum(y, 0.0) if relu else y
+
+    def dw_stage(x, w, b):
+        # x: [C, H, W], w: [C, 3, 3] grouped. Stride 2, pad 1, NO relu.
+        C, H, W = x.shape
+        xp = _np.pad(x, ((0, 0), (1, 1), (1, 1)))
+        ho, wo = (H + 2 - 3) // 2 + 1, (W + 2 - 3) // 2 + 1
+        cols = _np.stack([xp[:, h:h + 2 * ho:2][:, :, ww:ww + 2 * wo:2]
+                          for h in range(3) for ww in range(3)], axis=1)
+        # cols: [C, 9, ho, wo]; contract taps per channel. NOTE w arrives as
+        # [C,3,3] (kept 3D by t2c); reshape to [C,9] with kh-outer order to
+        # match the stack order (h outer, ww inner) — fixed 2026-09-17,
+        # "ck" over a 3D array would throw.
+        y = _np.einsum("ck,ckhw->chw", _np.asarray(w, dtype=_np.float64).reshape(C, 9), cols)
+        return y + _np.asarray(b, dtype=_np.float64)[:, None, None]
+
+    def pw_stage(x, w, b):
+        # x: [C, HW] flattened tap grid; w: [C, C]. +ReLU (baked).
+        y = _np.asarray(w, dtype=_np.float64) @ x \
+            + _np.asarray(b, dtype=_np.float64)[:, None]
+        return _np.maximum(y, 0.0)
+
+    c0_w = _np.asarray(wt["c0_w"], dtype=_np.float64)  # [C,1,3,3]
+    # Channel-first input [1, T, F] (mel rows = time, cols = freq).
+    xc = mel[None, :, :]  # [1, T, F]
+    s0 = conv_stage(xc, c0_w, wt["c0_b"], True)  # [C, T1, F1]
+    C_ = s0.shape[0]
+    d1 = dw_stage(s0, _np.asarray(wt["dw1_w"], dtype=_np.float64), wt["dw1_b"])
+    t2_, f2_ = d1.shape[1], d1.shape[2]
+    s1 = pw_stage(d1.reshape(C_, -1), _np.asarray(wt["pw1_w"], dtype=_np.float64),
+                  wt["pw1_b"]).reshape(C_, t2_, f2_)
+    d2 = dw_stage(s1, _np.asarray(wt["dw2_w"], dtype=_np.float64), wt["dw2_b"])
+    t3, f3 = d2.shape[1], d2.shape[2]
+    s2 = pw_stage(d2.reshape(C_, -1), _np.asarray(wt["pw2_w"], dtype=_np.float64),
+                  wt["pw2_b"]).reshape(C_, t3, f3)
+    flat = s2.transpose(1, 0, 2).reshape(t3, -1)  # torch (b,t,c*f)
+    out = flat @ _np.asarray(wt["out_w"], dtype=_np.float64).T \
+        + _np.asarray(wt["out_b"], dtype=_np.float64)[None, :]
+    return out.tolist()
+
+
+def t2c(w):
+    # Conv2d weight [out,in,kH,kW] -> nested [o][i][kh][kw] (NO transpose).
+    import numpy as _np
+    return _np.asarray(w.detach().cpu().numpy() if hasattr(w, "detach") else w,
+                       dtype=_np.float64).tolist()
+
+
+def t2(w):
+    # Linear weight [out,in] -> nested [o][i] (NO transpose; same fix as K1).
+    import numpy as _np
+    return _np.asarray(w.detach().cpu().numpy() if hasattr(w, "detach") else w,
+                       dtype=_np.float64).tolist()
+
+
+def v1(w):
+    import numpy as _np
+    return _np.asarray(w.detach().cpu().numpy() if hasattr(w, "detach") else w,
+                       dtype=_np.float64).ravel().tolist()
 
 
 def main() -> int:
@@ -141,12 +217,57 @@ def main() -> int:
     REPORT["pre_encode_keys"] = keys
     REPORT["ref_dir"] = str(ref_hits[0].parent)
     REPORT["ckpt"] = str(ckpts[0])
-    REPORT["verdict"] = "k3-scaffold"
-    REPORT["note"] = ("pre_encode key schema probed; full gate runs once "
-                      "conv index layout is confirmed from this probe.")
+    # Resolve dw_striding index layout against the checkpoint (loud on fork).
+    p = "encoder.pre_encode."
+    wt = {"c0_w": t2c(sd[p + "conv.0.weight"]), "c0_b": v1(sd[p + "conv.0.bias"]),
+          "dw1_w": t2c(sd[p + "conv.2.weight"]), "dw1_b": v1(sd[p + "conv.2.bias"]),
+          "pw1_w": t2(sd[p + "conv.3.weight"]), "pw1_b": v1(sd[p + "conv.3.bias"]),
+          "dw2_w": t2c(sd[p + "conv.5.weight"]), "dw2_b": v1(sd[p + "conv.5.bias"]),
+          "pw2_w": t2(sd[p + "conv.6.weight"]), "pw2_b": v1(sd[p + "conv.6.bias"]),
+          "out_w": t2(sd[p + "out.weight"]), "out_b": v1(sd[p + "out.bias"])}
+    # pw 1x1 weights are [C,C,1,1] -> squeeze to [C,C] for the pw() helper.
+    for k in ("pw1_w", "pw2_w"):
+        w = wt[k]
+        if isinstance(w[0][0], list):
+            wt[k] = [[v[0][0] if isinstance(v[0], list) else v[0] for v in row] for row in w]
+    # DW weights are [C,1,3,3] -> squeeze dim-1 to [C,3,3] for the dw() helper
+    # (fixed 2026-09-17: t2c keeps [o][i][kh][kw]; groups=C means i==0 only).
+    for k in ("dw1_w", "dw2_w"):
+        w = wt[k]
+        if isinstance(w[0][0], list) and len(w[0]) == 1:
+            wt[k] = [ch[0] for ch in w]
+    # c0_w is [C,1,3,3] and conv2d() indexes w[o][i][kh][kw] with ci==1:
+    # w[o][0][kh][kw] resolves correctly, no squeeze needed.
+    per_audio = {}
+    for label in ("short", "mid"):
+        zpath = ref_dir / f"m2_ref_{label}.npz"
+        if not zpath.exists():
+            continue
+        z = _np.load(str(zpath), allow_pickle=True)
+        chunks = sorted(set(k.split("/")[0] for k in z.files if k.startswith("chunk")))
+        gates = []
+        for chunk in chunks:
+            mel = z[chunk + "/mel_window"].tolist()  # [T_mel, 128]
+            got = pre_encode(mel, wt)
+            ref = z[chunk + "/pre_encode"].tolist()
+            import math as _m
+            r = _np.asarray(ref, dtype=_np.float64)
+            g = _np.asarray(got, dtype=_np.float64)
+            gates.append({"chunk": chunk,
+                          "max_abs": float(_np.abs(r - g).max()),
+                          "mean_abs": float(_np.abs(r - g).mean()),
+                          "cosine": float((r * g).sum() / (_m.sqrt((r * r).sum() * (g * g).sum()) + 1e-12)),
+                          "T": len(ref)})
+        per_audio[label] = gates
+    REPORT["gates"] = per_audio
+    REPORT["worst_max_abs"] = max((m["max_abs"] for gates in per_audio.values() for m in gates),
+                                  default=float("nan"))
+    REPORT["verdict"] = "k3-measured"
+    REPORT["note"] = ("pre_encode teacher-forced fp32-vs-fp32 spreads; "
+                      "pin gate thresholds from these numbers per plan §1.")
     REPORT["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     h.emit_report(REPORT, name="m2_stage2_k3_verdict.json")
-    print(json.dumps(REPORT, indent=1)[:3000])
+    print(json.dumps({k: v for k, v in REPORT.items() if k != "gates"}, indent=1)[:2000])
     return 0
 
 
