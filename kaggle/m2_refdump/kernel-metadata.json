@@ -1,0 +1,16 @@
+{
+  "id": "weijianxue/diar-m2-stage0-refdump",
+  "title": "diar-m2-stage0-refdump",
+  "code_file": "m2_stage0_refdump.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaP100",
+  "dataset_sources": [
+    "weijianxue/diar-gpu-engine-harness",
+    "weijianxue/diar-smoke-audio",
+    "weijianxue/diar-real-audio-5"
+  ]
+}

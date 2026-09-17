@@ -1,0 +1,105 @@
+"""Re-vendor kaggle/m2_refdump/dump_m2_reference.py from upstream.
+
+Delta vs upstream dump_sortformer_reference.py (a5b6953):
+  1. module-level _capture_block_outputs helper (forward hooks, observe-only);
+  2. hook register/remove around the frontend_encoder call on deep chunks
+     (sequential, NOT try/finally: an exception aborts the whole dump, so
+     there is no path that needs handle cleanup — and this keeps every
+     upstream line byte-verbatim, enforced by test_fork_diff_only_additive);
+  3. per-block outputs (conformer_block_NN / transformer_block_NN + counts)
+     stored for deep chunks.
+The NeMo forward path is untouched.
+"""
+from __future__ import annotations
+
+UPSTREAM = "/tmp/nemo-src/scripts/asr/dump_sortformer_reference.py"
+OUT = "/var/minis/workspace/diar-gpu-engine/kaggle/m2_refdump/dump_m2_reference.py"
+
+HELPER = '''
+
+def _capture_block_outputs(model):
+    """Register forward hooks capturing per-block outputs (deep chunks).
+
+    Hooks only observe: the NeMo forward path is untouched. Returns
+    (handles, conf_outs, trans_outs); the caller removes handles right
+    after the forward. Layer identity is by execution: hooks fire in
+    forward order, so both lists are in stack order no matter where NeMo
+    nests the modules (no attribute-path assumptions). Expected
+    (sortformer v2): 17 ConformerLayer + 18 TransformerEncoderBlock;
+    actual counts are stored in the dump (n_conformer_blocks /
+    n_transformer_blocks) for the spike verdict.
+    """
+    conf_outs: list = []
+    trans_outs: list = []
+    handles = []
+
+    def _mk(store):
+        def _fn(module, args, output):
+            out = output[0] if isinstance(output, (tuple, list)) else output
+            store.append(out.detach().cpu().numpy())
+        return _fn
+
+    for mod in model.modules():
+        cls = type(mod).__name__
+        if cls == "ConformerLayer":
+            handles.append(mod.register_forward_hook(_mk(conf_outs)))
+        elif cls in ("TransformerEncoderBlock", "TransformerEncoderLayer"):
+            handles.append(mod.register_forward_hook(_mk(trans_outs)))
+    return handles, conf_outs, trans_outs
+
+'''
+
+OLD_FWD = """            fc_embs, fc_lens = model.frontend_encoder(
+                processed_signal=concat_embs,
+                processed_signal_length=concat_lens,
+                bypass_pre_encode=True,
+            )"""
+NEW_FWD = """            handles, conf_outs, trans_outs = (
+                _capture_block_outputs(model)
+                if idx < args.deep_chunks else ([], [], []))
+            fc_embs, fc_lens = model.frontend_encoder(
+                processed_signal=concat_embs,
+                processed_signal_length=concat_lens,
+                bypass_pre_encode=True,
+            )
+            for hd in handles:
+                hd.remove()"""
+
+OLD_FC = """                out[p + "fc_encoder"] = fc_embs[0].cpu().numpy()"""
+NEW_FC = OLD_FC + """
+                for bi, arr in enumerate(conf_outs):
+                    out[p + f"conformer_block_{bi:02d}"] = arr[0]
+                for bi, arr in enumerate(trans_outs):
+                    out[p + f"transformer_block_{bi:02d}"] = arr[0]
+                out[p + "n_conformer_blocks"] = __import__("numpy").array(
+                    [len(conf_outs)], dtype=__import__("numpy").int64)
+                out[p + "n_transformer_blocks"] = __import__("numpy").array(
+                    [len(trans_outs)], dtype=__import__("numpy").int64)"""
+
+
+def main() -> None:
+    src = open(UPSTREAM).read()
+    anchor = "def main() -> int:"
+    assert anchor in src, "main anchor missing"
+    src = src.replace(anchor, HELPER.strip("\n") + "\n\n\n" + anchor, 1)
+    assert OLD_FWD in src, "frontend_encoder call site missing"
+    src = src.replace(OLD_FWD, NEW_FWD, 1)
+    assert OLD_FC in src, "fc_encoder site missing"
+    src = src.replace(OLD_FC, NEW_FC, 1)
+    lines = src.splitlines()
+    assert lines[0].startswith("#!"), "unexpected first line"
+    fork_note = (
+        "# M2 fork of upstream dump_sortformer_reference.py (NeMo-Speech.cpp a5b6953).\n"
+        "# ONLY delta vs upstream: _capture_block_outputs helper + per-block hook\n"
+        "# capture (conformer_block_NN / transformer_block_NN) on deep chunks.\n"
+        "# The NeMo forward path is untouched (hooks observe only).\n"
+    )
+    src = lines[0] + "\n" + fork_note + "\n".join(lines[1:]) + "\n"
+    import ast
+    ast.parse(src)
+    open(OUT, "w").write(src)
+    print("written, bytes:", len(src))
+
+
+if __name__ == "__main__":
+    main()
