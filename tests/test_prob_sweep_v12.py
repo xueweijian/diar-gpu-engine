@@ -35,7 +35,9 @@ def test_v12_pins_reach_every_child_env(tmp_path, monkeypatch):
 
 def test_v12_pins_constants():
     assert all(isinstance(v, str) and v for v in V12_ENV_PINS.values())
-    assert set(V11_SESSION_STABLE) == {"short_streaming", "mid_offline_full"}
+    assert set(_snippet.SESSION_STABLE_CASES) == {
+        "short_streaming", "mid_streaming",
+        "mid_offline_full", "mid_offline_preset"}
 
 
 def test_v12_export_parity_candidate_rep0_only(tmp_path, monkeypatch):
@@ -73,23 +75,39 @@ def test_v12_export_parity_candidate_rep0_only(tmp_path, monkeypatch):
     assert prov["preset"] is None  # sentinel-free label maps to None preset
 
 
-def test_v12_export_mid_case_not_marked_stable(tmp_path, monkeypatch):
+def test_v12_export_unknown_case_not_marked_stable(tmp_path, monkeypatch):
     stub, _calls = _stub_h(monkeypatch, tmp_path, ["0.0 1.0 spk"])
     stub.MODEL_PATH = Path("/fake/nemo.gguf")
-    case_dir = stub.WORK_ROOT / "det_sweep" / "mid_streaming"
+    case_dir = stub.WORK_ROOT / "det_sweep" / "future_case"
     case_dir.mkdir(parents=True)
     (case_dir / "probs.0.f32").write_bytes(
         struct.pack("<q", 2) + struct.pack("<i", 4) + struct.pack("<8f", *([0.5] * 8)))
-    sweep = {"cases": [{"label": "mid_streaming", "reps": [
+    sweep = {"cases": [{"label": "future_case", "reps": [
         {"rep": 0, "probs_available": True, "probs_shape": [2, 4]}]}]}
     out_dir = tmp_path / "out"
     monkeypatch.setattr(_snippet, "OUT", out_dir, raising=False)
     monkeypatch.setattr(_snippet, "REPORT", {}, raising=False)
-    result = _export_parity_candidate("mid_streaming", tmp_path / "none.wav", None, sweep)
+    result = _export_parity_candidate("future_case", tmp_path / "none.wav", None, sweep)
     assert result is not None and result["stable"] is False
-    prov = json.loads((out_dir / "parity_candidates" / "mid_streaming" / "candidate.json").read_text())
+    prov = json.loads((out_dir / "parity_candidates" / "future_case" / "candidate.json").read_text())
     assert prov["cross_session_stable"] is False
     assert prov["audio_sha256"] is None  # missing audio is recorded, not fatal
+
+
+def test_v13_unpatched_sweep_body_only(tmp_path, monkeypatch):
+    """PROBDUMP_ENABLED=False: no dump requested, bodies alone judge the case."""
+    stub, calls = _stub_h(monkeypatch, tmp_path, ["0.0 1.0 spk"])
+    stub.MODEL_PATH = Path("/fake/nemo.gguf")
+    monkeypatch.setattr(_snippet, "PROBDUMP_ENABLED", False)
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"RIFF")
+    sweep = _snippet.run_prob_sweep(Path("/nope/bin"), [("case1", audio, None)])
+    case = sweep["cases"][0]
+    assert case["verdict"] == "identical_body_only"
+    assert case["probs_available"] is False
+    assert case["body_identical"] is True
+    for call in calls:
+        assert call["dump"] is None  # no dump path reaches the child
 
 
 def test_v12_export_skips_when_no_dump(tmp_path, monkeypatch):

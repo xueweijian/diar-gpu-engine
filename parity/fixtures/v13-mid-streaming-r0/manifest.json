@@ -1,0 +1,49 @@
+{
+  "case": {
+    "audio": "/kaggle/input/datasets/weijianxue/diar-real-audio-5/video2_audio.wav",
+    "geometry": null,
+    "offline": false,
+    "preset": null
+  },
+  "name": "v13-mid-streaming-r0",
+  "observation": {
+    "deterministic": true,
+    "frame_grid_ms": 80,
+    "hash_groups": {
+      "ddf2312b153bb10b1af0be4be4dd03c00c92c46c4df9c1095c3cfdcfd6f9dd30": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    "n_frames": 4467,
+    "n_spk": 4
+  },
+  "schema_version": 1,
+  "source": {
+    "captured_at": "2026-09-17T01:53:33Z",
+    "env_pins": {},
+    "gpu": "Tesla T4, 580.159.04, 15360 MiB, 300 MHz, 405 MHz, 10.06 W, 0 %, 0 MiB, 45\nTesla T4, 580.159.04, 15360 MiB, 300 MHz, 405",
+    "kernel": "kaggle://weijianxue/diar-gpu-engine-sortformer-matrix",
+    "kernel_version": 13,
+    "repeats": 5,
+    "src_commit": "da60daa",
+    "upstream_commit": "a5b6953"
+  },
+  "tensors": [
+    {
+      "dtype": "f32",
+      "layer": "frame_probs",
+      "name": "probs",
+      "nbytes": 71472,
+      "path": "probs.f32",
+      "sha256": "fdbb7ad033f1fcbeaab92d2d0b019f2e2ca73f1465e293cd18f792c03cf3f37f",
+      "shape": [
+        4467,
+        4
+      ]
+    }
+  ]
+}

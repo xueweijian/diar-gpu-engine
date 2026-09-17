@@ -36,6 +36,10 @@ def load_prob_snippet():
     module = types.ModuleType("matrix_prob_snippet")
     module.__dict__["__name__"] = "matrix_prob_snippet"
     exec(compile(snippet, str(KERNEL), "exec"), module.__dict__)  # noqa: S102 - local test fixture
+    # These tests cover the PATCHED sweep path (probs dumps on); the kernel
+    # file may carry PROBDUMP_ENABLED=False while an unpatched v14-style
+    # session runs. The False path has its own test via monkeypatch.
+    module.PROBDUMP_ENABLED = True
     return module
 
 

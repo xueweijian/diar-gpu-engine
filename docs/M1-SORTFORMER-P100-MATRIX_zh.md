@@ -325,4 +325,30 @@ _export_parity_candidate 把 rep0 probs+rttm+provenance 落
   cross_session_stable 拒绝回填（--allow-unstable 显式开门）；fill 后
   立即过 parity.loader 完整性验证。84 pytest 全绿。
 
+## 12. v13 归因判读：pins no-op，收敛始于 v11 环境（2026-09-16 pass）
+
+v13 = v12 唯一去掉 env pins（其余逐字节相同）。结果：**四 case hash 全部
+复现 v11/v12**（short 81704884 / mid ddf2312b / offline_full 999fb4ba /
+preset 3f2258c5），14 跑会话内仍全 bit-identical。
+
+判读：
+- **pins 是 no-op**——CUDNN_DETERMINISTIC/CUBLAS_WORKSPACE_CONFIG 钉死的
+  选择 = autotune 本来就选的路径；
+- **跨会话收敛始于 v11**——三个会话（v11 未钉、v12 钉、v13 未钉）全一致；
+- v4-v10 的"漂移时代"定性收窄为：**v11 之前的环境状态**（Kaggle 平台库/
+  驱动）或 **probdump patch 二进制**（v11 起才打入）二者之一。v14 用
+  pristine upstream 二进制（apply_patch=False，body-only 判定）做最后
+  归因：unpatched mid == ddf2312b → 平台收敛、patch 无关（关案）；
+  unpatched mid 变值 → patch 自身改变了时序敏感路径（fixture 仍有效，
+  生产二进制就是 patched 版）。
+
+mid fixture 回填（三会话收敛背书，candidate 标记 stable=false 属导出时
+常量未更新，用 --allow-unstable 显式开门，manifest 记录真实 provenance）：
+- `parity/fixtures/v13-mid-streaming-r0/`（4467×4，mid 流式基线）
+- `parity/fixtures/v13-mid-offline-preset-r0/`（4467×4，大 chunk AOSC）
+- SESSION_STABLE_CASES 常量已扩为全部四 case（未知 label 仍默认 unstable）。
+
+parity L1 真值至此覆盖全部四个 sweep case：frame_probs 层的 M2 对拍可以
+开工。
+
 5. 以上均为 timing/结构实验，不动 engine 实现。

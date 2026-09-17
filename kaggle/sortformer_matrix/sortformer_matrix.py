@@ -215,10 +215,28 @@ def _export_parity_candidate(
 # Either way a third session hash locks fixture legitimacy for the cases
 # that reproduce.
 V12_ENV_PINS: dict[str, str] = {}
-# Cross-session-stable cases per the v11 hash lineage (short == v5/v7/v8
-# baseline; offline_full == v8's stable hash). These are the only legitimate
-# parity L1 fixture candidates; the mid cases churn across sessions.
-V11_SESSION_STABLE = ("short_streaming", "mid_offline_full")
+
+# v14 (residual-cause experiment): v13 proved the pins are no-ops and that
+# cross-session convergence started at v11. But v11 also introduced the
+# probdump-patched BINARY — v4-v8 sessions ran pristine upstream. Flip this to
+# False to build PRISTINE upstream (apply_patch=False) and judge the sweep on
+# RTTM bodies alone (verdict identical_body_only; probs marked unavailable).
+#   unpatched mid == ddf2312b -> the platform/libs converged at v11; the patch
+#                               is timing-irrelevant. Root cause closed.
+#   unpatched mid != ddf2312b -> the patch itself determinizes the run
+#                               (timing-sensitive async ordering after all);
+#                               fixtures remain valid (production binary is
+#                               the patched one) but the root-cause file stays
+#                               open with a timing chapter.
+PROBDUMP_ENABLED = False  # v14: pristine upstream build (attribution, residual cause)
+# Cross-session-stable cases. Initially only short/offline_full (v11 lineage);
+# since then mid_streaming ddf2312b and mid_offline_preset 3f2258c5 reproduced
+# across THREE sessions (v11 unpinned = v12 pinned = v13 unpinned), so all
+# four cases are fixture-eligible. Unknown labels stay unstable by default.
+SESSION_STABLE_CASES = ("short_streaming", "mid_streaming",
+                        "mid_offline_full", "mid_offline_preset")
+# Back-compat alias used by _export_parity_candidate's stable marking.
+V11_SESSION_STABLE = SESSION_STABLE_CASES
 
 
 def run_prob_sweep(
@@ -264,7 +282,8 @@ def run_prob_sweep(
             result = h.diarize_once(
                 binary, audio, out, device="cuda:0", preset=child_preset,
                 extra_args=list(child_extra),
-                timeout=3600, dump_probs_path=dump_path,
+                timeout=3600,
+                dump_probs_path=dump_path if PROBDUMP_ENABLED else None,
                 env=dict(V12_ENV_PINS),
             )
             rep_record: dict[str, object] = {
@@ -285,6 +304,12 @@ def run_prob_sweep(
             rep_bodies.append(body)
             rep_hashes.append(hashlib.sha256(body.encode()).hexdigest())
             rep_record["body_sha256"] = rep_hashes[-1]
+            if not PROBDUMP_ENABLED:
+                rep_dumps.append(None)
+                rep_record["probs_available"] = False
+                rep_record["probs_note"] = "probdump disabled (unpatched binary)"
+                case_entry["reps"].append(rep_record)
+                continue
             try:
                 rep_dumps.append(h.read_probdump(dump_path))
                 rep_record["probs_available"] = True
@@ -318,7 +343,9 @@ def run_prob_sweep(
         mean_abs = max((float(p.get("mean_abs_diff", 0.0)) for p in prob_pairs), default=0.0)
         min_agree = min(
             (float(p.get("frame_agreement", 1.0)) for p in prob_pairs), default=1.0)
-        if not probs_ok:
+        if not PROBDUMP_ENABLED and ok and len(unique_bodies) == 1:
+            verdict = "identical_body_only"
+        elif not probs_ok:
             verdict = "no_dump"
         elif probs_bit and len(unique_bodies) == 1:
             verdict = "identical"
@@ -857,7 +884,8 @@ def _main() -> None:
     REPORT["environment"] = environment
     REPORT["gpu_before"] = h.gpu_snapshot()
 
-    build = h.build_runtime(preset="cuda-diar", cuda_architectures="60")
+    build = h.build_runtime(preset="cuda-diar", cuda_architectures="60",
+                            apply_patch=PROBDUMP_ENABLED)
     REPORT["build"] = build
     binary = Path(build["binary"])
     REPORT["runtime_version_output"] = h.run([str(binary), "--version"], cwd=h.REPO_DIR, timeout=120)[1].strip()[:200]
