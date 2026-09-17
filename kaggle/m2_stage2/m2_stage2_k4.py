@@ -270,7 +270,10 @@ def main() -> int:
         handles.append(lay0.norm_feed_forward1.register_forward_hook(rec("n_ff1")))
         handles.append(lay0.feed_forward1.register_forward_hook(rec("ff1")))
         handles.append(lay0.norm_self_att.register_forward_hook(rec("n_sa")))
-        # MHA internals: recombine NeMo's own q/k/v/p with local formula
+        # MHA internals: recombine NeMo's own q/k/v/p with local formula.
+        # Hooks on linear_q/k/v/pos (nn.Linear) capture (B, T, C) — squeeze
+        # batch in P3b. (NOT forward_qkv's (B,H,T,Dk): that method's output
+        # is internal, hook the linears, not the method.)
         mh = lay0.self_attn
         qkv: dict[str, object] = {}
 
@@ -346,14 +349,16 @@ def main() -> int:
     mha_local = _np.asarray(relpos_mha(n_sa.tolist(), pe_local.tolist(), attn_wt,
                                        D_MODEL, N_HEADS))
     probes["P3a_mha_full_local"] = cmp(mha_nemo, mha_local)
-    # P3b: LOCAL shift/softmax recombined on NeMo's OWN q/k/v/p
-    # (torch (B,H,T,Dk) -> head h owns cols [h*Dk,(h+1)*Dk) after merge;
-    #  per-head slices below use exactly that contiguous convention).
+    # P3b: LOCAL shift/softmax recombined on NeMo's OWN q/k/v/p.
+    # Linear hooks capture (B, T, C)/(Bp, P, C) -> reshape to (T, H, Dk).
+    # (B is 1 here; assert it rather than silently squeezing a real batch.)
     DK = D_MODEL // N_HEADS
-    q = _np.asarray(qkv["q"]).reshape(T, N_HEADS, DK)
-    k = _np.asarray(qkv["k"]).reshape(T, N_HEADS, DK)
-    v = _np.asarray(qkv["v"]).reshape(T, N_HEADS, DK)
-    pp = _np.asarray(qkv["p"]).reshape(-1, N_HEADS, DK)
+    q = _np.asarray(qkv["q"]).reshape(1, T, D_MODEL).reshape(T, N_HEADS, DK)
+    k = _np.asarray(qkv["k"]).reshape(1, T, D_MODEL).reshape(T, N_HEADS, DK)
+    v = _np.asarray(qkv["v"]).reshape(1, T, D_MODEL).reshape(T, N_HEADS, DK)
+    _pp = _np.asarray(qkv["p"])
+    assert _pp.shape[0] == 1, _pp.shape
+    pp = _pp.reshape(-1, N_HEADS, DK)
     P = pp.shape[0]
     bu = _np.asarray(attn_wt["bu"]).reshape(N_HEADS, DK)
     bv = _np.asarray(attn_wt["bv"]).reshape(N_HEADS, DK)
