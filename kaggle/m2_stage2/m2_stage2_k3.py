@@ -269,13 +269,23 @@ def main() -> int:
             got = pre_encode(mel, wt)
             ref = z[chunk + "/pre_encode"].tolist()
             import math as _m
-            r = _np.asarray(ref, dtype=_np.float64)
-            g = _np.asarray(got, dtype=_np.float64)
+            # Tail chunks carry zero-padded mel rows (mel[feat_len:] == 0)
+            # whose stem outputs are padding artifacts, while the reference
+            # keeps full rows (its last row even holds a ~constant fill —
+            # v6 triage 2026-09-17: short/chunk035 row 11 rms 0.34 vs valid
+            # rows ~13-22, mid/chunk223 same pattern). Gate VALID rows only:
+            # n_valid = state_lens_before[2] (== ceil(feat_len/8)); full
+            # chunks are unaffected (n_valid == len(ref)).
+            n_valid = int(z[chunk + "/state_lens_before"][2])
+            assert 0 < n_valid <= len(ref), (chunk, n_valid, len(ref))
+            r = _np.asarray(ref, dtype=_np.float64)[:n_valid]
+            g = _np.asarray(got, dtype=_np.float64)[:n_valid]
             gates.append({"chunk": chunk,
                           "max_abs": float(_np.abs(r - g).max()),
                           "mean_abs": float(_np.abs(r - g).mean()),
                           "cosine": float((r * g).sum() / (_m.sqrt((r * r).sum() * (g * g).sum()) + 1e-12)),
-                          "T": len(ref)})
+                          "T": n_valid,
+                          "T_full": len(ref)})
         per_audio[label] = gates
     REPORT["gates"] = per_audio
     REPORT["worst_max_abs"] = max((m["max_abs"] for gates in per_audio.values() for m in gates),

@@ -259,6 +259,19 @@ def test_python_layer_matches_cpp() -> None:
 def test_key_fragments_documented() -> None:
     text = K2.read_text()
     for frag in ("encoder.layers.", "self_attn.linear_q", "self_attn.linear_pos",
+                 "self_attn.pos_bias_u",
                  "feed_forward1", "feed_forward2", "pointwise_conv1",
                  "depthwise_conv", "norm_feed_forward1", "norm_out"):
         assert frag in text, f"kernel missing key fragment {frag}"
+
+
+def test_no_shared_bias_broadcast() -> None:
+    # v5 bug (2026-09-17): shared encoder-level pos_bias keys do not exist
+    # in the diar ckpt (untie_biases=True default -> per-layer pairs);
+    # broadcasting layer-0's pair to all 17 layers blew L01..L16 to 1.4-7.2
+    # while L00 stayed ~0.5. The shared-key constant must stay dead and
+    # every layer must eat its own pair.
+    text = K2.read_text()
+    assert "POS_BIAS_U_KEY" not in text, "shared-bias constant resurrected"
+    assert "POS_BIAS_V_KEY" not in text, "shared-bias constant resurrected"
+    assert "bu_all[li]" in text and "bv_all[li]" in text

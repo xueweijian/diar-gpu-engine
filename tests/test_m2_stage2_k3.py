@@ -187,6 +187,16 @@ def test_key_fragments_documented() -> None:
         assert frag in text, f"kernel missing key fragment {frag}"
 
 
+def test_tail_masks_to_valid_rows() -> None:
+    # v6 triage (2026-09-17): tail chunks carry zero-padded mel rows whose
+    # stem outputs are padding artifacts (short/chunk035 valid 11/12 rows,
+    # mid/chunk223 valid 6/8, ref tail row rms 0.34 vs ~13-22 valid). The
+    # gate must slice to state_lens_before[2] before metrics.
+    text = K3.read_text()
+    assert "state_lens_before" in text, "tail masking missing"
+    assert "n_valid" in text, "tail masking missing"
+
+
 def test_pre_encode_matches_staged_helpers() -> None:
     # pre_encode() must equal the staged conv2d/dw/pw/flat_cf/lin path on
     # the SAME synthetic weights (guards the vectorized rewrite against

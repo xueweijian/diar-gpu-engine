@@ -81,16 +81,27 @@ REPORT: dict[str, object] = {
 }
 
 D_MODEL, D_FF, N_HEADS, KERNEL = 512, 2048, 8, 9
-# pos_bias_u/v are SHARED across all conformer layers (single nn.Parameter on
-# the encoder, passed by reference into each ConformerLayer — see NeMo
-# ConformerEncoder.__init__ `if not untie_biases` branch; diar keeps the
-# default untie_biases=True... which takes the SHARED branch: the `if not`
-# is True, one (n_heads, d_head) pair is created and handed to every layer).
-# NeMo key names (state dict of the .nemo): the shared pair lives at
-# encoder.pos_bias_u / encoder.pos_bias_v (encoder-level, NO layer index);
-# per-layer projections are encoder.layers.{li}.self_attn.linear_{q,k,v,pos,out}.*.
-POS_BIAS_U_KEY = "encoder.pos_bias_u"
-POS_BIAS_V_KEY = "encoder.pos_bias_v"
+# pos_bias_u/v are PER-LAYER (untied) in diar — NOT shared. Upstream pins
+# (NeMo main, conformer_encoder.py + conformer_modules.py + multi_head_attention.py,
+# fetched 2026-09-17; this branching is stable since the conformer port):
+#   ConformerEncoder.__init__ defaults untie_biases=True, and
+#   `if not untie_biases and self_attention_model == "rel_pos":` builds ONE
+#   shared pair, ELSE passes pos_bias_u/v=None into every ConformerLayer;
+#   RelPositionMultiHeadAttention.__init__ then creates its OWN
+#   self.pos_bias_u/v Parameter per layer whenever it receives None.
+#   => state-dict keys encoder.layers.{li}.self_attn.pos_bias_{u,v}, each
+#   (H, Dk) = (8, 64); there is NO encoder-level pos_bias key in the ckpt.
+# Empirical pin: the v5 verdict resolved the shared keys MISSING and fell
+# back to layer-0's pair for all 17 layers (pos_bias_source showed
+# per-layer-fallback), producing the L01..L16 blowup (1.4-7.2, both audios
+# x all 3 chunks) while L00 stayed ~0.5. The v6 re-harvest confirms the
+# signature: a constant per-layer offset, not noise.
+# resolve_bias() below therefore returns one pair PER LAYER and raises a
+# LOUD KeyError naming the exact missing key if any layer lacks it — never
+# broadcast one layer's bias to the others (that was the v5 bug). A future
+# shared-ckpt fork must update resolve_bias, not its callers.
+POS_BIAS_U_SUFFIX = "self_attn.pos_bias_u"
+POS_BIAS_V_SUFFIX = "self_attn.pos_bias_v"
 
 
 def layer_prefix(li):
@@ -338,30 +349,31 @@ def main() -> int:
     REPORT["ckpt"] = str(ckpts[0])
     sd = load_sd(str(ckpts[0]))
 
-    def resolve_bias(key):
-        # Shared encoder-level pair; fall back to per-layer copies if a
-        # future checkpoint unties them (same (H,Dk) shape either way).
-        if key in sd:
-            return v1(sd[key])
-        per_layer = [v1(sd[layer_prefix(li) + "self_attn." + key.split(".")[-1]])
-                     for li in range(17)
-                     if layer_prefix(li) + "self_attn." + key.split(".")[-1] in sd]
-        if per_layer:
-            REPORT.setdefault("pos_bias_untied", True)
-            return per_layer[0]
-        raise KeyError(key)
+    def resolve_bias(suffix):
+        # Per-layer untied pairs (see header pins). Returns one (H*Dk,)
+        # vector per layer, in layer order. Raises a LOUD KeyError naming
+        # the exact missing key if ANY layer lacks the pair — never
+        # broadcast one layer's bias to the others (that was the v5 bug:
+        # layer-0's pair fed to all 17 layers -> L01..L16 red at 1.4-7.2).
+        out = []
+        for li in range(17):
+            key = layer_prefix(li) + suffix
+            if key not in sd:
+                raise KeyError(f"missing per-layer pos_bias: {key}")
+            out.append(v1(sd[key]))
+        return out
 
-    bu_shared = resolve_bias(POS_BIAS_U_KEY)
-    bv_shared = resolve_bias(POS_BIAS_V_KEY)
-    REPORT["pos_bias_source"] = ("shared:" + POS_BIAS_U_KEY if POS_BIAS_U_KEY in sd
-                                 else "per-layer-fallback")
+    bu_all = resolve_bias(POS_BIAS_U_SUFFIX)
+    bv_all = resolve_bias(POS_BIAS_V_SUFFIX)
+    REPORT["pos_bias_source"] = ("per-layer:" + POS_BIAS_U_SUFFIX +
+                                 " (untied, 17 pairs)")
 
     layers = []
     for li in range(17):
         p = f"encoder.layers.{li}."
         # NeMo ConformerLayer submodule names (conformer_modules.py):
         #   norm_feed_forward1/feed_forward1(linear1/linear2) +
-        #   norm_self_att/self_attn(linear_q/k/v/pos/out, pos_bias_u/v shared) +
+        #   norm_self_att/self_attn(linear_q/k/v/pos/out, pos_bias_u/v PER-LAYER untied) +
         #   norm_conv/conv(pointwise_conv1/depthwise_conv/batch_norm/pointwise_conv2) +
         #   norm_feed_forward2/feed_forward2 + norm_out.
         # Full key list per layer (resolved against ckpt at runtime):
@@ -376,8 +388,8 @@ def main() -> int:
                 "v_w": t2(sd[p + "self_attn.linear_v.weight"]),
                 "vb": v1(sd[p + "self_attn.linear_v.bias"]),
                 "pos_w": t2(sd[p + "self_attn.linear_pos.weight"]),
-                "bu": bu_shared,  # shared encoder pair (see POS_BIAS_*_KEY)
-                "bv": bv_shared,  # (same values for every layer)
+                "bu": bu_all[li],  # per-layer untied pair (see header pins)
+                "bv": bv_all[li],  # (v5 broadcast bug fixed 2026-09-17)
                 "o_w": t2(sd[p + "self_attn.linear_out.weight"]),
                 "ob": v1(sd[p + "self_attn.linear_out.bias"])}
         # FF norms + bodies (ConformerFeedForward.linear1/linear2).
