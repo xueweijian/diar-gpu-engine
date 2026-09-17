@@ -204,18 +204,17 @@ def _export_parity_candidate(
     print(f"[parity-candidate] {label}: exported rep0 -> {dst}", flush=True)
     return {"label": label, "dir": str(dst), "stable": prov["cross_session_stable"]}
 
-# v12 (2026-09-16 verdict): per-process library nondeterminism. v11 showed
-# within-session repeats are bit-identical at BOTH probs and body level while
-# cross-session mid hashes never repeat — the signature of autotune/algo
-# selection happening once per process. These pins force cuDNN to deterministic
-# kernel selection and cuBLAS to a fixed workspace split, so a cross-session
-# rerun (v12 vs v13, identical kernel) should converge mid to ONE hash.
-# Scoped to prob_sweep only: matrix rows keep running unpinned so their body
-# hashes stay comparable with the v4-v11 history.
-V12_ENV_PINS: dict[str, str] = {
-    "CUDNN_DETERMINISTIC": "1",
-    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-}
+# v13 (attribution experiment): v12 minus the env pins. v11 (unpinned) and
+# v12 (pinned) produced IDENTICAL hashes on all four cases — including mid
+# ddf2312b, which had never repeated across sessions before. Two candidate
+# explanations: (a) the environment/build became deterministic at v11 and the
+# pins are no-ops; (b) the pins select the same algo autotune already picked.
+# v13 flips ONLY the pin variable against v12:
+#   mid == ddf2312b unpinned  -> environment converged at v11; pins no-op;
+#   mid != ddf2312b unpinned  -> pins are causal; mid fixtures gate on pins.
+# Either way a third session hash locks fixture legitimacy for the cases
+# that reproduce.
+V12_ENV_PINS: dict[str, str] = {}
 # Cross-session-stable cases per the v11 hash lineage (short == v5/v7/v8
 # baseline; offline_full == v8's stable hash). These are the only legitimate
 # parity L1 fixture candidates; the mid cases churn across sessions.

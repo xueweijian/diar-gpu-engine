@@ -293,4 +293,36 @@ identical；跨会话 autotune 选择漂 → body 换 hash。这同时解释了�
 钉死 autotune，跨会话重跑 mid——若 hash 收敛到同一值则定位成立；
 parity L1 的短场 fixture（`999…`/`8170…` 均跨会话稳定）可直接回填。
 
+## 11. v12 pinned 会话：跨会话收敛达成 + 首批 parity fixture 回填
+（2026-09-16 pass）
+
+v12 = v11 + prob_sweep 子进程 env pins（`CUDNN_DETERMINISTIC=1` +
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`，仅 sweep，matrix 行不钉），14 跑
+probs/body 会话内再次全 bit-identical。**hash 与 v11 逐 case 完全一致**：
+
+- short `81704884` == v11 == v5/v7/v8 基线
+- **mid `ddf2312b` == v11**——此前 v5/v7/v8 每版 mid 都不重复，v11/v12
+  连续两会话钉在同一值
+- offline_full `999fb4ba` == v8/v11；preset `3f2258c5` == v11
+
+读法：跨会话收敛在 v11→v12 之间成立，但 v11 本身未钉——单凭 v12 无法
+区分"环境/构建在 v11 起已确定（pins 无关）"与"pins 恰好选中 autotune
+本来的选择"。v13（v12 唯一去掉 pins）做归因：
+- 未钉仍 `ddf2312b` → 环境自 v11 起收敛，pins no-op；
+- 未钉变值 → pins 是因果，mid fixture 必须 pinned 会话背书。
+
+parity fixture 首批回填（scripts/fill_parity_fixture.py，v12 kernel 新增
+_export_parity_candidate 把 rep0 probs+rttm+provenance 落
+/kaggle/working/parity_candidates/，解决 WORK_ROOT 随会话消失）：
+
+- `parity/fixtures/v12-short-streaming-r0/`（711×4，11.1KB）
+- `parity/fixtures/v12-mid-offline-full-r0/`（4467×4，69.8KB）
+- schema v1 manifest：nbytes=纯张量字节（11,328 / 71,488-12=71,476B…按
+  shape×4），sha256=整文件（含 12B probdump 头），frame_grid_ms=80
+  （FE 10ms hop × 8x 采样；spkcache160=12.8s/fifo80=6.4s/chunk20=1.6s
+  旁证 + mid 4467×80ms=357.4s 与哨兵 357s 音频吻合）
+- fill 前校验：rep0 probs_sha256 逐字节对上 candidate 文件；非
+  cross_session_stable 拒绝回填（--allow-unstable 显式开门）；fill 后
+  立即过 parity.loader 完整性验证。84 pytest 全绿。
+
 5. 以上均为 timing/结构实验，不动 engine 实现。

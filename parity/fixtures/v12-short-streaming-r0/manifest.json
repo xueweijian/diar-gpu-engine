@@ -1,0 +1,50 @@
+{
+  "case": {
+    "audio": "/kaggle/input/datasets/weijianxue/diar-smoke-audio/0-four-speakers-zh.wav",
+    "geometry": null,
+    "offline": false,
+    "preset": null
+  },
+  "name": "v12-short-streaming-r0",
+  "observation": {
+    "deterministic": true,
+    "frame_grid_ms": 80,
+    "hash_groups": {
+      "817048840019797cd82494d508dbf5176fc46bf14af5ea4baa6ffe8058b20be2": [
+        0,
+        1,
+        2
+      ]
+    },
+    "n_frames": 711,
+    "n_spk": 4
+  },
+  "schema_version": 1,
+  "source": {
+    "captured_at": "2026-09-17T00:54:40Z",
+    "env_pins": {
+      "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+      "CUDNN_DETERMINISTIC": "1"
+    },
+    "gpu": "Tesla T4, 580.159.04, 15360 MiB, 300 MHz, 405 MHz, 10.36 W, 0 %, 0 MiB, 43\nTesla T4, 580.159.04, 15360 MiB, 300 MHz, 405",
+    "kernel": "kaggle://weijianxue/diar-gpu-engine-sortformer-matrix",
+    "kernel_version": 12,
+    "repeats": 3,
+    "src_commit": "8881cfd",
+    "upstream_commit": "a5b6953"
+  },
+  "tensors": [
+    {
+      "dtype": "f32",
+      "layer": "frame_probs",
+      "name": "probs",
+      "nbytes": 11376,
+      "path": "probs.f32",
+      "sha256": "e4be4b5de3179838d8b787eaa64ce07f0cf6f9b4f990839615ee5e390002e9ad",
+      "shape": [
+        711,
+        4
+      ]
+    }
+  ]
+}
