@@ -1,0 +1,15 @@
+{
+  "id": "weijianxue/diar-m2-stage2-gates",
+  "title": "diar-m2-stage2-gates",
+  "code_file": "m2_stage2_run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaP100",
+  "dataset_sources": [
+    "weijianxue/diar-gpu-engine-harness",
+    "weijianxue/diar-m2-ref"
+  ]
+}
