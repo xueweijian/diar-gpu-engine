@@ -48,6 +48,9 @@ ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
 "$BUILD/test_sortformer_forward"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   -I"$ROOT/include" -I"$ROOT/tests" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" $NN_SRC "$ROOT/tools/dump_forward.cpp" -o "$BUILD/diar_dump_forward"
+g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
+  -I"$ROOT/include" -I"$ROOT/tests" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/fe.cpp" "$ROOT/src/diar.cpp" "$ROOT/src/aosc.cpp" "$ROOT/src/birth_gate.cpp" $NN_SRC "$ROOT/tests/test_engine.cpp" -o "$BUILD/test_engine"
+"$BUILD/test_engine"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   "$ROOT/tests/probdump_oracle.cpp" -o "$BUILD/probdump_oracle"
 "$BUILD/probdump_oracle"

@@ -436,6 +436,230 @@ void run_case(const CaseConfig& c) {
     }
 }
 
+// ------------------- streaming mel scheduler (fe.cpp:714 reskin) -----------
+// Mechanical reskin of upstream produce_new_mel_frames (NeMo-Speech.cpp
+// a5b6953 src/asr/features/fe.cpp:714). One deliberate expansion: upstream
+// calls fe.compute(...), whose body is exactly compute_padded(n, n) — the
+// reskinned OracleFE has no separate compute(), so the call is expanded to
+// its definition here and nowhere else.
+int oracle_produce_new_mel_frames(OracleFE& fe, const std::vector<float>& audio,
+    std::size_t audio_base, std::int64_t i_start, std::vector<float>& out) {
+    const int n_mels = fe.n_mels();
+    const int hop = fe.hop_length();
+    const int n_fft = fe.n_fft();
+    out.clear();
+    const std::size_t audio_end = audio_base + audio.size();
+    const std::int64_t i_max = (audio_end >= static_cast<std::size_t>(n_fft / 2))
+                                   ? static_cast<std::int64_t>((audio_end - n_fft / 2) / hop) + 1
+                                   : 0;
+    if (i_max <= i_start)
+        return 0;
+    std::vector<float> partial;
+    int n_frames = 0;
+    std::int64_t first_global;
+    if (i_start * hop < n_fft / 2) {
+        fe.compute_padded(audio.data(), audio.size(), audio.size(), partial, n_frames,
+            /*reflect_left=*/true, /*normalize=*/false);
+        first_global = 0;
+    } else {
+        const std::int64_t off = i_start * hop - n_fft / 2 - static_cast<std::int64_t>(audio_base);
+        fe.compute_padded(audio.data() + off, audio.size() - static_cast<std::size_t>(off),
+            audio.size() - static_cast<std::size_t>(off), partial, n_frames,
+            /*reflect_left=*/false, /*normalize=*/false);
+        first_global = i_start;
+    }
+    const std::int64_t skip = i_start - first_global;
+    const std::int64_t take =
+        std::min<std::int64_t>(static_cast<std::int64_t>(n_frames) - skip, i_max - i_start);
+    if (take <= 0 || skip < 0)
+        return 0;
+    out.assign(partial.data() + skip * n_mels, partial.data() + (skip + take) * n_mels);
+    return static_cast<int>(take);
+}
+
+struct MineProduce {
+    int operator()(diar::MelSpectrogramExtractor& fe, const std::vector<float>& audio,
+        std::size_t audio_base, std::int64_t i_start, std::vector<float>& out) const {
+        return diar::produce_new_mel_frames(fe, audio, audio_base, i_start, out);
+    }
+};
+
+// Drives a scheduler through a full stream: identical shard sizes, identical
+// consume hop, identical buffer trim policy (upstream DiarStream::run_one_chunk
+// lines), optionally the finish() decay tail. Returns every released frame.
+struct StreamTrace {
+    std::vector<float> frames;               // frame-major, n_mels per row
+    std::vector<std::int64_t> slice_starts;  // first frame of each mid-stream slice
+    int calls = 0;                           // produce() calls that returned frames
+};
+
+template <class FE, class Produce>
+StreamTrace drive_stream(FE& fe, const std::vector<float>& audio,
+    const std::vector<std::size_t>& shards, int hop_mel, int lc_mel, int rc_mel,
+    bool finish_tail, float preemph, Produce produce) {
+    const int n_fft = fe.n_fft();
+    const int hop = fe.hop_length();
+    std::vector<float> audio_buf;
+    std::size_t audio_base = 0;
+    std::int64_t produced = 0;
+    std::int64_t consumed = 0;
+    StreamTrace tr;
+
+    auto ensure = [&] {
+        std::vector<float> fresh;
+        const int n = produce(fe, audio_buf, audio_base, produced, fresh);
+        if (n <= 0)
+            return;
+        if (produced > 0 && produced * hop >= n_fft / 2)
+            tr.slice_starts.push_back(produced);
+        tr.frames.insert(tr.frames.end(), fresh.begin(), fresh.end());
+        produced += n;
+        ++tr.calls;
+    };
+    auto drain = [&] {
+        while (produced >= consumed + hop_mel + rc_mel) {
+            const std::int64_t lc = std::min<std::int64_t>(lc_mel, consumed);
+            consumed += hop_mel;
+            const std::int64_t keep_mel = std::max<std::int64_t>(consumed - lc, 0);
+            const std::int64_t keep_sample =
+                std::max<std::int64_t>(keep_mel * hop - n_fft / 2, 0);
+            if (keep_sample > static_cast<std::int64_t>(audio_base)) {
+                audio_buf.erase(audio_buf.begin(), audio_buf.begin() + (keep_sample - audio_base));
+                audio_base = static_cast<std::size_t>(keep_sample);
+            }
+        }
+    };
+
+    std::size_t pos = 0;
+    for (std::size_t s : shards) {
+        const std::size_t take = std::min(s, audio.size() - pos);
+        audio_buf.insert(audio_buf.end(), audio.begin() + pos, audio.begin() + pos + take);
+        pos += take;
+        ensure();
+        drain();
+    }
+    if (pos < audio.size()) {
+        audio_buf.insert(audio_buf.end(), audio.begin() + pos, audio.end());
+        ensure();
+        drain();
+    }
+    if (finish_tail && (!audio_buf.empty() || audio_base > 0)) {
+        float tail = audio_buf.empty() ? 0.0F : audio_buf.back();
+        for (int k = 0; k < n_fft / 2; k++) {
+            tail *= preemph;
+            audio_buf.push_back(tail);
+        }
+        ensure();
+        drain();
+    }
+    return tr;
+}
+
+void report_stream(const std::string& case_name, const StreamTrace& mine, const StreamTrace& ref) {
+    bool ok = mine.calls == ref.calls && mine.slice_starts == ref.slice_starts &&
+              mine.frames.size() == ref.frames.size() &&
+              (mine.frames.empty() ||
+                  std::memcmp(mine.frames.data(), ref.frames.data(),
+                      mine.frames.size() * sizeof(float)) == 0);
+    if (ok)
+        return;
+    ++g_failures;
+    std::printf("FAIL %s: frames %zu vs %zu, calls %d vs %d, slices %zu vs %zu", case_name.c_str(),
+        mine.frames.size(), ref.frames.size(), mine.calls, ref.calls, mine.slice_starts.size(),
+        ref.slice_starts.size());
+    if (mine.frames.size() == ref.frames.size() && !mine.frames.empty()) {
+        std::size_t idx = 0;
+        float worst = 0.0F;
+        for (std::size_t i = 0; i < mine.frames.size(); ++i) {
+            const float d = std::fabs(mine.frames[i] - ref.frames[i]);
+            if (d > worst) {
+                worst = d;
+                idx = i;
+            }
+        }
+        std::printf(" (worst %.9g vs %.9g, diff %.3g)", mine.frames[idx], ref.frames[idx], worst);
+    }
+    std::printf("\n");
+}
+
+// Characterization: outside the first frame of each mid-stream slice (the
+// upstream preemphasis boundary: a slice starts exactly at its first window's
+// left edge, so that sample is not differenced against its predecessor), the
+// streaming stream must equal the whole-file compute bit-for-bit.
+void characterize_stream(const std::string& case_name, const StreamTrace& tr,
+    const std::vector<float>& whole, int whole_frames, int n_mels) {
+    const std::int64_t n =
+        std::min<std::int64_t>(static_cast<std::int64_t>(tr.frames.size()) / n_mels, whole_frames);
+    std::int64_t skipped = 0, compared = 0;
+    for (std::int64_t g = 0; g < n; ++g) {
+        if (std::binary_search(tr.slice_starts.begin(), tr.slice_starts.end(), g)) {
+            ++skipped;
+            continue;
+        }
+        ++compared;
+        if (std::memcmp(tr.frames.data() + static_cast<std::size_t>(g) * n_mels,
+                whole.data() + static_cast<std::size_t>(g) * n_mels, n_mels * sizeof(float)) != 0) {
+            ++g_failures;
+            std::printf("FAIL %s: frame %lld differs from the whole-file compute outside a "
+                        "slice start\n", case_name.c_str(), static_cast<long long>(g));
+            return;
+        }
+    }
+    std::printf("  stream/%s: %lld frames, %lld compared vs whole-file, %lld slice-start "
+                "frames excluded\n", case_name.c_str(), static_cast<long long>(n),
+        static_cast<long long>(compared), static_cast<long long>(skipped));
+}
+
+void run_streaming_case(const std::string& name, const std::vector<std::size_t>& shards,
+    int hop_mel, int lc_mel, int rc_mel, bool finish_tail, bool characterize) {
+    diar::FrontendConfig mine_cfg;  // diar wiring defaults (n_mels 128, symmetric hann, centered)
+    OracleMelSpecConfig ref_cfg;
+    ref_cfg.n_mels = 128;
+    ref_cfg.hann_periodic = false;
+    ref_cfg.stft_center_window = true;
+    ref_cfg.normalize_per_feature = false;
+    ref_cfg.mask_invalid_frames = false;
+
+    diar::MelSpectrogramExtractor fe_mine(mine_cfg);
+    OracleFE fe_ref(ref_cfg);
+    const int n_bins = mine_cfg.n_fft / 2 + 1;
+    std::vector<float> basis(static_cast<std::size_t>(128) * n_bins);
+    std::mt19937 basis_rng(4321);
+    std::uniform_real_distribution<float> basis_dist(0.0F, 1.0F);
+    for (auto& v : basis) v = basis_dist(basis_rng);
+    fe_mine.set_mel_basis(basis.data(), 128, n_bins);
+    fe_ref.set_mel_basis(basis.data(), 128, n_bins);
+
+    std::size_t total = 0;
+    for (std::size_t s : shards) total += s;
+    const std::vector<float> audio = gen_audio(99u + static_cast<unsigned>(total), total);
+
+    const StreamTrace mine = drive_stream(fe_mine, audio, shards, hop_mel, lc_mel, rc_mel,
+        finish_tail, mine_cfg.preemph, MineProduce{});
+    const StreamTrace ref = drive_stream(
+        fe_ref, audio, shards, hop_mel, lc_mel, rc_mel, finish_tail, ref_cfg.preemph,
+        oracle_produce_new_mel_frames);
+    report_stream(name, mine, ref);
+
+    if (characterize && finish_tail) {
+        std::vector<float> whole;
+        int whole_frames = 0;
+        // Whole-buffer reference over audio + finish()'s decay tail: the tail
+        // pre-emphasizes to exact zeros, which is what NeMo's constant right
+        // pad looks like after preemphasis. Every streaming frame must equal
+        // this reference except the first frame of each mid-stream slice.
+        std::vector<float> ext = audio;
+        float tail = ext.empty() ? 0.0F : ext.back();
+        for (int k = 0; k < mine_cfg.n_fft / 2; k++) {
+            tail *= mine_cfg.preemph;
+            ext.push_back(tail);
+        }
+        fe_mine.compute(ext.data(), ext.size(), whole, whole_frames, /*reflect_left=*/true,
+            /*normalize=*/false);
+        characterize_stream(name, mine, whole, whole_frames, 128);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -469,6 +693,36 @@ int main() {
             report("peak_normalize/n=" + std::to_string(x.size()), mine, ref,
                    static_cast<int>(x.size()), static_cast<int>(x.size()));
         }
+    }
+
+    // streaming mel scheduler (produce_new_mel_frames): shard patterns ×
+    // buffer-trim policies × finish-tail, mine vs the upstream reskin, then a
+    // whole-file characterization of where streaming legitimately differs.
+    {
+        const std::size_t n = 32000;  // 2 s
+        // Whole buffer in one feed: single slice, no mid-stream boundaries.
+        run_streaming_case("one_shard", {n}, 160, 0, 0, true, true);
+        // Hop-aligned shards (10 mel frames each): every feed starts a slice.
+        std::vector<std::size_t> hop_shards;
+        for (std::size_t i = 0; i < n; i += 1600) hop_shards.push_back(1600);
+        run_streaming_case("hop_shards", hop_shards, 160, 0, 0, true, true);
+        // Sub-window shards (one mel frame per feed) + left-context retention.
+        std::vector<std::size_t> tiny_shards;
+        for (std::size_t i = 0; i < n; i += 160) tiny_shards.push_back(160);
+        run_streaming_case("frame_shards", tiny_shards, 160, 0, 0, true, false);
+        run_streaming_case("frame_shards_lc", tiny_shards, 160, 80, 0, true, false);
+        // 1-sample shards at the start (the reflect-left path re-entry), then
+        // large feeds; right context exercised too.
+        std::vector<std::size_t> ragged;
+        for (int i = 0; i < 700; i++) ragged.push_back(1);
+        ragged.push_back(4000);
+        ragged.push_back(777);
+        ragged.push_back(9000);
+        ragged.push_back(37);
+        ragged.push_back(40000);  // capped to the remaining audio
+        run_streaming_case("ragged_shards", ragged, 160, 0, 80, true, true);
+        // No finish tail: the frames NeMo's pad holds back stay unreleased.
+        run_streaming_case("no_finish_tail", hop_shards, 160, 0, 0, false, false);
     }
 
     if (g_failures != 0) {

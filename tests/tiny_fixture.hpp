@@ -164,7 +164,7 @@ struct Tiny {
             {"sortformer.encoder.conv_kernel_size", "3"},
             {"sortformer.encoder.subsampling_conv_channels", "8"},
             {"sortformer.encoder.feat_in", "128"},
-            {"sortformer.encoder.pos_emb_max_len", "64"},
+            {"sortformer.encoder.pos_emb_max_len", std::to_string(pe_max)},
             {"sortformer.transformer.n_layers", "2"},
             {"sortformer.transformer.hidden_size", "12"},
             {"sortformer.transformer.inner_size", "24"},
@@ -177,7 +177,7 @@ struct Tiny {
 // dims mirror the documented GGUF layout: stem conv2d [C,1,3,3], stem pw
 // [C,C,1,1] (converter keeps it 4-D), conformer pw squeezed [2D,D], dw
 // [D,1,K] (kept 3-D), linear [out,in], pe [2*pe_max-1, D], fb [F, 257].
-std::vector<TSpec> tiny_tensors(bool with_pe) {
+std::vector<TSpec> tiny_tensors(bool with_pe, int pe_max = 64) {
     const int D = 16, C = 8, F = 128, K = 3, H = 2, DK = 8, FF = 24;
     const int X = 12, I = 24, SPK = 3;
     const int fbins = 16;  // 128 -> 64 -> 32 -> 16
@@ -269,7 +269,9 @@ std::vector<TSpec> tiny_tensors(bool with_pe) {
     t.push_back({"head.single_hidden_to_spks.weight", {SPK, X}});
     t.push_back({"head.single_hidden_to_spks.bias", {SPK}});
     t.push_back({"preprocessor.fb", {F, 257}});
-    if (with_pe) t.push_back({"encoder.pos_enc.pe", {2 * 64 - 1, D}});
+    if (with_pe)
+        t.push_back({"encoder.pos_enc.pe",
+            {static_cast<std::uint32_t>(2 * pe_max - 1), static_cast<std::uint32_t>(D)}});
     return t;
 }
 

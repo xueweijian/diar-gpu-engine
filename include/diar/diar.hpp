@@ -140,6 +140,18 @@ private:
     std::vector<float> mel_basis_;
 };
 
+// Streaming mel-frame scheduler — faithful port of upstream fe.cpp:714
+// (a5b6953). Frames are indexed on the global 10 ms grid: frame i covers the
+// window centered at sample i*hop (torch.stft center=True convention). A
+// frame becomes available once its window's right edge fits in real audio
+// (n_fft/2 hold-back). At stream start (i_start*hop < n_fft/2) the first
+// batch is computed with reflect_left=true over the whole buffer; afterwards
+// compute() runs reflect_left=false from the window start offset. Returns
+// the number of frames appended to out (n_mels per row).
+int produce_new_mel_frames(const MelSpectrogramExtractor& fe,
+    const std::vector<float>& audio, std::size_t audio_base, std::int64_t i_start,
+    std::vector<float>& out);
+
 // Offline-path input prep ported from DiarModel::diarize_offline
 // (diar_pipeline.cpp @ a5b6953): scales by 1/(max(x) + eps). Note the
 // upstream quirk kept verbatim: the max ignores negative peaks, so a

@@ -309,4 +309,41 @@ offline_peak_normalize(const float* audio, std::size_t n_samples, float eps) {
     return scaled;
 }
 
+int produce_new_mel_frames(const MelSpectrogramExtractor& fe,
+    const std::vector<float>& audio, std::size_t audio_base, std::int64_t i_start,
+    std::vector<float>& out) {
+    // Geometry comes from the extractor itself; callers cannot desync it from
+    // the frames fe.compute() actually produces (upstream fe.cpp:714 pin).
+    const int n_mels = fe.n_mels();
+    const int hop = fe.hop_length();
+    const int n_fft = fe.n_fft();
+    out.clear();
+    const std::size_t audio_end = audio_base + audio.size();
+    const std::int64_t i_max = (audio_end >= static_cast<std::size_t>(n_fft / 2))
+                                   ? static_cast<std::int64_t>((audio_end - n_fft / 2) / hop) + 1
+                                   : 0;
+    if (i_max <= i_start)
+        return 0;
+    std::vector<float> partial;
+    int n_frames = 0;
+    std::int64_t first_global;
+    if (i_start * hop < n_fft / 2) {
+        fe.compute(audio.data(), audio.size(), partial, n_frames, /*reflect_left=*/true,
+            /*normalize=*/false);
+        first_global = 0;
+    } else {
+        const std::int64_t off = i_start * hop - n_fft / 2 - static_cast<std::int64_t>(audio_base);
+        fe.compute(audio.data() + off, audio.size() - static_cast<std::size_t>(off), partial,
+            n_frames, /*reflect_left=*/false, /*normalize=*/false);
+        first_global = i_start;
+    }
+    const std::int64_t skip = i_start - first_global;
+    const std::int64_t take = std::min<std::int64_t>(static_cast<std::int64_t>(n_frames) - skip,
+        i_max - i_start);
+    if (take <= 0 || skip < 0)
+        return 0;
+    out.assign(partial.data() + skip * n_mels, partial.data() + (skip + take) * n_mels);
+    return static_cast<int>(take);
+}
+
 } // namespace diar
