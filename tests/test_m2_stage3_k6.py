@@ -155,6 +155,44 @@ def test_gate_cli_end_to_end_tiny(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# K6 kernel entry file (generated: runner with DEFAULT_GATE flipped to "k6")
+# ---------------------------------------------------------------------------
+def _k6_entry_path() -> Path:
+    return REPO / "kaggle" / "m2_stage3_k6" / "m2_stage3_run_k6.py"
+
+
+def test_k6_entry_is_runner_with_gate_flipped():
+    """The K6 kernel ships a generated copy — exactly one line may differ."""
+    src = (STAGE3 / "m2_stage3_run.py").read_text(encoding="utf-8")
+    assert src.count('DEFAULT_GATE = "k5a"') == 1
+    got = _k6_entry_path().read_text(encoding="utf-8")
+    assert got == src.replace('DEFAULT_GATE = "k5a"', 'DEFAULT_GATE = "k6"'), \
+        "K6 entry stale — run scripts/build_k6_entry.py"
+
+
+def test_k6_entry_embedded_payload_is_fresh():
+    """The generated entry must carry the same fresh embedded anchors."""
+    sys.path.insert(0, str(STAGE3))
+    import embed_stage3 as e
+    text = _k6_entry_path().read_text(encoding="utf-8")
+    texts, blobs = e.build_embedded(text)
+    for anchor, value in texts.items():
+        assert e._read_anchor(text, anchor) == value, \
+            f"{anchor} stale in K6 entry (embed_stage3.py + build_k6_entry.py)"
+    assert e._read_anchor(text, "EMBEDDED_CPP_BLOBS_B64") == blobs, \
+        "EMBEDDED_CPP_BLOBS_B64 stale in K6 entry"
+
+
+def test_gate_pins():
+    """Both files pin their gate; a flip is a conscious, test-visible change."""
+    src = (STAGE3 / "m2_stage3_run.py").read_text(encoding="utf-8")
+    k6 = _k6_entry_path().read_text(encoding="utf-8")
+    assert 'DEFAULT_GATE = "k5a"' in src
+    assert 'DEFAULT_GATE = "k6"' in k6
+    assert 'DEFAULT_GATE = "k5a"' not in k6
+
+
+# ---------------------------------------------------------------------------
 # kernel-side fixture discovery (dataset may mount extracted OR as a zip)
 # ---------------------------------------------------------------------------
 def _case_tree(root: Path) -> Path:
@@ -208,3 +246,19 @@ def test_find_fixtures_dir_missing_raises(tmp_path):
     (tmp_path / "input").mkdir()
     with pytest.raises(RuntimeError, match="diar-m2-fixtures"):
         mod.find_fixtures_dir(tmp_path / "work", roots=[tmp_path / "input"])
+
+
+def test_pack_fixtures_zip_layout(tmp_path):
+    """The publish zip must carry <case>/<file> entries at the TOP level."""
+    spec = importlib.util.spec_from_file_location(
+        "pack_fixtures", REPO / "scripts" / "pack_fixtures.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    out = mod.pack(REPO / "parity" / "fixtures", tmp_path / "fixtures.zip")
+    with zipfile.ZipFile(out) as z:
+        names = set(z.namelist())
+    for case in mod.CASES:
+        assert f"{case}/manifest.json" in names
+        assert f"{case}/probs.f32" in names
+    # no wrapper dir: find_fixtures_dir() searches for "<case>/" under the mount
+    assert all(any(n.startswith(f"{c}/") for c in mod.CASES) for n in names)
