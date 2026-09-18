@@ -82,7 +82,7 @@ def load_npz(path: Path):
     return np.load(str(path), allow_pickle=True)
 
 
-def run_runner(runner: Path, args: list[str], timeout: int = 3600) -> subprocess.CompletedProcess:
+def run_runner(runner: Path, args: list[str], timeout: int = 4 * 3600) -> subprocess.CompletedProcess:
     return subprocess.run([str(runner), *args], capture_output=True, text=True, timeout=timeout)
 
 
@@ -212,6 +212,13 @@ def compare_audio(label: str, z, runner: Path, dfw1: Path, work: Path,
     blob_path = runs["whole"].get("aosc_f32", str(work / f"{label}_whole.aosc.f32"))
     blob = np.fromfile(blob_path, dtype="<f4")
     state_geometry_ok = True
+    # Last-chunk phantom exemption: python-NeMo's fifo_after on the FINAL
+    # chunk carries exactly G5's `phantom` extra zero-fill rows (K5 verdict
+    # forensics 2026-09-18: short 72v71/1, mid 68v66/2; the fill rows are
+    # cross-audio bit-identical and no non-final chunk has any all-zero
+    # chunk_preds row). Compare the real prefix; any OTHER shape mismatch
+    # stays a hard geometry failure.
+    n_last = n_chunks - 1
     for i, (snap, ci) in enumerate(zip(snaps, [f"chunk{c:03d}" for c in range(len(snaps))])):
         entry: dict = {"chunk": i}
         for kind, npz_key, frames, off in (
@@ -221,11 +228,19 @@ def compare_audio(label: str, z, runner: Path, dfw1: Path, work: Path,
             n_ref = z.get(f"{ci}/{npz_key}")
             if n_ref is not None:
                 ref = np.asarray(n_ref, dtype=np.float64)
-                got = blob[snap[off]:snap[off] + ref.size].astype(np.float64).reshape(ref.shape)
                 if ref.shape[0] != snap[frames]:
-                    entry[kind] = {"geometry-mismatch": [snap[frames], int(ref.shape[0])]}
-                    state_geometry_ok = False
+                    if (i == n_last and phantom > 0
+                            and int(ref.shape[0]) - int(snap[frames]) == phantom):
+                        ref = ref[:snap[frames]]
+                        got = blob[snap[off]:snap[off] + ref.size].astype(np.float64).reshape(ref.shape)
+                        m = metrics(ref, got)
+                        m["phantom_prefix_rows"] = int(snap[frames])
+                        entry[kind] = m
+                    else:
+                        entry[kind] = {"geometry-mismatch": [snap[frames], int(ref.shape[0])]}
+                        state_geometry_ok = False
                 else:
+                    got = blob[snap[off]:snap[off] + ref.size].astype(np.float64).reshape(ref.shape)
                     entry[kind] = metrics(ref, got)
         ms_ref = z.get(f"{ci}/mean_sil_emb_after")
         if ms_ref is not None:

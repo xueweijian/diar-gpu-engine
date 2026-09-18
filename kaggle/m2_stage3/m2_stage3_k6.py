@@ -160,7 +160,7 @@ def load_probs_f32(fdir: Path, manifest: dict) -> np.ndarray:
     return values.reshape(n_frames, n_spk)
 
 
-def run_runner(runner: Path, args: list[str], timeout: int = 3600) -> subprocess.CompletedProcess:
+def run_runner(runner: Path, args: list[str], timeout: int = 4 * 3600) -> subprocess.CompletedProcess:
     return subprocess.run([str(runner), *args], capture_output=True, text=True,
                           timeout=timeout)
 

@@ -248,7 +248,7 @@ def main() -> int:
     else:
         report["verdict"] = "nemo-dump-failed"
 
-    shutil.copy(probs_path, OUT / probs_path.name)   # already in OUT; explicit
+    shutil.copy(probs_path, TMP / probs_path.name)  # stage INTO tmp, not onto itself
     report["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     report["seconds"] = round(time.time() - started, 1)
     h.emit_report(report, name="m2_tail_fixture_verdict.json")

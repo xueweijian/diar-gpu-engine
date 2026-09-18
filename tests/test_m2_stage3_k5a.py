@@ -431,3 +431,59 @@ def test_k5a_parallel_runs_match_sequential(tmp_path):
     assert "error" not in r_par and "error" not in r_seq
     assert json.dumps(r_par, sort_keys=True) == json.dumps(r_seq, sort_keys=True)
     assert r_par["G6_determinism"]["bit_identical"] is True
+
+
+def test_k5a_g3_last_chunk_phantom_exemption(tmp_path):
+    """G3 forgives exactly G5's phantom delta on the FINAL chunk only.
+
+    Regression for the 2026-09-18 K5 verdict forensics: python-NeMo's
+    final-chunk fifo_after carries phantom extra zero-fill rows
+    (short 72v71/1, mid 68v66/2 — cross-audio bit-identical fill), while
+    our snapshot holds the real prefix. The gate must compare the prefix
+    (and tag it) instead of failing geometry; any other mismatch —
+    wrong delta, non-final chunk, spk side — must still fail hard.
+    """
+    import importlib
+    k5a = importlib.import_module("m2_stage3_k5a")
+    runner = _runner()
+    wpath, audio = _tiny_case_inputs(tmp_path, runner)
+    runs = _run_feeds("phantom", ["whole", "drip"], runner, wpath, tmp_path, audio)
+    assert all("error" not in rec for rec in runs.values())
+    whole = runs["whole"]
+    n_chunks = len(whole["ledger"])
+    assert n_chunks >= 2, "need a non-final chunk to prove the negative case"
+
+    def _npz_with_fifo(n_extra: int, chunk: int):
+        z = _synthetic_ref_npz(audio, whole)
+        ci = f"chunk{chunk:03d}"
+        fifo = np.asarray(z[f"{ci}/fifo_after"])
+        assert n_extra >= 0
+        z[f"{ci}/fifo_after"] = np.concatenate(
+            [fifo, np.zeros((n_extra, fifo.shape[1]))], axis=0)
+        return z
+
+    last = n_chunks - 1
+
+    # 1) exact-phantom delta on the final chunk -> forgiven, prefix compared.
+    r = k5a.compare_audio("tiny", _npz_with_fifo(1, last), runner, wpath,
+                          tmp_path, n_spk=4, runs={k: dict(v) for k, v in runs.items()})
+    assert "error" not in r, r.get("error")
+    assert r["G3_aosc"]["geometry_ok"] is True
+    cell = r["G3_aosc"]["per_chunk"][last]["fifo"]
+    assert cell.get("phantom_prefix_rows") == whole["aosc_index"][last]["fifo_frames"]
+    assert cell["max_abs"] == pytest.approx(0.0, abs=1e-6)
+
+    # 2) wrong delta on the final chunk -> still hard-fails geometry.
+    r = k5a.compare_audio("tiny", _npz_with_fifo(2, last), runner, wpath,
+                          tmp_path, n_spk=4, runs={k: dict(v) for k, v in runs.items()})
+    assert "error" not in r, r.get("error")
+    assert r["G3_aosc"]["geometry_ok"] is False
+
+    # 3) exact delta on a NON-final chunk -> still hard-fails geometry.
+    r = k5a.compare_audio("tiny", _npz_with_fifo(1, 0), runner, wpath,
+                          tmp_path, n_spk=4, runs={k: dict(v) for k, v in runs.items()})
+    assert "error" not in r, r.get("error")
+    assert r["G3_aosc"]["geometry_ok"] is False
+    assert r["G3_aosc"]["per_chunk"][0]["fifo"].get("geometry-mismatch") == [
+        whole["aosc_index"][0]["fifo_frames"],
+        whole["aosc_index"][0]["fifo_frames"] + 1]
