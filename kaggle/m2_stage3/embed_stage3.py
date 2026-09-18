@@ -27,6 +27,7 @@ TEXT_ANCHORS = {
     "m2_stage3_k5a.py": "EMBEDDED_M2_STAGE3_K5A",
     "f32bin_writer.py": "EMBEDDED_M2_STAGE3_F32WRITER",
     "m2_stage3_k6.py": "EMBEDDED_M2_STAGE3_K6",
+    "m3_stage1_prof.py": "EMBEDDED_M3_PROF",
 }
 
 # Must match CPP_SOURCES in m2_stage3_run.py (asserted below at embed time).
@@ -41,6 +42,7 @@ CPP_FILES = [
     "include/diar/mha.hpp", "include/diar/nn.hpp", "include/diar/posenc.hpp",
     "include/diar/sortformer.hpp", "include/diar/subsampling.hpp",
     "include/diar/tailfix.hpp",
+    "src/profile.cpp", "include/diar/profile.hpp",
 ]
 REPO = DIR.parent.parent
 

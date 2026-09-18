@@ -1,0 +1,13 @@
+{
+  "id": "weijianxue/diar-m3-stage1-prof",
+  "title": "diar-m3-stage1-prof",
+  "code_file": "m3_stage1_run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "weijianxue/diar-m2-ref"
+  ]
+}
