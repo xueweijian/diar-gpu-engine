@@ -59,12 +59,15 @@ def test_t2_keeps_torch_layout() -> None:
     assert ns["t2"]([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]) == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
 
 
-def test_k2_verdict_is_measured() -> None:
-    # K2 is a full 17-layer gate now, not a probe scaffold.
+def test_k2_verdict_is_gated() -> None:
+    # v13: K2 verdict is green/red against a pinned threshold (v12 measured
+    # 102/102 green, worst 1.11e-05; gate 1.2e-05 with headroom).
     text = K2.read_text()
-    assert '"k2-measured"' in text or "'k2-measured'" in text
-    assert "k2-scaffold" not in text.replace("not a probe scaffold", ""), \
-        "K2 still carries scaffold verdict"
+    assert '"k2-green"' in text or "'k2-green'" in text
+    assert '"k2-red"' in text or "'k2-red'" in text
+    assert "k2-measured" not in text
+    # K2 is a full 17-layer gate now, not a probe scaffold.
+    assert "k2-scaffold" not in text
 
 
 def test_shift_orientation() -> None:

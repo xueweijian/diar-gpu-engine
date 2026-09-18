@@ -18,6 +18,18 @@
 //     Conv2d oracle already pins this geometry on synthetic data; Stage 0
 //     chunk000 real-data check pins 160 -> 20 frames (mel 160x128 in,
 //     pre_encode 20x512 out).
+//   v13 MASKED-TAIL pin (subsampling.py MaskedConvSequential, NeMo 3.0.0,
+//     pinned 2026-09-18 from v12 P6 probe evidence): the conv stack runs on
+//     the FULL window grid (t_mel rows, T_full = t_mel/8 out rows), but a
+//     multiplicative time mask is applied around every layer with per-stage
+//     floor lengths iterated from feat_len (calculate_conv_output_size):
+//     L_{k+1} = (L_k + 2 - 3)/2 + 1; 86 -> 43 -> 22 -> 11. Rows >= Lk are
+//     zeroed after level k's activation (bit-equivalent to per-layer
+//     masking; only zero-vs-nonzero matters downstream). Final rows >= L3
+//     flatten to zero features so the out Linear yields out.bias EXACTLY —
+//     the bit-identical fill rows observed on tail chunks (rms 0.337,
+//     identical across audios). L3 == calc_length(repeat_num=3) ==
+//     state_lens_before[2] == the encoder's reported valid length.
 //
 // Diar config: feat_in=128, conv_channels=256, d_model=512, factor 8.
 //
@@ -26,6 +38,7 @@
 // C,H,W single-channel — NOT reused here; this file has its own explicit
 // grouped loop); pointwise 1x1 [C,C,1,1]; out Linear [512, C*F]+b. All
 // biases present (torch Conv2d default bias=True). T <= 0 no-op.
+// feat_len <= 0 or > t_mel means full window (masks become no-ops).
 
 namespace diar {
 
@@ -46,7 +59,10 @@ struct SubsamplingWeights {
 
 // mel [T_mel,128] -> y [T_enc,512]. f_out is the surviving freq bins after
 // 3x ceil-div (16 for feat 128); asserted against computed geometry.
+// feat_len: valid mel rows (NeMo processed_signal_length); rows >= feat_len
+// are masked and tail output rows become out.bias (see pin above).
+// feat_len <= 0 || feat_len > t_mel selects the full window.
 void subsampling_forward(const float* mel_in, const SubsamplingWeights& w, float* y, int t_mel,
-    int feat_in = 128, int conv_channels = 256, int d_model = 512);
+    int feat_in = 128, int conv_channels = 256, int d_model = 512, int feat_len = -1);
 
 }  // namespace diar

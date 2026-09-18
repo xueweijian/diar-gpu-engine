@@ -118,7 +118,7 @@ def lin(x, w, b):
     return y.tolist()
 
 
-def pre_encode(mel_tf, wt, F=128, C=256, D=512):
+def pre_encode(mel_tf, wt, F=128, C=256, D=512, feat_len=None):
     # Numpy-vectorized stem (same perf rewrite as K1/K2): identical math to
     # src/subsampling.cpp — conv0+ReLU, (DW/no-ReLU, pw+ReLU) x2, flat, out.
     # Nested-list I/O preserved for the mechanics transcription tests.
@@ -127,9 +127,29 @@ def pre_encode(mel_tf, wt, F=128, C=256, D=512):
     #   conv.4 (ReLU) / conv.5 (DW) / conv.6 (pw) / conv.7 (ReLU),
     #   then pre_encode.out (Linear C*F3 -> D). Resolved against the
     #   checkpoint key list in main(); any schema fork fails LOUDLY there.
+    #
+    # v13 masked-tail semantics (NeMo 3.0.0 subsampling.py MaskedConvSequential,
+    # pinned 2026-09-18 from the v12 P6 probe): the conv stack runs on the
+    # FULL window grid (T_full = window/8 rows), but a multiplicative time
+    # mask is applied around every layer using per-stage floor lengths
+    # L_{k+1} = (L_k + 2 - 3)//2 + 1 iterated from feat_len (NOT window):
+    # 86 -> 43 -> 22 -> 11 == state_lens_before[2]. Rows >= Lk are zeroed
+    # after level k's activation (bit-equivalent to NeMo's per-layer mask:
+    # only zero-vs-nonzero matters to the next strided consumer). Consequence
+    # 1: boundary valid rows tap masked zero rows instead of bias chains
+    # (short/chunk035 row10 divergence, v12 34.8 -> fixed). Consequence 2:
+    # final rows >= L3 have all-zero features -> out(0) == out.bias EXACTLY —
+    # the bit-identical fill rows (rms 0.337, sha 8f441a7ac60126dc) seen
+    # across both audios' tail chunks.
     import numpy as _np
-    mel = _np.asarray(mel_tf, dtype=_np.float64)  # [T, F]
+    mel = _np.array(mel_tf, dtype=_np.float64)  # [T, F] (fresh copy, masked below)
     T = mel.shape[0]
+    if feat_len is None:
+        feat_len = T
+    if not (0 < feat_len <= T):
+        raise ValueError(f"feat_len {feat_len} outside (0, {T}]")
+    mel[int(feat_len):, :] = 0.0  # input time mask (mask before conv.0)
+    L1, L2, L3 = ool(feat_len), ool(ool(feat_len)), ool(ool(ool(feat_len)))
 
     def conv_stage(x, w, b, relu):
         # x: [Ci, H, W] (numpy), w: [Co, Ci, 3, 3]. Stride 2, pad 1, floor.
@@ -169,15 +189,18 @@ def pre_encode(mel_tf, wt, F=128, C=256, D=512):
     # Channel-first input [1, T, F] (mel rows = time, cols = freq).
     xc = mel[None, :, :]  # [1, T, F]
     s0 = conv_stage(xc, c0_w, wt["c0_b"], True)  # [C, T1, F1]
+    s0[:, L1:, :] = 0.0  # v13: per-stage length mask (rows >= L1)
     C_ = s0.shape[0]
     d1 = dw_stage(s0, _np.asarray(wt["dw1_w"], dtype=_np.float64), wt["dw1_b"])
     t2_, f2_ = d1.shape[1], d1.shape[2]
     s1 = pw_stage(d1.reshape(C_, -1), _np.asarray(wt["pw1_w"], dtype=_np.float64),
                   wt["pw1_b"]).reshape(C_, t2_, f2_)
+    s1[:, L2:, :] = 0.0  # v13: per-stage length mask (rows >= L2)
     d2 = dw_stage(s1, _np.asarray(wt["dw2_w"], dtype=_np.float64), wt["dw2_b"])
     t3, f3 = d2.shape[1], d2.shape[2]
     s2 = pw_stage(d2.reshape(C_, -1), _np.asarray(wt["pw2_w"], dtype=_np.float64),
                   wt["pw2_b"]).reshape(C_, t3, f3)
+    s2[:, L3:, :] = 0.0  # v13: final mask -> rows >= L3 flatten to zero features
     flat = s2.transpose(1, 0, 2).reshape(t3, -1)  # torch (b,t,c*f)
     out = flat @ _np.asarray(wt["out_w"], dtype=_np.float64).T \
         + _np.asarray(wt["out_b"], dtype=_np.float64)[None, :]
@@ -202,6 +225,14 @@ def v1(w):
     import numpy as _np
     return _np.asarray(w.detach().cpu().numpy() if hasattr(w, "detach") else w,
                        dtype=_np.float64).ravel().tolist()
+
+
+# v13 pinned gates. valid-row threshold: v12 measured 259/260 green at
+# worst ~5-8e-05 (fp32-vs-fp64 spread); the 260th (short/chunk035 row10)
+# was the masked-tail bug fixed in v13. fill rows: out.bias on BOTH sides,
+# compared EXACTLY (0*w sums are exact zeros in fp64 and fp32 alike).
+GATE_VALID_MAX_ABS = 8e-05
+GATE_FILL_MAX_ABS = 0.0
 
 
 def main() -> int:
@@ -266,33 +297,50 @@ def main() -> int:
         gates = []
         for chunk in chunks:
             mel = z[chunk + "/mel_window"].tolist()  # [T_mel, 128]
-            got = pre_encode(mel, wt)
+            feat_len = int(z[chunk + "/feat_length"][0])
+            got = pre_encode(mel, wt, feat_len=feat_len)
             ref = z[chunk + "/pre_encode"].tolist()
             import math as _m
-            # Tail chunks carry zero-padded mel rows (mel[feat_len:] == 0)
-            # whose stem outputs are padding artifacts, while the reference
-            # keeps full rows (its last row even holds a ~constant fill —
-            # v6 triage 2026-09-17: short/chunk035 row 11 rms 0.34 vs valid
-            # rows ~13-22, mid/chunk223 same pattern). Gate VALID rows only:
-            # n_valid = state_lens_before[2] (== ceil(feat_len/8)); full
-            # chunks are unaffected (n_valid == len(ref)).
+            # v13: the mirror now reproduces NeMo's masked-tail semantics, so
+            # the gate covers ALL rows: valid rows (< n_valid) against fp32
+            # spread thresholds, tail rows (>= n_valid) against out.bias
+            # EXACTLY (both sides compute out(0-features) == out.bias).
+            # n_valid = state_lens_before[2] must equal our iterated floor
+            # formula L3 (NeMo calc_length repeat_num=3) — asserted loudly.
             n_valid = int(z[chunk + "/state_lens_before"][2])
             assert 0 < n_valid <= len(ref), (chunk, n_valid, len(ref))
-            r = _np.asarray(ref, dtype=_np.float64)[:n_valid]
-            g = _np.asarray(got, dtype=_np.float64)[:n_valid]
+            L3 = ool(ool(ool(feat_len)))
+            assert n_valid == L3, (chunk, "length formula drift", n_valid, L3)
+            r_all = _np.asarray(ref, dtype=_np.float64)
+            g_all = _np.asarray(got, dtype=_np.float64)
+            r, g = r_all[:n_valid], g_all[:n_valid]
+            out_b = _np.asarray(wt["out_b"], dtype=_np.float64)
+            tail_r, tail_g = r_all[n_valid:], g_all[n_valid:]
             gates.append({"chunk": chunk,
                           "max_abs": float(_np.abs(r - g).max()),
                           "mean_abs": float(_np.abs(r - g).mean()),
                           "cosine": float((r * g).sum() / (_m.sqrt((r * r).sum() * (g * g).sum()) + 1e-12)),
+                          "fill_max_abs": (float(_np.abs(tail_r - tail_g).max())
+                                           if tail_r.shape[0] else 0.0),
+                          "fill_vs_out_bias": (float(_np.abs(tail_r - out_b[None, :]).max())
+                                               if tail_r.shape[0] else 0.0),
                           "T": n_valid,
                           "T_full": len(ref)})
         per_audio[label] = gates
     REPORT["gates"] = per_audio
     REPORT["worst_max_abs"] = max((m["max_abs"] for gates in per_audio.values() for m in gates),
                                   default=float("nan"))
-    REPORT["verdict"] = "k3-measured"
-    REPORT["note"] = ("pre_encode teacher-forced fp32-vs-fp32 spreads; "
-                      "pin gate thresholds from these numbers per plan §1.")
+    REPORT["worst_fill_max_abs"] = max((m["fill_max_abs"] for gates in per_audio.values()
+                                        for m in gates), default=0.0)
+    REPORT["worst_fill_vs_out_bias"] = max((m["fill_vs_out_bias"] for gates in per_audio.values()
+                                            for m in gates), default=0.0)
+    ok = (REPORT["worst_max_abs"] <= GATE_VALID_MAX_ABS
+          and REPORT["worst_fill_max_abs"] <= GATE_FILL_MAX_ABS
+          and REPORT["worst_fill_vs_out_bias"] <= GATE_FILL_MAX_ABS)
+    REPORT["gate"] = {"valid_max_abs": GATE_VALID_MAX_ABS, "fill_max_abs": GATE_FILL_MAX_ABS}
+    REPORT["verdict"] = "k3-green" if ok else "k3-red"
+    REPORT["note"] = ("v13 masked-tail semantics: valid rows gated at "
+                      f"{GATE_VALID_MAX_ABS:g}, tail rows must equal out.bias exactly.")
     REPORT["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     h.emit_report(REPORT, name="m2_stage2_k3_verdict.json")
     print(json.dumps({k: v for k, v in REPORT.items() if k != "gates"}, indent=1)[:2000])

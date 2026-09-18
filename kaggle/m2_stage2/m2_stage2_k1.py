@@ -221,6 +221,11 @@ def v1(w):
                        dtype=_np.float64).ravel().tolist()
 
 
+# v13 pinned gate (v12 measured: K1 120/120 green, worst blocks 1.13e-06,
+# proj 5.0e-07, head 8.8e-08; frame_agreement 1.0 everywhere).
+GATE_MAX_ABS = 1.2e-06
+
+
 def main() -> int:
     import numpy as _np
     REPORT["environment"] = h.environment_record()
@@ -351,9 +356,12 @@ def main() -> int:
     REPORT["worst_block_max_abs"] = worst_block
     REPORT["worst_head_max_abs"] = worst_head
     REPORT["worst_proj_max_abs"] = worst_proj
-    REPORT["verdict"] = "k1-measured"
-    REPORT["note"] = ("teacher-forced fp32-vs-fp32 spreads measured; "
-                      "pin gate thresholds from these numbers per plan §1.")
+    ok = (worst_block <= GATE_MAX_ABS and worst_head <= GATE_MAX_ABS
+          and worst_proj <= GATE_MAX_ABS)
+    REPORT["gate"] = {"max_abs": GATE_MAX_ABS}
+    REPORT["verdict"] = "k1-green" if ok else "k1-red"
+    REPORT["note"] = (f"v13 pinned gate {GATE_MAX_ABS:g} (v12 measured worst "
+                      "proj 5.0e-07 / blocks 1.13e-06 / head 8.8e-08).")
     REPORT["gpu_after"] = h.gpu_snapshot()
     REPORT["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     h.emit_report(REPORT, name="m2_stage2_k1_verdict.json")

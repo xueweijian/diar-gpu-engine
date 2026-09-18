@@ -539,6 +539,12 @@ def main() -> int:
     h.emit_report(REPORT, name="m2_stage2_k4_verdict.json")
     print(json.dumps({k: v for k, v in REPORT.items() if k != "probes"}, indent=1)[:3000])
     for name, m in probes.items():
+        # v13: P6 (and any future probe) carries nested/row-wise payloads
+        # without scalar max_abs — skip instead of KeyError-ing the summary
+        # (cosmetic-only crash seen in the v12 run; json was already dumped).
+        if not isinstance(m, dict) or "max_abs" not in m or "mean_abs" not in m:
+            print(f"{name}: (non-scalar probe payload; see verdict json)")
+            continue
         print(f"{name}: max_abs={m['max_abs']:.3e} mean={m['mean_abs']:.3e} "
               f"cos={m['cosine']:.6f} shape={m['shape']}")
     return 0

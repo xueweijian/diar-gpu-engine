@@ -78,28 +78,60 @@ void pointwise_relu(const float* x, const float* w, const float* b, float* y, in
 
 }  // namespace
 
+// v13: zero time-rows >= l of a [c][t][f] buffer (NeMo MaskedConvSequential
+// per-stage length mask; equivalent to its per-layer multiplicative mask —
+// only zero-vs-nonzero matters to the next strided consumer).
+void zero_time_rows(float* v, int c, int t_tot, int f, int l) {
+    for (int ch = 0; ch < c; ++ch) {
+        float* base = v + (static_cast<std::size_t>(ch) * t_tot + l) * f;
+        const int n = (t_tot - l) * f;
+        for (int i = 0; i < n; ++i) base[i] = 0.0F;
+    }
+}
+
 void subsampling_forward(const float* mel_in, const SubsamplingWeights& w, float* y, int t_mel,
-    int feat_in, int conv_channels, int d_model) {
+    int feat_in, int conv_channels, int d_model, int feat_len) {
     if (t_mel <= 0) return;
+    if (feat_len <= 0 || feat_len > t_mel) feat_len = t_mel;  // full-window default
     const int C = conv_channels;
+    // Per-stage masked lengths from feat_len (NOT the window length):
+    // L_{k+1} = floor((L_k + 2 - 3)/2) + 1. 86 -> 43 -> 22 -> 11 ==
+    // state_lens_before[2]. Window grid sizes t1/t2/t3 stay window-based.
+    const int l1 = conv_out_len(feat_len, 3, 2, 1);
+    const int l2 = conv_out_len(l1, 3, 2, 1);
+    const int l3 = conv_out_len(l2, 3, 2, 1);
+    // Input time mask: rows >= feat_len zeroed before conv.0 (NeMo applies a
+    // multiplicative mask before every layer; for the input this is it).
+    std::vector<float> mel_masked;
+    const float* mel_p = mel_in;
+    if (feat_len < t_mel) {
+        mel_masked.assign(mel_in, mel_in + static_cast<std::size_t>(t_mel) * feat_in);
+        for (int t = feat_len; t < t_mel; ++t)
+            for (int f = 0; f < feat_in; ++f)
+                mel_masked[static_cast<std::size_t>(t) * feat_in + f] = 0.0F;
+        mel_p = mel_masked.data();
+    }
     // Stage 0: (1, T, F) -> (C, T1, F1).
     const int t1 = conv_out_len(t_mel, 3, 2, 1);
     const int f1 = conv_out_len(feat_in, 3, 2, 1);
     // torch input (B,T,F) channel-first (1,T,F): index (t*F+f).
     std::vector<float> s0(C * t1 * f1);
-    conv2d_relu(mel_in, w.c0_w, w.c0_b, s0.data(), 1, t_mel, feat_in, C, /*relu=*/true);
+    conv2d_relu(mel_p, w.c0_w, w.c0_b, s0.data(), 1, t_mel, feat_in, C, /*relu=*/true);
+    zero_time_rows(s0.data(), C, t1, f1, l1);
     // Stage 1: DW + pointwise.
     const int t2 = conv_out_len(t1, 3, 2, 1);
     const int f2 = conv_out_len(f1, 3, 2, 1);
     std::vector<float> d1(C * t2 * f2), s1(C * t2 * f2);
     conv2d_dw_relu(s0.data(), w.dw1_w, w.dw1_b, d1.data(), C, t1, f1, /*relu=*/false);
     pointwise_relu(d1.data(), w.pw1_w, w.pw1_b, s1.data(), C, t2 * f2);
+    zero_time_rows(s1.data(), C, t2, f2, l2);
     // Stage 2: DW + pointwise.
     const int t3 = conv_out_len(t2, 3, 2, 1);
     const int f3 = conv_out_len(f2, 3, 2, 1);
     std::vector<float> d2(C * t3 * f3), s2(C * t3 * f3);
     conv2d_dw_relu(s1.data(), w.dw2_w, w.dw2_b, d2.data(), C, t2, f2, /*relu=*/false);
     pointwise_relu(d2.data(), w.pw2_w, w.pw2_b, s2.data(), C, t3 * f3);
+    zero_time_rows(s2.data(), C, t3, f3, l3);
     // Flatten (C,F) per time step, Linear -> d_model. s2 layout [C,T3,F3]:
     // frame t is C*F3 values strided by F3 (matches torch reshape(b,t,-1)
     // of (b,c,t,f).transpose(1,2)).

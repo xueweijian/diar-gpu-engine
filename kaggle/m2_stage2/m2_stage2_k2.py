@@ -331,6 +331,11 @@ def v1(w):
                        dtype=_np.float64).ravel().tolist()
 
 
+# v13 pinned gate (v12 measured: K2 102/102 green over 17 layers x 6 chunks,
+# worst 1.11e-05, cosine 1.0).
+GATE_MAX_ABS = 1.2e-05
+
+
 def main() -> int:
     import numpy as _np
     import json
@@ -506,9 +511,11 @@ def main() -> int:
     worst = max((m["max_abs"] for gates in per_audio.values() for m in gates),
                 default=float("nan"))
     REPORT["worst_layer_max_abs"] = worst
-    REPORT["verdict"] = "k2-measured"
-    REPORT["note"] = ("17-layer teacher-forced fp32-vs-fp32 spreads; "
-                      "pin gate thresholds from these numbers per plan §1.")
+    ok = worst <= GATE_MAX_ABS
+    REPORT["gate"] = {"max_abs": GATE_MAX_ABS}
+    REPORT["verdict"] = "k2-green" if ok else "k2-red"
+    REPORT["note"] = (f"v13 pinned gate {GATE_MAX_ABS:g} (v12 measured worst "
+                      "1.11e-05 over 102 layer gates, cos 1.0).")
     REPORT["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     h.emit_report(REPORT, name="m2_stage2_k2_verdict.json")
     print(json.dumps({k: v for k, v in REPORT.items() if k != "gates"}, indent=1)[:2000])

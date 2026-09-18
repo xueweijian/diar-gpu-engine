@@ -211,6 +211,148 @@ void test_dw_channel_isolation() {
     expect(y[0] != 0.0F || y[1] == 0.0F, "dw isolation structural");
 }
 
+// ---- v13 masked-tail semantics (NeMo MaskedConvSequential) ---------------
+
+int mool(int in) { return (in + 2 - 3) / 2 + 1; }
+
+void dbl_mask_time(std::vector<double>& v, int c, int t, int f, int l) {
+    for (int ch = 0; ch < c; ++ch)
+        for (int h = l; h < t; ++h)
+            for (int w = 0; w < f; ++w) v[(static_cast<std::size_t>(ch) * t + h) * f + w] = 0.0;
+}
+
+void dbl_pw_raw(const std::vector<double>& x, const std::vector<double>& w,
+    const std::vector<double>& b, std::vector<double>& y, int c, int hw) {
+    for (int o = 0; o < c; ++o)
+        for (int q = 0; q < hw; ++q) {
+            double acc = b[o];
+            for (int i = 0; i < c; ++i) acc += x[i * hw + q] * w[o * c + i];
+            y[o * hw + q] = acc;
+        }
+}
+
+void dbl_relu(std::vector<double>& v) {
+    for (auto& z : v) if (z < 0) z = 0;
+}
+
+void test_masked_length_formula() {
+    // Per-stage floor lengths from feat_len (v12 evidence: short/chunk035
+    // 86 -> 43 -> 22 -> 11 == state_lens_before[2]; mid/chunk223
+    // 48 -> 24 -> 12 -> 6; full chunk 160 -> 80 -> 40 -> 20).
+    int l = 86;
+    l = mool(l); expect(l == 43, "mask 86->43");
+    l = mool(l); expect(l == 22, "mask 43->22");
+    l = mool(l); expect(l == 11, "mask 22->11");
+    l = 48;
+    l = mool(l); expect(l == 24, "mask 48->24");
+    l = mool(l); expect(l == 12, "mask 24->12");
+    l = mool(l); expect(l == 6, "mask 12->6");
+    l = 160;
+    l = mool(l); expect(l == 80, "mask 160->80");
+    l = mool(l); expect(l == 40, "mask 80->40");
+    l = mool(l); expect(l == 20, "mask 40->20");
+}
+
+void test_masked_random_vs_literal_oracle() {
+    // C++ subsampling_forward vs an INDEPENDENT literal transcription of
+    // NeMo MaskedConvSequential: per-layer multiplicative masks, lengths
+    // iterated from feat_len. Geometry: window 24 -> 12 -> 6 -> 3, masks
+    // from feat_len=16: 16 -> 8 -> 4 -> 2 (tail row 2, boundary row taps
+    // masked rows — the v12 chunk035 row10 failure mode).
+    const int tm = 24, f = 8, c = 4, d = 6, feat_len = 16;
+    std::uint64_t s = 13001;
+    auto R = [&](std::vector<float>& v, double sc) {
+        for (auto& z : v) z = static_cast<float>(lcg_uniform(s) * sc);
+    };
+    std::vector<float> mel(tm * f), mel_raw(tm * f);
+    std::vector<float> c0w(c * 9), c0b(c), dw1w(c * 9), dw1b(c), pw1w(c * c), pw1b(c), dw2w(c * 9),
+        dw2b(c), pw2w(c * c), pw2b(c);
+    R(mel_raw, 0.5);
+    mel = mel_raw;  // forward() masks internally; oracle masks its own copy
+    R(c0w, 0.3); R(c0b, 0.1); R(dw1w, 0.3); R(dw1b, 0.1); R(pw1w, 0.3); R(pw1b, 0.1);
+    R(dw2w, 0.3); R(dw2b, 0.1); R(pw2w, 0.3); R(pw2b, 0.1);
+    const int f3 = ool(ool(ool(f)));
+    std::vector<float> outw(d * c * f3), outb(d);
+    R(outw, 0.2); R(outb, 0.1);
+    diar::SubsamplingWeights w{c0w.data(), c0b.data(), dw1w.data(), dw1b.data(), pw1w.data(),
+        pw1b.data(), dw2w.data(), dw2b.data(), pw2w.data(), pw2b.data(), outw.data(),
+        outb.data()};
+    const int t3 = ool(ool(ool(tm)));
+    std::vector<float> y(t3 * d, 0.0F);
+    diar::subsampling_forward(mel.data(), w, y.data(), tm, f, c, d, feat_len);
+
+    // Literal oracle (doubles).
+    const int l1 = mool(feat_len), l2 = mool(l1), l3 = mool(l2);
+    expect(l1 == 8 && l2 == 4 && l3 == 2, "oracle lengths");
+    const int t1 = ool(tm), ff1 = ool(f), t2 = ool(t1), ff2 = ool(ff1);
+    std::vector<double> xm(static_cast<std::size_t>(tm) * f);
+    for (int t = 0; t < tm; ++t)
+        for (int q = 0; q < f; ++q)
+            xm[static_cast<std::size_t>(t) * f + q] = t < feat_len ? mel_raw[t * f + q] : 0.0;
+    auto D = [](const std::vector<float>& v) { return std::vector<double>(v.begin(), v.end()); };
+    std::vector<double> a0(c * t1 * ff1), s0(c * t1 * ff1), d1(c * t2 * ff2), p1(c * t2 * ff2),
+        s1(c * t2 * ff2), d2(c * t3 * f3), p2(c * t3 * f3), s2(c * t3 * f3);
+    dbl_conv2d(xm, D(c0w), D(c0b), a0, 1, tm, f, c, false);
+    dbl_mask_time(a0, c, t1, ff1, l1);
+    s0 = a0; dbl_relu(s0);
+    dbl_dw(s0, D(dw1w), D(dw1b), d1, c, t1, ff1);
+    dbl_mask_time(d1, c, t2, ff2, l2);
+    dbl_pw_raw(d1, D(pw1w), D(pw1b), p1, c, t2 * ff2);
+    dbl_mask_time(p1, c, t2, ff2, l2);
+    s1 = p1; dbl_relu(s1);
+    dbl_dw(s1, D(dw2w), D(dw2b), d2, c, t2, ff2);
+    dbl_mask_time(d2, c, t3, f3, l3);
+    dbl_pw_raw(d2, D(pw2w), D(pw2b), p2, c, t3 * f3);
+    dbl_mask_time(p2, c, t3, f3, l3);
+    s2 = p2; dbl_relu(s2);
+    dbl_mask_time(s2, c, t3, f3, l3);  // final mask
+    std::vector<double> flat(static_cast<std::size_t>(t3) * c * f3), e(static_cast<std::size_t>(t3) * d);
+    for (int t = 0; t < t3; ++t)
+        for (int cc = 0; cc < c; ++cc)
+            for (int ff = 0; ff < f3; ++ff)
+                flat[(static_cast<std::size_t>(t) * c + cc) * f3 + ff] =
+                    s2[(static_cast<std::size_t>(cc) * t3 + t) * f3 + ff];
+    for (int r = 0; r < t3; ++r)
+        for (int o = 0; o < d; ++o) {
+            double acc = outb[o];
+            for (std::size_t i = 0; i < static_cast<std::size_t>(c) * f3; ++i)
+                acc += flat[static_cast<std::size_t>(r) * c * f3 + i] * outw[o * c * f3 + i];
+            e[static_cast<std::size_t>(r) * d + o] = acc;
+        }
+    for (int i = 0; i < t3 * d; ++i) expect_near(y[i], e[i], 1e-4, "masked subsampling oracle");
+    // Tail fill rows must be EXACTLY out.bias (bit-equal floats).
+    for (int r = l3; r < t3; ++r)
+        for (int o = 0; o < d; ++o)
+            expect(y[static_cast<std::size_t>(r) * d + o] == outb[o],
+                   "masked tail row must equal out.bias exactly");
+}
+
+void test_masked_full_window_default() {
+    // feat_len defaults (-1 / == t_mel) must reproduce the unmasked path
+    // bit-for-bit (regression guard for full chunks like 160/160).
+    const int tm = 24, f = 8, c = 4, d = 6;
+    std::uint64_t s = 15001;
+    auto R = [&](std::vector<float>& v, double sc) {
+        for (auto& z : v) z = static_cast<float>(lcg_uniform(s) * sc);
+    };
+    std::vector<float> mel(tm * f), c0w(c * 9), c0b(c), dw1w(c * 9), dw1b(c), pw1w(c * c), pw1b(c),
+        dw2w(c * 9), dw2b(c), pw2w(c * c), pw2b(c);
+    R(mel, 0.5); R(c0w, 0.3); R(c0b, 0.1); R(dw1w, 0.3); R(dw1b, 0.1); R(pw1w, 0.3); R(pw1b, 0.1);
+    R(dw2w, 0.3); R(dw2b, 0.1); R(pw2w, 0.3); R(pw2b, 0.1);
+    const int f3 = ool(ool(ool(f)));
+    std::vector<float> outw(d * c * f3), outb(d);
+    R(outw, 0.2); R(outb, 0.1);
+    diar::SubsamplingWeights w{c0w.data(), c0b.data(), dw1w.data(), dw1b.data(), pw1w.data(),
+        pw1b.data(), dw2w.data(), dw2b.data(), pw2w.data(), pw2b.data(), outw.data(),
+        outb.data()};
+    const int t3 = ool(ool(ool(tm)));
+    std::vector<float> y1(t3 * d, 0.0F), y2(t3 * d, 0.0F);
+    diar::subsampling_forward(mel.data(), w, y1.data(), tm, f, c, d);           // default -1
+    diar::subsampling_forward(mel.data(), w, y2.data(), tm, f, c, d, tm);       // explicit full
+    for (int i = 0; i < t3 * d; ++i)
+        expect(y1[i] == y2[i], "full-window default must be bit-identical");
+}
+
 }  // namespace
 
 int main() {
@@ -218,6 +360,9 @@ int main() {
     test_ones_geometry_end_to_end();
     test_random_vs_oracle();
     test_dw_channel_isolation();
+    test_masked_length_formula();
+    test_masked_random_vs_literal_oracle();
+    test_masked_full_window_default();
     std::cout << "subsampling tests passed\n";
     return 0;
 }
