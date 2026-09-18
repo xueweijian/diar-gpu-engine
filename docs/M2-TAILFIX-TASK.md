@@ -61,6 +61,10 @@
 ## 5. 状态
 
 - [x] Step 0 侦查（bug 静态成立 + 潜伏判定）
-- [ ] tail fixture 产出（内核已推 RUNNING，见 `kaggle/m2_tailfix`）
-- [ ] 引擎 patch（§3.2）
-- [ ] Kaggle 前后对拍 + 回归
+- [x] tail fixture 产出（v2 verdict 干净：body 0.028 / 尾行 0.9964，
+  产物归档 `shared/diar-gpu-engine/m2-stage3/tailfx/` + REPORT.md）
+- [x] 引擎 patch（本地，89817b9：final flush 窗 pad32 + feat_len>0 + 裁幻影行；
+  行数保持是结构性的——t3_valid == subsampled(feat_len==t_mel) == 旧 t3；
+  167 pytest + engine C++ 全绿；K5/K6 入口已重嵌，未推 Kaggle）
+- [ ] Kaggle 前后对拍 + 回归（待 K5 v3/K6 v5 verdict 落袋后：先判 M2 门，
+  再推 patch 版 K5 重跑，tail11 应落回正文水平，四 fixture sha 不变）
