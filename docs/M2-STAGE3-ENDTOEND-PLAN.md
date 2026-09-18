@@ -48,19 +48,28 @@
   - 同分布 → 生产无辜 → 选项 2 归档关闭，理由写进本文件附录。
 - 产出：`shared/diar-gpu-engine/m2-stage2/step0_production_tail_probe.md`。
 
+> **Step 0 已完成（2026-09-18）**，判定：
+> ①尾块 bug **静态成立**（run_chunk 无 feat_len 参数、subsampled_len 整窗
+> ceil、stem 零掩码），当前 fixture 上**动力学潜伏**（两 case 尾块帧全静音，
+> diff 0.0017-0.0003）；生产补丁降为独立小任务（先造"尾块带语音"fixture
+> 再打补丁，规格见侦查报告附录），不在 Stage 3 关键路径。
+> ②**K6 门必须走路线 B**：NeMo-fp32-vs-q8-生产在 spkcache 反馈环里随时长
+> 复利到 0.6（mid gate-clean 区实测），fp32 引擎（路线 A）对拍 q8 fixture
+> 的 max_abs≤0.05 门必然失败——与实现正确性无关。路线 A 降级为 K5 真值锚。
+
 ## 3. Stage 3 主线 — 五步
 
-### 3.1 权重落地：fp32 自有容器（路线 A）
+### 3.1 权重落地：q8_0 GGUF loader（主）+ fp32 容器（K5 锚）
 
-- Kaggle kernel（复用 m2_refdump 骨架）：.nemo → fp32 平铺 bin +
-  自描述头（layout 与 `include/diar/*.hpp` 契约逐字一致：Linear
-  [out,in]、activation [T,C] frame-major、Conv 对称零垫…）。
-- 发布为 Kaggle 数据集（不落本机，铁律）；manifest 记 sha256 +
-  逐张量形状/布局断言。
-- 本机测试：tiny 随机权重 round-trip（写→读→逐字节相等）+
-  头 schema 版本化（v1）+ 非退化前置断言（v13 教训：seed 777 类
-  退化必须被测试前置抓住）。
-- 体积预估 ~100-250MB，只存在于 Kaggle 数据集层。
+- **主路线（K6 用）**：最小 q8_0 GGUF 读取器——读 header/张量表，
+  q8_0 块（fp16 scale + 32×int8）反量化为 fp32 喂入现有算子（=
+  M2 计划 §1 原意："CPU 参考核吃反量化后的权重做精确 FP32 数学"）。
+  生产 GGUF（sha 0679cfeb…）只在 Kaggle 侧存在，不落本机。
+- **锚路线（K5-A 用）**：kernel 内 .nemo → 自有 fp32 平铺 bin（layout
+  与 include/diar/*.hpp 契约逐字一致），K5 运行时现场生成，不发布数据集。
+- 本机测试：自写 tiny GGUF（q8_0 块写→读→反量化→逐字节比对）+
+  fp32 bin round-trip + 头 schema 版本化（v1）+ 非退化前置断言
+  （v13 教训：seed 777 类退化必须被测试前置抓住）。
 
 ### 3.2 张量 arena + 模型组装（本机纯 C++，无权重）
 
@@ -77,23 +86,29 @@
 - ggml 侧交叉验证仍按 M2 plan §0.2：NeMo 为真值源，ggml 二进制
   仅端到端双背书。
 
-### 3.3 K5 kernel — fp32 全链 free-running vs NeMo（teacher→free 桥）
+### 3.3 K5 kernel — 双路线对拍 NeMo（teacher→free 桥）
 
 - 四 case 音频 → 本引擎（CPU fp32 编译）与 NeMo fp32 同机各跑一遍 →
-  pre-gate frame_probs 逐帧比。
-- **闭环误差结构必须分层钉门**：chunk0 开环（应保持 1e-5 量级）；
-  chunkN 含 chunk_embs 反馈（spkcache 闭环，误差跨 chunk 复利，
-  预期放宽）。门先测后钉：首测 spread → 定 chunk0 门（预期 ~1e-5）
-  与累积门（预期 1e-4~1e-3）两档 → 钉进 tests。
-- 若 chunk0 就崩 → 组装/接线 bug，用 3.2 的 dump 钩子分段定罪。
+  pre-gate frame_probs 逐帧比。**A/B 两跑**：
+  - **K5-A（fp32 容器）= 真值锚**：干净比较。chunk0 开环应 1e-5 量级；
+    chunkN 含 chunk_embs 反馈（闭环复利），门先测后钉分两档。
+    若 chunk0 就崩 → 组装/接线 bug，用 3.2 的 dump 钩子分段定罪。
+  - **K5-B（q8 GGUF）= 生产行为画像**：预期 ≈ Step 0 实测的生产-vs-NeMo
+    包络（short ~0.1 / mid ~0.6，随时长复利）。门按 case 时长分档钉，
+    用途是确认引擎复现生产行为（而非绝对真值）。
+- Step 0 已证 fixture 与 NeMo 在 gate 折叠帧（未 establish 说话人清零）
+  有范畴差——K5 比较一律用 pre-gate 双方，禁混 post-gate。
 - 产出：verdict json 归档 + 阈值常量回填 tests。
 
 ### 3.4 K6 kernel — 过生产 fixture 双背书（M2 正式关门）
 
 - 引擎输出 post-BirthGate timeline/probs vs `parity/fixtures/` 四 case。
-- 已钉门沿用：frame_agreement≥0.999 / max_abs≤0.05 / mean_abs≤0.005
-  （宽松档即吸收 fp32 引擎 vs q8 生产权重的量化差；实测后收紧）。
+- **必须跑路线 B（q8 GGUF）**：与 fixture 同权重才有紧门（Step 0 实测
+  fp32-vs-q8 复利差 0.1-0.6，路线 A 在此门必死）。同权重同 host 语义下
+  预期接近位级——先测后钉（预期 ≪0.05，若 >1e-2 即有实现分歧要查）。
 - RTTM 段级对齐另记（边界 ±1 帧容忍策略，先测后钉）。
+- 已知盲区：四 case 尾块帧全静音，尾块回归在此门不可见（Step 0 实测）；
+  尾块覆盖由独立的生产补丁任务补（造语音尾 fixture）。
 - 全绿 → **ROADMAP M2 exit**（FP32 参考后端完成），M3 CUDA sm_60
   解锁。
 
