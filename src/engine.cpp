@@ -46,7 +46,6 @@ void DiarEngine::finish() {
     if (finished_)
         return;
     finished_ = true;
-    mel_real_ = mel_produced();
     // Geometric decay tail: y[k] = a^(k+1)*x[N-1] - a*a^k*x[N-1] = 0 — the
     // post-preemphasis pad is exactly zero, matching NeMo's constant right
     // pad bit-for-bit (upstream DiarStream::finish pin).
@@ -108,18 +107,11 @@ bool DiarEngine::run_one_chunk(bool force, bool final_flush) {
         throw std::runtime_error("DiarEngine: mel window trimmed too aggressively");
     const float* mel = mel_buf_.data() + (w0 - mel_base_) * n_mels_;
 
-    // Tail-semantics routing (Step 0): K5-A masks with the real-audio row
-    // count inside the window; production runs the full window unmasked.
-    int feat_len = -1;
-    if (cfg_.nemo_tail_semantics) {
-        const std::int64_t real = std::min<std::int64_t>(mel_real_, end + rc_mel) - w0;
-        if (real >= t_mel)
-            feat_len = -1;  // mask is a no-op — keep the production bit-path
-        else
-            feat_len = static_cast<int>(std::max<std::int64_t>(real, 0));
-    }
-
-    SortformerChunkOutput out = sortformer_run_chunk(mel, t_mel, feat_len,
+    // Upstream verbatim (a5b6953 diar_pipeline.cpp): run_chunk gets the whole
+    // window — no feat_len mask, no tail-window padding. The final chunk's
+    // decay-tail rows (post-preemphasis zeros) are computed like any other
+    // row; python NeMo's masked pad rows are not production behavior.
+    SortformerChunkOutput out = sortformer_run_chunk(mel, t_mel, -1,
         aosc_.spkcache_frames() ? aosc_.spkcache().data() : nullptr, aosc_.spkcache_frames(),
         aosc_.fifo_frames() ? aosc_.fifo().data() : nullptr, aosc_.fifo_frames(), weights_,
         tap_sink_);
@@ -135,11 +127,11 @@ bool DiarEngine::run_one_chunk(bool force, bool final_flush) {
     entry.spkcache_frames = aosc_.spkcache_frames();
     entry.fifo_frames = aosc_.fifo_frames();
     entry.window_frames = out.total_frames;
-    entry.feat_len = feat_len;
     std::vector<float> emitted =
         aosc_.update(out.chunk_embs.data(), out.chunk_frames, out.preds.data(), lc_enc, rc_enc);
     entry.emitted = static_cast<int>(emitted.size()) / n_spk_;
     ledger_.push_back(entry);
+    if (aosc_recorder_ != nullptr) aosc_recorder_->push_back(aosc_snapshot());
     // BirthGate consumes a relabeled COPY; the raw emitted chain is the K5
     // pre-gate face.
     pre_gate_.insert(pre_gate_.end(), emitted.begin(), emitted.end());
@@ -165,6 +157,18 @@ bool DiarEngine::run_one_chunk(bool force, bool final_flush) {
 void DiarEngine::run_ready_chunks(bool end_of_stream) {
     while (run_one_chunk(/*force=*/end_of_stream, /*final_flush=*/end_of_stream)) {
     }
+}
+
+DiarEngine::AoscSnapshot DiarEngine::aosc_snapshot() const {
+    AoscSnapshot s;
+    s.spk_frames = aosc_.spkcache_frames();
+    s.fifo_frames = aosc_.fifo_frames();
+    s.silence_frames = aosc_.silence_frames();
+    s.spkcache = aosc_.spkcache();
+    s.fifo = aosc_.fifo();
+    s.mean_sil = aosc_.mean_sil_emb();
+    if (aosc_.spkcache_preds_valid()) s.spkcache_preds = aosc_.spkcache_preds();
+    return s;
 }
 
 OfflineDiarizationResult diarize_offline(const SortformerWeights& weights, const float* audio,

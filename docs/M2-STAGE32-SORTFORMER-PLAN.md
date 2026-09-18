@@ -280,14 +280,24 @@ public:
 - 双尾模式在 engine 层的分叉端到端可见（同音频两 config，final chunk
   帧 pre-gate 值不同）。
 
-## 3. 尾块语义开关（K5/K6 分流）设计要点
+## 3. 尾块语义开关（K5/K6 分流）设计要点 — **已推翻（T9 判决，2026-09-18）**
 
-- 单一参数 `feat_len`（run_chunk 层）+ 单一 bool（engine 层），语义注释
-  引 Step 0 判决文档；**禁第三态**（"自动"之类）。
-- 测试双向断言两模式确实分叉（防未来某次重构悄悄把 mask 删了而 K6 还绿）。
-- T9（3.2c 钉死项）：K5-A final chunk 的 feat_len 精确值 = NeMo
-  streaming_feat_loader 语义（m2-ref npz 有 per-chunk state_lens 佐证）。
-  实现时从 npz 反推 + 写成测试常量，不拍脑袋。
+Step 0 的"feat_len 开关"设计是对 python 栈的误读。上游 a5b6953 源码实锤
+（diar_pipeline.cpp run_one_chunk + sortformer_model.cpp）：
+
+- `DiarStream::run_one_chunk` 调 `run_chunk(mel, t_mel, spk, fifo)` ——
+  **无 feat_len 参数**；尾窗不 pad 不 mask，衰减尾行照常算；
+  `subsampled_len` 整窗 `(len+1)/2` 链。
+- mask（attention/valid）只用于批内 state 对齐（state_offset），与尾块无关。
+- m2-ref npz 的尾块多行（short 12 vs 我们 11 / mid 8 vs 我们 6）是
+  **python NeMo streaming loader 的行为**：尾窗 pad 到 32 mel 倍数
+  （86→96、48→64）、pad 行走 MaskedConvSequential 掩码 → 全 0 概率幻影行
+  （npz 实证：phantom rows max prob == 0.0）。
+- 因此 engine 已**整体拆除** `nemo_tail_semantics`/`mel_real_`/ledger
+  `feat_len`（commit 记录在 3.3 prep）；`sortformer_run_chunk` 的
+  feat_len 参数保留（神经核镜像能力，探针用），engine 恒传 -1。
+- K5 门对应调整：比较 real prefix（711/4466），phantom 行数与全零性
+  单独报告/硬门，不与 python 幻影行对齐。
 
 ## 4. 测试矩阵总表
 
@@ -308,8 +318,9 @@ public:
 | R2 | 权重名/形状绑定错（F4 表手推） | 双向覆盖率 + 形状断言 + 名单测试钉死；stem 索引已从 K3 实证 |
 | R3 | xscale 时机错（pre_encode 后提前 scale 会污染 AOSC 缓存） | 机器检查：chunk_embs tap bit-eq stem.out；concat tap 抽查 scale |
 | R4 | qkv 融合/分离搞反（F5） | 绑定测试 pattern 抽查 q/k/v 指向不同数据 |
-| R5 | 双尾模式被未来重构静默合并 | 分叉测试（两模式同输入必须不同 + masked 尾==out.bias bit 级） |
+| R5 | ~~双尾模式被未来重构静默合并~~ | 已随 T9 判决作废：上游本就无双尾模式 |
 | R6 | 流式 FE 移植偏差（reflect/衰减尾） | produce_new_mel_frames 纳入 FE 差分 oracle；feed 分片不变性测试 |
+| R7 | 3.3 K5 kernel 基建翻车（转换器/门脚本 typo 烧掉一次 kernel） | 本地 dress rehearsal：python 写 tiny DFW1 → C++ load → 跑 engine → 与合成 npz（含 phantom 行）过全部 G0-G6 门（test_k5a_dress_rehearsal） |
 | R7 | 账本 off-by-one（lc/rc 取整、final flush 几何） | 上游 lround/ceil 逐字；账本守恒测试 |
 | R8 | 工程量超预算 | 三段各自全绿再下一步；镜像对拍可降级为首末层抽段 |
 | R9 | K5 CPU 太慢 | 粗算分钟级可接受；scratch 优化后置不改层契约 |

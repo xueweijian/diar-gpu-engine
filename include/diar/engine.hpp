@@ -9,16 +9,6 @@
 // frozen segments (memory guard for hour-long streams; K5/K6 fixtures are
 // <= 357 s and the timeline stays tiny) and flush_available/speaker_for_frames
 // (riva-facing APIs).
-//
-// Tail semantics (Step 0 verdict): the run_chunk feat_len parameter routes
-//   nemo_tail_semantics = true  -> feat_len = real-audio mel rows in the
-//       window (masked stem; fill rows == out.bias). K5-A comparator mode.
-//       The exact final-chunk feat_len rule is pinned against the m2-ref npz
-//       in 3.3 (plan item T9); this engine uses rows with global index <
-//       mel_produced_at_finish, clamped to the window.
-//   nemo_tail_semantics = false -> feat_len = -1 (production: full-window
-//       stem, no mask). K6 fixture mode.
-// Frame geometry is identical in both modes; only tail-row values differ.
 
 #include "diar/diar.hpp"
 #include "diar/sortformer.hpp"
@@ -28,9 +18,19 @@
 
 namespace diar {
 
+// Tail semantics (T9, settled 2026-09-18 against upstream a5b6953 source +
+// m2-ref npz): there is NO tail flag. Upstream DiarStream::run_one_chunk
+// calls run_chunk(mel, t_mel, spk, fifo) — no feat_len, no window padding;
+// the final chunk runs the real mel rows (incl. the zero-after-preemphasis
+// decay tail) and subsampled_len = whole-window ceil. The m2-ref npz's extra
+// final-chunk rows (short 12 vs our 11, mid 8 vs our 6) are PYTHON NeMo's
+// streaming loader padding the tail window to a 32-mel multiple and masking
+// the pad rows — a python-stack artifact with all-zero probs, NOT production
+// behavior. The K5 gate compares the real prefix and reports the phantom
+// count.
+
 struct EngineConfig {
     StreamGeometry geometry = StreamGeometry::streaming();
-    bool nemo_tail_semantics = false;  // true = K5-A reference, false = K6 production
     SegmentationConfig segmentation{};
 };
 
@@ -46,7 +46,6 @@ struct ChunkLedgerEntry {
     int emitted = 0;             // timeline frames appended (t3 - lc - rc)
     int spkcache_frames = 0, fifo_frames = 0;  // state sizes BEFORE this chunk
     int window_frames = 0;                     // spkcache + fifo + t3
-    int feat_len = -1;                         // tail-semantics routing used
 };
 
 class DiarEngine {
@@ -84,6 +83,28 @@ public:
 
     const std::vector<ChunkLedgerEntry>& chunk_ledger() const { return ledger_; }
 
+    // Full copy of the AOSC state — the closed-loop comparison face for 3.3
+    // K5: the m2-ref npz stores spkcache_after / fifo_after / mean_sil_emb /
+    // n_sil_frames per chunk, so the free-running kernel walks chunk by chunk
+    // against the state itself, not just the emitted probs. Empty vectors are
+    // legal (state empty). Diagnostic copies only; production never calls it.
+    struct AoscSnapshot {
+        int spk_frames = 0;
+        int fifo_frames = 0;
+        long long silence_frames = 0;
+        std::vector<float> spkcache;  // spk_frames x emb_dim
+        std::vector<float> fifo;      // fifo_frames x emb_dim
+        std::vector<float> mean_sil;  // emb_dim
+        std::vector<float> spkcache_preds;  // spk_frames x num_speakers (empty unless valid)
+    };
+    AoscSnapshot aosc_snapshot() const;
+
+    // When set, the engine appends one AoscSnapshot after EVERY chunk's
+    // aosc_.update inside run_one_chunk — index-aligned with chunk_ledger().
+    // Ownership stays with the caller (kernel runner buffer). Production
+    // leaves it null; the copy cost is then zero.
+    void set_aosc_recorder(std::vector<AoscSnapshot>* recorder) { aosc_recorder_ = recorder; }
+
 private:
     void ensure_mel();
     bool run_one_chunk(bool force, bool final_flush);
@@ -108,12 +129,12 @@ private:
     std::vector<float> mel_buf_;
     std::int64_t mel_base_ = 0;
     std::int64_t mel_consumed_ = 0;
-    std::int64_t mel_real_ = 0;  // mel_produced() at finish() entry (T9 placeholder)
 
     std::vector<float> probs_;     // post-gate timeline (frames x n_spk)
     std::vector<float> pre_gate_;  // pre-gate emitted chain (frames x n_spk)
     std::vector<ChunkLedgerEntry> ledger_;
     TapSink* tap_sink_ = nullptr;
+    std::vector<AoscSnapshot>* aosc_recorder_ = nullptr;
 };
 
 struct OfflineDiarizationResult {

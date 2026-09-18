@@ -281,32 +281,30 @@ void test_finish_tail_and_determinism() {
     expect(empty.n_frames() == 0, "tail: empty stream finishes empty");
 }
 
-void test_nemo_tail_route_and_offline() {
+void test_tail_and_offline() {
     const diar::SortformerWeights w = load_tiny();
-    diar::EngineConfig k5 = base_cfg();
-    k5.nemo_tail_semantics = true;
-    diar::DiarEngine k5_engine(load_tiny(), k5);
+    // Final-chunk semantics (T9, upstream verbatim): no pad, no mask — the
+    // final chunk's t3 = subsampled_len(real tail mel), emitted frames label
+    // the timeline exactly once (no phantom rows, unlike python NeMo).
+    diar::DiarEngine eng(load_tiny(), base_cfg());
     const std::vector<float> audio = make_audio(16000 * 4, 5);
-    k5_engine.feed_audio(audio.data(), audio.size());
-    k5_engine.finish();
+    eng.feed_audio(audio.data(), audio.size());
+    eng.finish();
 
-    diar::DiarEngine k6_engine(load_tiny(), base_cfg());
-    k6_engine.feed_audio(audio.data(), audio.size());
-    k6_engine.finish();
-
-    // Same geometry (ledger), different tail values on non-hop-multiple
-    // total mel. (16800+256 samples -> 17056/hop=1705+1? not multiple of 8.)
-    expect(k5_engine.n_frames() == k6_engine.n_frames(),
-        "tail routes share frame geometry");
-    bool differs = k5_engine.post_gate_probs() != k6_engine.post_gate_probs();
-    expect(differs, "tail routes diverge in values (final chunk mask)");
-    // The routing must be visible in the ledger too (feat_len bookkeeping).
-    bool masked = false, unmasked = false;
-    for (const diar::ChunkLedgerEntry& e : k5_engine.chunk_ledger())
-        if (e.feat_len >= 0) masked = true;
-    for (const diar::ChunkLedgerEntry& e : k6_engine.chunk_ledger())
-        if (e.feat_len < 0) unmasked = true;
-    expect(masked && unmasked, "tail routes: feat_len routing recorded in the ledger");
+    const auto& led = eng.chunk_ledger();
+    expect(!led.empty(), "tail: chunks ran");
+    std::int64_t sum_emitted = 0;
+    for (const diar::ChunkLedgerEntry& e : led) sum_emitted += e.emitted;
+    expect(sum_emitted == eng.n_frames(),
+        "tail: emitted chain == timeline (no phantom rows)");
+    const diar::ChunkLedgerEntry& last = led.back();
+    expect(last.t3 > 0 && last.emitted == last.t3 - last.lc_enc - last.rc_enc,
+        "tail: final chunk emits its whole valid window");
+    expect(last.t_mel < base_cfg().geometry.chunk_len * 8 ||
+               static_cast<std::int64_t>(led.size()) *
+                       base_cfg().geometry.chunk_len * 8 >
+                   last.t_mel,
+           "tail: final window is the real remainder");
 
     // Offline entries.
     const diar::OfflineDiarizationResult off =
@@ -316,14 +314,15 @@ void test_nemo_tail_route_and_offline() {
         "offline: preds sized [n_frames, n_spk]");
     expect(off.n_frames == diar::sortformer_subsampled_len(off.n_mel, 8),
         "offline: frame ledger");
-    for (float p : off.preds)
+    for (float p : off.preds) {
         expect(std::isfinite(p) && p >= 0.0F && p <= 1.0F, "offline: probs in [0,1]");
+    }
 
     // segments() smoke on the streaming engine.
-    auto segs = k6_engine.segments();
+    auto segs = eng.segments();
     for (const auto& s : segs) expect(s.end_sec >= s.start_sec, "segments: ordered spans");
-    const diar::FrameProbabilities fp = k6_engine.post_gate_frame_probabilities();
-    expect(fp.frames() == static_cast<std::size_t>(k6_engine.n_frames()) &&
+    const diar::FrameProbabilities fp = eng.post_gate_frame_probabilities();
+    expect(fp.frames() == static_cast<std::size_t>(eng.n_frames()) &&
                fp.speakers() == static_cast<std::size_t>(w.config().num_speakers),
         "segments: frame probabilities face matches the timeline");
 }
@@ -336,7 +335,7 @@ int main() {
     test_one_sample_sharding();
     test_offline_preset_geometry();
     test_finish_tail_and_determinism();
-    test_nemo_tail_route_and_offline();
+    test_tail_and_offline();
     std::cout << "PASS: diar engine tests\n";
     return 0;
 }
