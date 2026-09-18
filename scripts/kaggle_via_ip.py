@@ -30,6 +30,7 @@ Usage:
   python3 scripts/kaggle_via_ip.py kernels-log --ref weijianxue/slug
          [--out dir] [--download] [--file-pattern REGEX]
   python3 scripts/kaggle_via_ip.py datasets-status --ref weijianxue/slug
+  python3 scripts/kaggle_via_ip.py quota                # weekly GPU/TPU accelerator quota
   python3 scripts/kaggle_via_ip.py raw --method GET --path /api/v1/datasets/list?search=x
 """
 from __future__ import annotations
@@ -189,6 +190,60 @@ def cmd_datasets_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_quota(_args: argparse.Namespace) -> int:
+    """Weekly accelerator quota (GPU/TPU) via GetAcceleratorQuotaStatistics.
+
+    Server reports a fresh-until timestamp plus used/reserved/allowed per
+    accelerator family. Reserved > 0 means running sessions are already
+    counted against the window before they finish.
+    """
+    import re
+    from datetime import datetime, timedelta, timezone
+
+    code, text = _sdk_call(
+        "kernels.KernelsApiService", "GetAcceleratorQuotaStatistics", {"params": {}}
+    )
+    if code != 200:
+        print(f"HTTP={code}")
+        print(text[:2000])
+        return 1
+    try:
+        resp = json.loads(text)
+    except ValueError:
+        print(text[:2000])
+        return 1
+
+    def _secs(s: str) -> float:
+        m = re.fullmatch(r"([0-9.]+)s", s or "")
+        return float(m.group(1)) if m else 0.0
+
+    def _hm(sec: float) -> str:
+        h, rem = divmod(int(round(sec)), 3600)
+        return f"{h}h {rem // 60:02d}m"
+
+    reset = resp.get("quotaRefreshTime")
+    if reset:
+        dt = datetime.fromisoformat(reset.replace("Z", "+00:00"))
+        cst = dt.astimezone(timezone(timedelta(hours=8)))
+        left = dt - datetime.now(timezone.utc)
+        lsec = max(0, int(left.total_seconds()))
+        print(
+            f"window resets: {dt:%Y-%m-%d %H:%M} UTC = {cst:%Y-%m-%d %H:%M} CST"
+            f" (in {lsec // 3600}h {lsec % 3600 // 60:02d}m)"
+        )
+    for key, label in (("gpuQuota", "GPU"), ("tpuQuota", "TPU")):
+        q = resp.get(key)
+        if not q:
+            continue
+        used = _secs(q.get("timeUsed", "0s"))
+        resv = _secs(q.get("timeReserved", "0s"))
+        total = _secs(q.get("totalTimeAllowed", "0s"))
+        rema = max(0.0, total - used - resv)
+        extra = f"  (running: {_hm(resv)})" if resv > 0 else ""
+        print(f"{label}: used {_hm(used)} / {_hm(total)}  ->  remaining {_hm(rema)}{extra}")
+    return 0
+
+
 def cmd_kernels_live_log(args: argparse.Namespace) -> int:
     """Stream a kernel's live log over SSE (api channel).
 
@@ -342,6 +397,8 @@ def main() -> int:
     p = sub.add_parser("datasets-status")
     p.add_argument("--ref", required=True)
     p.set_defaults(fn=cmd_datasets_status)
+    p = sub.add_parser("quota")
+    p.set_defaults(fn=cmd_quota)
     p = sub.add_parser("kernels-live-log")
     p.add_argument("--ref", required=True)
     p.add_argument("--seconds", type=int, default=30)
