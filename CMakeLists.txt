@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_library(diar_core STATIC src/diar.cpp src/aosc.cpp src/birth_gate.cpp src/fe.cpp src/nn.cpp src/layers.cpp src/mha.cpp src/conv.cpp src/conformer.cpp src/subsampling.cpp src/posenc.cpp src/gguf.cpp src/sortformer.cpp src/engine.cpp)
+add_library(diar_core STATIC src/diar.cpp src/aosc.cpp src/birth_gate.cpp src/fe.cpp src/nn.cpp src/layers.cpp src/mha.cpp src/conv.cpp src/conformer.cpp src/subsampling.cpp src/posenc.cpp src/gguf.cpp src/sortformer.cpp src/tailfix.cpp src/engine.cpp)
 target_include_directories(diar_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(diar_core PUBLIC cxx_std_17)
 if(MSVC)

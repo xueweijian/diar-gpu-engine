@@ -43,6 +43,13 @@
 #include <string>
 #include <vector>
 
+// MSVC's <cmath> does not define M_PI unless _USE_MATH_DEFINES (and the
+// latter fights with other headers when included late). Self-contained
+// fallback keeps the synthetic sine PCM portable across the CI matrix.
+#if !defined(M_PI)
+#define M_PI 3.14159265358979323846
+#endif
+
 namespace {
 
 using AoscSnapshot = diar::DiarEngine::AoscSnapshot;
