@@ -15,6 +15,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -141,7 +142,9 @@ std::vector<std::string>& temp_paths() {
 
 std::string write_temp(const std::string& content) {
     static int counter = 0;
-    const std::string path = "/tmp/diar_gguf_test_" + std::to_string(counter++) + ".bin";
+    namespace fs = std::filesystem;
+    const std::string path = (fs::temp_directory_path()
+        / ("diar_gguf_test_" + std::to_string(counter++) + ".bin")).string();
     FILE* fp = std::fopen(path.c_str(), "wb");
     expect(fp != nullptr, "open temp file");
     std::fwrite(content.data(), 1, content.size(), fp);

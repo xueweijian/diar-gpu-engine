@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <map>
 #include <cstdint>
+#include <filesystem>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -141,7 +142,9 @@ std::string build_dfw1(const std::vector<CfgPair>& cfg, const std::vector<TSpec>
 
 std::string write_temp(const std::string& content) {
     static int counter = 0;
-    const std::string path = "/tmp/diar_sortformer_w_test_" + std::to_string(counter++) + ".bin";
+    namespace fs = std::filesystem;
+    const std::string path = (fs::temp_directory_path()
+        / ("diar_sortformer_w_test_" + std::to_string(counter++) + ".bin")).string();
     FILE* fp = std::fopen(path.c_str(), "wb");
     if (fp == nullptr) tiny_fixture_die("open temp file");
     std::fwrite(content.data(), 1, content.size(), fp);

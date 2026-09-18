@@ -5,6 +5,7 @@
 // bit-identical. If this oracle is green, the injected block's write logic
 // is byte-correct by construction (the injection is this code, verbatim).
 #include <cstdint>
+#include <filesystem>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -51,8 +52,9 @@ int main() {
             0.9f, 0.8f, 0.7f, 0.6f,
             123.456f, -7.5f, 0.0f, 1.0f,
         };
-        const char* p = "/tmp/probdump_oracle_case1.f32";
-        CHECK(diar_probdump_write(p, probs.data(), F, S), "write ok");
+        const std::string p = (std::filesystem::temp_directory_path()
+            / "probdump_oracle_case1.f32").string();
+        CHECK(diar_probdump_write(p.c_str(), probs.data(), F, S), "write ok");
         std::ifstream in(p, std::ios::binary);
         CHECK(!!in, "reopen ok");
         int64_t rf = -1;
@@ -83,8 +85,9 @@ int main() {
     // 3. single frame single speaker (degenerate shape)
     {
         float v = 0.641f;
-        const char* p = "/tmp/probdump_oracle_case3.f32";
-        CHECK(diar_probdump_write(p, &v, 1, 1), "1x1 write ok");
+        const std::string p = (std::filesystem::temp_directory_path()
+            / "probdump_oracle_case3.f32").string();
+        CHECK(diar_probdump_write(p.c_str(), &v, 1, 1), "1x1 write ok");
         std::ifstream in(p, std::ios::binary);
         int64_t rf = 0;
         int32_t rs = 0;
