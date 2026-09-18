@@ -37,6 +37,9 @@ ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   -o "$BUILD/test_posenc"
 "$BUILD/test_posenc"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
+  -I"$ROOT/include" "$ROOT/src/gguf.cpp" "$ROOT/tests/test_gguf.cpp" -o "$BUILD/test_gguf"
+"$BUILD/test_gguf"
+${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   "$ROOT/tests/probdump_oracle.cpp" -o "$BUILD/probdump_oracle"
 "$BUILD/probdump_oracle"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
