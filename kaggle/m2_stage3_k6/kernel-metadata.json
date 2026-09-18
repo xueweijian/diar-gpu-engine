@@ -1,0 +1,15 @@
+{
+  "id": "weijianxue/diar-m2-stage3-k6",
+  "title": "diar-m2-stage3-k6",
+  "code_file": "../m2_stage3/m2_stage3_run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "weijianxue/diar-m2-fixtures",
+    "weijianxue/diar-smoke-audio",
+    "weijianxue/diar-real-audio-5"
+  ]
+}

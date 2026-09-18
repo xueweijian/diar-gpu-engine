@@ -26,6 +26,7 @@ RUNNER = DIR / "m2_stage3_run.py"
 TEXT_ANCHORS = {
     "m2_stage3_k5a.py": "EMBEDDED_M2_STAGE3_K5A",
     "f32bin_writer.py": "EMBEDDED_M2_STAGE3_F32WRITER",
+    "m2_stage3_k6.py": "EMBEDDED_M2_STAGE3_K6",
 }
 
 # Must match CPP_SOURCES in m2_stage3_run.py (asserted below at embed time).
