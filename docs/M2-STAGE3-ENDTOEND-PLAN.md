@@ -73,6 +73,11 @@
 
 ### 3.2 张量 arena + 模型组装（本机纯 C++，无权重）
 
+> **详细规划已展开**（2026-09-18）：`docs/M2-STAGE32-SORTFORMER-PLAN.md`
+> ——侦查结论（组装序/尾块开关/host 循环/张量名表）、三段提交切分
+> （3.2a 权重 arena → 3.2b 前向组装+抽头 → 3.2c engine 壳）、测试矩阵
+> 与 DoD。工时口径修正为 2-3 天。本文节保留为概要。
+
 - 新增 `src/sortformer.cpp` + `include/diar/sortformer.hpp`（暂名）：
   per-chunk 前向 mel → stem(masked, feat_len) → concat[spkcache|fifo|
   chunk_embs] → xscale+rel-pos → 17 conformer → encoder_proj →
