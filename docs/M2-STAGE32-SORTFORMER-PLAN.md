@@ -226,6 +226,8 @@ python 镜像同输入重算 → 逐 tap 比对，门 1e-5（与 K 门同级）�
 
 ### 3.2c engine 壳：host 状态机首次连跑
 
+**状态：已完成 (53132b6, 2026-09-18)**
+
 前置小件：`produce_new_mel_frames` 移植进 fe.cpp（~45 行调度器 + 上游
 语义注释），FE 差分 oracle 补一条流式用例（流首 reflect / 中段
 reflect_left=false / 尾部保留不完整窗）。
@@ -233,32 +235,31 @@ reflect_left=false / 尾部保留不完整窗）。
 新增 `include/diar/engine.hpp` + `src/engine.cpp`：
 
 ```cpp
+struct ChunkLedgerEntry {
+    int chunk_index = 0, t_mel = 0, t3 = 0;
+    int lc_enc = 0, rc_enc = 0, emitted = 0;
+    int spkcache_frames = 0, fifo_frames = 0, window_frames = 0;
+    int feat_len = -1;
+};
+
 struct EngineConfig {
     StreamGeometry geometry = StreamGeometry::streaming();
     bool nemo_tail_semantics = false;    // F2 路由：true=K5-A；false=K6/生产
     SegmentationConfig segmentation;
 };
 
-class DiarEngine {                        // 镜像 DiarStream（去掉 riva/compact 面）
+class DiarEngine {
 public:
-    DiarEngine(SortformerWeights weights, EngineConfig cfg);
-    void feed_audio(const float* samples, std::size_t n);
-    void finish();
-    std::int64_t n_frames() const;
-    const std::vector<float>& pre_gate_probs() const;   // AOSC emitted 直链（K5 面）
-    const std::vector<float>& post_gate_probs() const;  // BirthGate timeline（K6 面）
-    FrameProbabilities post_gate_frame_probabilities() const;
-    std::vector<Segment> segments() const;              // upstream_segments_from_probs
-    void set_tap_sink(TapSink*);                        // 转发给 run_chunk（K5 调试）
+    // ... feed_audio / finish / n_frames / pre_gate_probs / post_gate_probs
+    // ... post_gate_frame_probabilities / segments / set_tap_sink
+    const std::vector<ChunkLedgerEntry>& chunk_ledger() const;
 };
-// 另：diarize_offline(...) 独立函数/静态入口（F3 offline 语义逐字：
-// 正峰 normalize quirk + 单次全窗 run_chunk + t_enc>5000 loud）。
 ```
 
 - run_one_chunk 调度逐字移植（hop/lc/rc/钳位/forced 帧格/final_flush/
   缓冲裁剪/finish 衰减尾/lround-ceil 取整）。
 - pre-gate 链：上游把 emitted 直接喂 BirthGate 不保留；我们另存
-  `raw_` 链（BirthGate.append 吃拷贝，已有契约）。
+  `pre_gate_` 链（BirthGate.append 吃拷贝，已有契约）。
 - `nemo_tail_semantics` 的 feat_len 规则：非 final chunk 全窗有效
   （mask no-op，传 t_mel 或 -1 等价）；final chunk 的 feat_len 钉死项
   见 T9。
