@@ -12,6 +12,10 @@
 //         PREFIX.ledger.json   per-chunk ChunkLedgerEntry rows
 //         PREFIX.aosc.json     per-chunk AOSC snapshot index (after update)
 //         PREFIX.aosc.f32      snapshot payloads in index order
+//   --full-offline --weights W --audio A.f32 --out PREFIX
+//       Upstream DiarModel::diarize_offline: peak-normalize, whole-file FE,
+//       one run_chunk with empty state — raw probs, NO BirthGate (mirrors
+//       the production `--offline` flag; pregate/postgate written identical).
 //   --probe-weights --weights W
 //       Full load (loud on any coverage/shape failure) + config echo json.
 //   --expected-names
@@ -355,6 +359,55 @@ void write_text(const std::string& path, const std::string& s) {
     if (!f) die("short write " + path);
 }
 
+int run_full_offline(const std::string& weights, const std::string& audio,
+                     const std::string& out) {
+    diar::SortformerWeights w = diar::SortformerWeights::load(weights);
+    const diar::SortformerConfig& c = w.config();
+
+    std::vector<float> pcm;
+    {
+        std::ifstream f(audio, std::ios::binary);
+        if (!f) die("cannot open audio " + audio);
+        f.seekg(0, std::ios::end);
+        const std::streamoff bytes = f.tellg();
+        f.seekg(0, std::ios::beg);
+        if (bytes < 0 || bytes % 4 != 0) die("audio file size not a f32 multiple");
+        pcm.resize(static_cast<std::size_t>(bytes / 4));
+        if (!pcm.empty())
+            f.read(reinterpret_cast<char*>(pcm.data()), static_cast<std::streamsize>(bytes));
+        if (!f) die("short audio read");
+    }
+
+    diar::OfflineDiarizationResult r;
+    try {
+        r = diar::diarize_offline(w, pcm.data(), pcm.size());
+    } catch (const std::exception& e) {
+        die(std::string("full-offline run failed: ") + e.what());
+    }
+
+    // Upstream --offline runs DiarModel::diarize_offline directly: raw frame
+    // probs, NO BirthGate (birth_gate_ lives only in the streaming pipeline).
+    // We emit both prefixes identically so gate scripts can read either.
+    std::string meta = "{\n";
+    meta += "  \"weights\": \"" + jescape(weights) + "\",\n";
+    meta += "  \"audio\": \"" + jescape(audio) + "\",\n";
+    meta += "  \"mode\": \"full-offline\",\n";
+    meta += "  \"samples\": " + std::to_string(pcm.size()) + ",\n";
+    meta += "  \"n_frames\": " + std::to_string(r.n_frames) + ",\n";
+    meta += "  \"n_chunks\": 0,\n";
+    meta += "  \"config\": {\"d_model\": " + std::to_string(c.d_model) +
+            ", \"encoder_layers\": " + std::to_string(c.encoder_layers) +
+            ", \"transformer_layers\": " + std::to_string(c.transformer_layers) +
+            ", \"num_speakers\": " + std::to_string(c.num_speakers) +
+            ", \"feat_in\": " + std::to_string(c.feat_in) + "}\n";
+    meta += "}\n";
+    write_text(out + ".meta.json", meta);
+    write_f32(out + ".pregate.f32", r.preds);
+    write_f32(out + ".postgate.f32", r.preds);
+    std::cout << "full-offline: n_frames=" << r.n_frames << "\n";
+    return 0;
+}
+
 int run_mode(const std::string& weights, const std::string& audio, const std::string& out,
              const std::string& feed, bool offline) {
     diar::SortformerWeights w = diar::SortformerWeights::load(weights);
@@ -575,6 +628,7 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--run") mode = "run";
+        else if (a == "--full-offline") mode = "full-offline";
         else if (a == "--probe-weights") mode = "probe";
         else if (a == "--expected-names") mode = "names";
         else if (a == "--selftest") mode = "selftest";
@@ -596,5 +650,10 @@ int main(int argc, char** argv) {
             die("--run needs --weights, --audio, --out");
         return run_mode(weights, audio, out, feed, offline);
     }
-    die("no mode: pass --run | --probe-weights | --expected-names | --selftest");
+    if (mode == "full-offline") {
+        if (weights.empty() || audio.empty() || out.empty())
+            die("--full-offline needs --weights, --audio, --out");
+        return run_full_offline(weights, audio, out);
+    }
+    die("no mode: pass --run | --full-offline | --probe-weights | --expected-names | --selftest");
 }

@@ -151,17 +151,22 @@ def test_name_mirror_matches_cpp():
     assert py_names == cpp_names
 
 
-def test_dfw1_written_by_python_loads_in_cpp(tmp_path):
+def _write_tiny_dfw1(tmp_path, seed: int = 777):
+    """Tiny non-degenerate DFW1 container (shared by loader/run-mode tests)."""
     runner = _runner()
     shapes = _tiny_shapes()
     names = w.expected_dfw1_tensor_names(TINY_CFG)
-    rng = np.random.default_rng(777)
+    rng = np.random.default_rng(seed)
     tensors = []
     for n in names:
         shape = shapes[n]
         a = rng.standard_normal(shape).astype(np.float32) * 0.4
         if n.endswith("running_var"):
             a = np.abs(a) + 1.0
+        if n == "preprocessor.fb":
+            # filterbank magnitudes: log(negative power) = NaN timeline
+            # (same degenerate-random failure the C++ selftest guards)
+            a = np.abs(a) + 0.01
         tensors.append((n, a))
     cfg = [
         ("sortformer.encoder.d_model", "16"),
@@ -197,12 +202,50 @@ def test_dfw1_written_by_python_loads_in_cpp(tmp_path):
     ]
     path = tmp_path / "tiny.dfw1"
     w.write_dfw1_v2(path, cfg, tensors)
+    return path
+
+
+def test_dfw1_written_by_python_loads_in_cpp(tmp_path):
+    runner = _runner()
+    path = _write_tiny_dfw1(tmp_path)
     p = subprocess.run([str(runner), "--probe-weights", "--weights", str(path)],
                        capture_output=True, text=True, timeout=120)
     assert p.returncode == 0, p.stderr[-500:]
     probe = json.loads(p.stdout)
     assert probe["ok"] is True
     assert probe["d_model"] == 16 and probe["encoder_layers"] == 2
+
+
+def test_full_offline_mode_end_to_end(tmp_path):
+    """--full-offline: peak-normalize + one run_chunk, raw probs, no gate.
+
+    Mirrors upstream DiarModel::diarize_offline via the production `--offline`
+    CLI semantics: pregate == postgate (no BirthGate on this path), rows ==
+    subsampled_len(mel), all finite.
+    """
+    runner = _runner()
+    weights = _write_tiny_dfw1(tmp_path)
+    # 2.0 s of 16 kHz mono with headroom so peak-normalize is a no-op-ish gain
+    t = np.arange(32000, dtype=np.float32) / 16000.0
+    pcm = (0.3 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
+    audio = tmp_path / "tone.f32"
+    audio.write_bytes(np.ascontiguousarray(pcm, dtype="<f4").tobytes())
+    prefix = str(tmp_path / "off")
+    p = subprocess.run([str(runner), "--full-offline", "--weights", str(weights),
+                        "--audio", str(audio), "--out", prefix],
+                       capture_output=True, text=True, timeout=300)
+    assert p.returncode == 0, p.stderr[-500:]
+    meta = json.loads(Path(prefix + ".meta.json").read_text())
+    assert meta["mode"] == "full-offline"
+    assert meta["samples"] == 32000
+    assert meta["n_frames"] > 0
+    n_spk = TINY_CFG["num_speakers"]
+    pre = np.fromfile(prefix + ".pregate.f32", dtype="<f4").reshape(-1, n_spk)
+    post = np.fromfile(prefix + ".postgate.f32", dtype="<f4").reshape(-1, n_spk)
+    assert pre.shape[0] == meta["n_frames"]
+    assert np.isfinite(pre).all(), "non-finite probs (negative fb leaked?)"
+    assert np.array_equal(pre, post), "full-offline must not apply BirthGate"
+    assert (pre >= 0.0).all() and (pre <= 1.0).all()
 
 
 def test_dfw1_bad_magic_fails_loud(tmp_path):
