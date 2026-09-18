@@ -104,6 +104,9 @@
 - Step 0 已证 fixture 与 NeMo 在 gate 折叠帧（未 establish 说话人清零）
   有范畴差——K5 比较一律用 pre-gate 双方，禁混 post-gate。
 - 产出：verdict json 归档 + 阈值常量回填 tests。
+- **并行执行（实测后加）**：run 单元 = (label, feed)，4 进程并发（`--jobs`，
+  默认 4；长音频先发车）。每个 run 是独立 k5_runner 进程、同二进制同输入
+  → 与顺序执行 bit 级一致（测试钉死）。墙钟校准见 §6。
 
 ### 3.4 K6 kernel — 过生产 fixture 双背书（M2 正式关门）
 
@@ -111,6 +114,8 @@
 - **必须跑路线 B（q8 GGUF）**：与 fixture 同权重才有紧门（Step 0 实测
   fp32-vs-q8 复利差 0.1-0.6，路线 A 在此门必死）。同权重同 host 语义下
   预期接近位级——先测后钉（预期 ≪0.05，若 >1e-2 即有实现分歧要查）。
+- **并行执行**：case 级 4 并发（cost 排序：chunked mid 先跑，full-offline
+  最后）；determinism 双跑留在各自 case worker 内串行。
 - RTTM 段级对齐另记（边界 ±1 帧容忍策略，先测后钉）。
 - 已知盲区：四 case 尾块帧全静音，尾块回归在此门不可见（Step 0 实测）；
   尾块覆盖由独立的生产补丁任务补（造语音尾 fixture）。
@@ -131,7 +136,7 @@
 | 3 | fixture pre/post-gate 语义混比 | Step 0a 先钉死，禁直接比的铁律沿用 |
 | 4 | host 状态机连跑组合 bug | 3.2 分段对拍；AOSC/BirthGate oracle 测试不删 |
 | 5 | 工程量超预期（组装 > 预算） | 3.2 拆两段提交：神经前向先连，host 状态机后连 |
-| 6 | CPU fp32 跑 357s 音频太慢 | T4 上 CPU 核够用；不行就分 chunk 进程并行，禁止为此提前进 CUDA |
+| 6 | CPU fp32 跑 357s 音频太慢 | **已实测并实施**：d=512/35 层 ≈ 30-40 s/chunk（`tools/bench_engine_synth.py` 合成双点校准），mid 单 feed ≈ 2.2 h；改为 run 级 4 进程并行（K5: label×feed；K6: case 级），墙钟 ≈ 2.2 h/kernel。禁止为此提前进 CUDA |
 
 ## 5. 预算与铁律
 
@@ -145,3 +150,12 @@
 Step 0 半天内；3.1 半天；3.2 一到两天（最大块）；3.3/3.4 各一个
 kernel 轮次（含可能的修一轮）；3.5 收尾半天。全绿后进度口径从 ~55%
 改 ~75%（M0-M3 权重表）。
+
+### 6.1 墙钟（实测 2026-09-18）
+
+- 引擎单 chunk（d=512、17+18 层、窗口 ≤260 帧）≈ **30-40 s**；mid case
+  224 chunks → 单 feed ≈ 2.2 h，whole+drip 顺序 ≈ 4.4 h。
+- 顺序跑法下 K5 ≈ 5 h、K6 ≈ 6 h（首版实测两小时仍未过半，遂改并行）。
+- **run 级 4 进程并行后：各 kernel ≈ 2.2 h 墙钟**（受最长单 run 支配，
+  与 worker 数无关地不再叠加）。K5 gate 逐 job 打点 + 平台侧 SSE 实时
+  日志（`scripts/kaggle_via_ip.py kernels-live-log`）可用于观察。
