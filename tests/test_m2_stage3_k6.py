@@ -8,8 +8,10 @@ color — mechanics only).
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import struct
 import subprocess
 import sys
 import wave
@@ -86,18 +88,83 @@ def test_decode_wav_rejects_wrong_rate(tmp_path):
         k6.decode_wav(p)
 
 
+# ---------------------------------------------------------------------------
+# fixture frame_probs wire format (12B <qi> header + f32 payload, sha-pinned)
+# ---------------------------------------------------------------------------
+def test_load_probs_f32_equals_canonical_loader_on_real_fixture():
+    """Pin the K6 parser to parity/loader.py on the REAL short fixture."""
+    fix = REPO / "parity" / "fixtures" / "v12-short-streaming-r0"
+    manifest = json.loads((fix / "manifest.json").read_text())
+    got = k6.load_probs_f32(fix, manifest)
+    assert got.shape == (711, 4)
+    sys.path.insert(0, str(REPO))
+    from parity.loader import load_case  # noqa: E402
+    _, tensors = load_case(fix)
+    canon = tensors["probs"]
+    assert (canon.n_frames, canon.n_spk) == (711, 4)
+    np.testing.assert_array_equal(
+        got.ravel(), np.asarray(canon.values, dtype="<f4").reshape(-1))
+
+
+def test_load_probs_f32_real_mid_shape():
+    fix = REPO / "parity" / "fixtures" / "v12-mid-offline-full-r0"
+    manifest = json.loads((fix / "manifest.json").read_text())
+    got = k6.load_probs_f32(fix, manifest)
+    assert got.shape == (4467, 4)
+    assert got.dtype == np.float32
+
+
+def test_load_probs_f32_rejects_header_manifest_mismatch(tmp_path):
+    d = tmp_path / "fx"
+    d.mkdir()
+    payload = np.zeros((19, 4), dtype="<f4").tobytes()
+    raw = struct.pack("<qi", 20, 4) + payload  # header disagrees with manifest
+    (d / "probs.f32").write_bytes(raw)
+    manifest = {
+        "observation": {"n_frames": 19, "n_spk": 4},
+        "tensors": [{"name": "probs", "layer": "frame_probs", "dtype": "f32",
+                     "shape": [19, 4], "nbytes": len(payload),
+                     "sha256": hashlib.sha256(raw).hexdigest(),
+                     "path": "probs.f32"}],
+    }
+    with pytest.raises(RuntimeError, match="header"):
+        k6.load_probs_f32(d, manifest)
+
+
+def test_load_probs_f32_rejects_sha_mismatch(tmp_path):
+    d = tmp_path / "fx"
+    d.mkdir()
+    payload = np.zeros((19, 4), dtype="<f4").tobytes()
+    raw = struct.pack("<qi", 19, 4) + payload
+    (d / "probs.f32").write_bytes(raw)
+    manifest = {
+        "observation": {"n_frames": 19, "n_spk": 4},
+        "tensors": [{"name": "probs", "layer": "frame_probs", "dtype": "f32",
+                     "shape": [19, 4], "nbytes": len(payload),
+                     "sha256": "0" * 64, "path": "probs.f32"}],
+    }
+    with pytest.raises(RuntimeError, match="sha256"):
+        k6.load_probs_f32(d, manifest)
+
+
 def _write_fixture(tmp_path: Path, name: str, n_spk: int, n_rows: int) -> Path:
     d = tmp_path / "fixtures" / name
     d.mkdir(parents=True)
+    payload = np.zeros((n_rows, n_spk), dtype="<f4").tobytes()
+    raw = struct.pack("<qi", n_rows, n_spk) + payload  # probdump wire format
+    (d / "probs.f32").write_bytes(raw)
     manifest = {
         "case": {"audio": "fake.wav", "geometry": None,
                  "offline": name.endswith("full-r0"),
                  "preset": "offline" if "preset" in name else None},
         "observation": {"n_spk": n_spk, "n_frames": n_rows},
+        "tensors": [{
+            "name": "probs", "layer": "frame_probs", "dtype": "f32",
+            "shape": [n_rows, n_spk], "nbytes": len(payload),
+            "sha256": hashlib.sha256(raw).hexdigest(), "path": "probs.f32",
+        }],
     }
     (d / "manifest.json").write_text(json.dumps(manifest))
-    (d / "probs.f32").write_bytes(
-        np.zeros((n_rows, n_spk), dtype="<f4").tobytes())
     return d
 
 

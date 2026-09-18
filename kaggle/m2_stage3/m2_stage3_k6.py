@@ -20,15 +20,21 @@ Reported as data (NOT gated): row-count delta (production tail semantics vs
 python-NeMo phantom padding differ by construction), per-row diff percentiles
 (for tightening). Determinism (one case re-run) is hard: bit-identical.
 
-A gate FAIL is data (verdict json still written); only infra errors raise.
+Fixture payloads keep the probdump wire format (12-byte <qi> header + f32
+payload, sha256-pinned by the manifest — parity/loader.py discipline). A gate
+FAIL is data — including a per-case exception, recorded as that case's
+`error`; the verdict json is always written.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import struct
 import subprocess
 import sys
 import time
+import traceback
 import wave
 from pathlib import Path
 
@@ -112,6 +118,47 @@ def find_audio(basename: str, roots: list[Path]) -> Path:
     raise RuntimeError(f"audio {basename} not found under {roots}")
 
 
+PROBDUMP_HEADER = struct.Struct("<qi")  # n_frames (i64), n_spk (i32)
+
+
+def load_probs_f32(fdir: Path, manifest: dict) -> np.ndarray:
+    """Load a fixture's frame_probs with the canonical wire-format discipline.
+
+    Fixtures store the kernel probdump bytes verbatim (parity/loader.py): a
+    12-byte little-endian <qi> (n_frames, n_spk) header followed by the
+    row-major f32 payload. The manifest pins BOTH the logical payload size
+    (nbytes = shape * 4) and the whole-file sha256 (header included), so a
+    corrupt or hand-edited fixture fails loudly here, not silently downstream.
+    """
+    pin = next((t for t in manifest["tensors"] if t["layer"] == "frame_probs"),
+               None)
+    if pin is None:
+        raise RuntimeError(f"{fdir}: manifest has no frame_probs tensor")
+    raw = (fdir / pin["path"]).read_bytes()
+    expect_bytes = PROBDUMP_HEADER.size + int(pin["nbytes"])
+    if len(raw) != expect_bytes:
+        raise RuntimeError(
+            f"{fdir.name}/{pin['path']}: {len(raw)} bytes != {expect_bytes} "
+            f"(manifest nbytes {pin['nbytes']} + 12B header)")
+    n_frames, n_spk = PROBDUMP_HEADER.unpack(raw[:PROBDUMP_HEADER.size])
+    if (n_frames, n_spk) != tuple(pin["shape"]):
+        raise RuntimeError(
+            f"{fdir.name}/{pin['path']}: header ({n_frames}, {n_spk}) != "
+            f"manifest shape {list(pin['shape'])}")
+    obs = manifest["observation"]
+    if n_frames != obs["n_frames"] or n_spk != obs["n_spk"]:
+        raise RuntimeError(
+            f"{fdir.name}/{pin['path']}: header ({n_frames}, {n_spk}) != "
+            f"observation ({obs['n_frames']}, {obs['n_spk']})")
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != pin["sha256"]:
+        raise RuntimeError(
+            f"{fdir.name}/{pin['path']}: sha256 {digest} != pinned {pin['sha256']}")
+    values = np.frombuffer(raw, dtype="<f4", count=n_frames * n_spk,
+                           offset=PROBDUMP_HEADER.size)
+    return values.reshape(n_frames, n_spk)
+
+
 def run_runner(runner: Path, args: list[str], timeout: int = 3600) -> subprocess.CompletedProcess:
     return subprocess.run([str(runner), *args], capture_output=True, text=True,
                           timeout=timeout)
@@ -120,8 +167,8 @@ def run_runner(runner: Path, args: list[str], timeout: int = 3600) -> subprocess
 def run_case(label: str, fdir: Path, runner: Path, weights: Path,
              roots: list[Path], work: Path) -> dict:
     manifest = json.loads((fdir / "manifest.json").read_text())
-    n_spk = int(manifest["observation"]["n_spk"])
-    ref = np.fromfile(str(fdir / "probs.f32"), dtype="<f4").reshape(-1, n_spk)
+    ref = load_probs_f32(fdir, manifest)
+    n_spk = ref.shape[1]
     argv_extra, which = classify(manifest)
     audio_src = find_audio(Path(manifest["case"]["audio"]).name, roots)
     pcm = decode_wav(audio_src)
@@ -215,7 +262,11 @@ def main() -> int:
     per_case: dict[str, dict] = {}
     t0 = time.time()
     for d in case_dirs:
-        per_case[d.name] = run_case(d.name, d, runner, gguf, roots, WORK)
+        try:
+            per_case[d.name] = run_case(d.name, d, runner, gguf, roots, WORK)
+        except Exception as exc:  # a FAIL is data; keep the other cases
+            traceback.print_exc()
+            per_case[d.name] = {"error": f"{type(exc).__name__}: {exc}"}
     per_case = dict(sorted(per_case.items()))
     REPORT["per_case"] = per_case
     REPORT["seconds"] = round(time.time() - t0, 1)
