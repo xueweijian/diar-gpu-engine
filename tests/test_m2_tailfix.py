@@ -59,3 +59,30 @@ def test_kernel_metadata_consistent():
     assert (TAILFIX / meta["code_file"]).exists()
     assert "weijianxue/diar-gpu-engine-harness" in meta["dataset_sources"]
     assert "weijianxue/diar-real-audio-5" in meta["dataset_sources"]
+
+
+def test_analyze_tail_result_synthetic(tmp_path):
+    """The result analyzer reads the probdump wire format + npz and reports
+    the tail-row divergence (synthetic: one deliberately wrong tail row)."""
+    import struct
+    import subprocess
+    import sys
+
+    import numpy as np
+
+    nf, ns = 30, 4
+    prod = np.zeros((nf, ns), dtype="<f4")
+    prod[-1, 2] = 0.9
+    tp = prod.astype(np.float64).copy()
+    tp[-1, 2] = 0.1
+    probs = tmp_path / "probs.f32"
+    probs.write_bytes(struct.pack("<qi", nf, ns) + prod.tobytes())
+    np.savez(tmp_path / "ref.npz", total_preds=tp)
+
+    out = subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "analyze_tail_result.py"),
+         str(probs), str(tmp_path / "ref.npz")],
+        capture_output=True, text=True, check=True).stdout
+    assert '"tail11_max_abs"' in out
+    assert "0.80000" in out      # the synthetic tail-row diff, in the table
+    assert "TAIL" in out         # the last rows are flagged
