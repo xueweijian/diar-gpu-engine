@@ -7,12 +7,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(DIAR_PROFILE_STAGE "Enable per-stage wall-clock profiling (M3 §2; zero behavior change)" OFF)
+option(DIAR_WITH_CUDA "Compile the CUDA backend translation unit (OFF keeps CI CPU-only)" OFF)
 
-add_library(diar_core STATIC src/diar.cpp src/aosc.cpp src/birth_gate.cpp src/fe.cpp src/nn.cpp src/layers.cpp src/mha.cpp src/conv.cpp src/conformer.cpp src/subsampling.cpp src/posenc.cpp src/gguf.cpp src/sortformer.cpp src/tailfix.cpp src/engine.cpp src/profile.cpp)
+add_library(diar_core STATIC src/diar.cpp src/aosc.cpp src/birth_gate.cpp src/fe.cpp src/nn.cpp src/layers.cpp src/mha.cpp src/conv.cpp src/conformer.cpp src/subsampling.cpp src/posenc.cpp src/gguf.cpp src/sortformer.cpp src/tailfix.cpp src/engine.cpp src/profile.cpp src/backend.cpp)
 target_include_directories(diar_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(diar_core PUBLIC cxx_std_17)
 if(DIAR_PROFILE_STAGE)
   target_compile_definitions(diar_core PUBLIC DIAR_PROFILE_STAGE)
+endif()
+if(DIAR_WITH_CUDA)
+  # Reserved for Step 3+: src/backend_cuda.cpp + CUDA::cudart linkage.
+  message(FATAL_ERROR "DIAR_WITH_CUDA=ON is not wired yet (M3 Step 3+); the option exists so CI and local builds pin the OFF surface.")
 endif()
 if(MSVC)
   target_compile_options(diar_core PRIVATE /W4)
@@ -38,6 +43,17 @@ if(BUILD_TESTING)
     target_compile_options(diar_nn_tests PRIVATE -Wall -Wextra -Wpedantic)
   endif()
   add_test(NAME diar_nn_tests COMMAND diar_nn_tests)
+
+  # M3 Step 2: backend skeleton (CPU passthrough pinned bit-identical to nn::;
+  # the CUDA translation unit is absent unless DIAR_WITH_CUDA=ON).
+  add_executable(diar_backend_tests tests/test_backend.cpp)
+  target_link_libraries(diar_backend_tests PRIVATE diar_core)
+  if(MSVC)
+    target_compile_options(diar_backend_tests PRIVATE /W4)
+  else()
+    target_compile_options(diar_backend_tests PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+  add_test(NAME diar_backend_tests COMMAND diar_backend_tests)
 
   add_executable(diar_layers_tests tests/test_layers.cpp)
   target_link_libraries(diar_layers_tests PRIVATE diar_core)
