@@ -2,6 +2,8 @@
 // See include/diar/sortformer.hpp for the full pin ledger.
 #include "diar/sortformer.hpp"
 
+#include "diar/profile.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -428,14 +430,17 @@ SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat
 
     // 1) stem — raw pre-encode embeddings (chunk_embs BEFORE any scaling)
     out.chunk_embs.resize(static_cast<std::size_t>(T3) * D);
-    if (T3 > 0)
+    if (T3 > 0) {
+        DIAR_PROFILE_SCOPE("stem");
         subsampling_forward(mel, w.stem(), out.chunk_embs.data(), t_mel, c.feat_in,
             c.subsampling_conv_channels, D, feat_len);
+    }
     if (taps && T3 > 0) taps->tap("stem.out", out.chunk_embs.data(), T3, D);
 
     // 2) concat [spkcache | fifo | chunk]
     std::vector<float> x(static_cast<std::size_t>(L) * D);
     {
+        DIAR_PROFILE_SCOPE("concat");
         float* dst = x.data();
         if (spkcache_frames > 0) {
             std::memcpy(dst, spkcache, sizeof(float) * spkcache_frames * D);
@@ -452,6 +457,7 @@ SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat
 
     // 3) xscale on the whole concat (state prefix included)
     if (c.xscaling) {
+        DIAR_PROFILE_SCOPE("xscale");
         const float scale = std::sqrt(static_cast<float>(D));
         for (std::size_t i = 0; i < x.size(); ++i) x[i] *= scale;  // element-wise
         if (taps) taps->tap("xscaled", x.data(), L, D);
@@ -464,12 +470,15 @@ SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat
             "sortformer_run_chunk: L=" + std::to_string(L) + " exceeds pos_emb_max_len=" +
             std::to_string(c.pos_emb_max_len) + " (upstream validate_stream_geometry guard)");
     std::vector<float> pe(static_cast<std::size_t>(2 * L - 1) * D);
-    if (w.pe_table() != nullptr) {
-        const int center = w.pe_rows() / 2 + 1;  // v12 live probe pin
-        std::memcpy(pe.data(), w.pe_table() + static_cast<std::size_t>(center - L) * D,
-            sizeof(float) * (2 * L - 1) * D);
-    } else {
-        relpos_table_forward(pe.data(), L, D);
+    {
+        DIAR_PROFILE_SCOPE("pe");
+        if (w.pe_table() != nullptr) {
+            const int center = w.pe_rows() / 2 + 1;  // v12 live probe pin
+            std::memcpy(pe.data(), w.pe_table() + static_cast<std::size_t>(center - L) * D,
+                sizeof(float) * (2 * L - 1) * D);
+        } else {
+            relpos_table_forward(pe.data(), L, D);
+        }
     }
     if (taps) taps->tap("pos_emb", pe.data(), 2 * L - 1, D);
 
@@ -477,42 +486,54 @@ SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat
     std::vector<float> y(static_cast<std::size_t>(L) * D);
     float* cur = x.data();
     float* nxt = y.data();
-    for (int i = 0; i < c.encoder_layers; ++i) {
-        conformer_layer_forward(cur, pe.data(), w.conformer(i), nxt, L, D, c.encoder_d_ff,
-            c.encoder_heads, c.conv_kernel);
-        std::swap(cur, nxt);
-        if (taps) {
-            char name[32];
-            std::snprintf(name, sizeof(name), "conformer.%d", i);
-            taps->tap(name, cur, L, D);
+    {
+        DIAR_PROFILE_SCOPE("conformer");
+        for (int i = 0; i < c.encoder_layers; ++i) {
+            conformer_layer_forward(cur, pe.data(), w.conformer(i), nxt, L, D, c.encoder_d_ff,
+                c.encoder_heads, c.conv_kernel);
+            std::swap(cur, nxt);
+            if (taps) {
+                char name[32];
+                std::snprintf(name, sizeof(name), "conformer.%d", i);
+                taps->tap(name, cur, L, D);
+            }
         }
     }
 
     // 6) encoder_proj
     std::vector<float> px(static_cast<std::size_t>(L) * X);
-    nn::linear_forward(cur, w.proj_w(), w.proj_b(), px.data(), static_cast<std::size_t>(L),
-        static_cast<std::size_t>(D), static_cast<std::size_t>(X));
+    {
+        DIAR_PROFILE_SCOPE("proj");
+        nn::linear_forward(cur, w.proj_w(), w.proj_b(), px.data(), static_cast<std::size_t>(L),
+            static_cast<std::size_t>(D), static_cast<std::size_t>(X));
+    }
     if (taps) taps->tap("proj.out", px.data(), L, X);
 
     // 7) transformer chain (post-LN)
     std::vector<float> py(static_cast<std::size_t>(L) * X);
     cur = px.data();
     nxt = py.data();
-    for (int i = 0; i < c.transformer_layers; ++i) {
-        transformer_block_forward(cur, w.transformer(i), nxt, L, X, c.transformer_inner,
-            c.transformer_heads);
-        std::swap(cur, nxt);
-        if (taps) {
-            char name[32];
-            std::snprintf(name, sizeof(name), "transformer.%d", i);
-            taps->tap(name, cur, L, X);
+    {
+        DIAR_PROFILE_SCOPE("transformer");
+        for (int i = 0; i < c.transformer_layers; ++i) {
+            transformer_block_forward(cur, w.transformer(i), nxt, L, X, c.transformer_inner,
+                c.transformer_heads);
+            std::swap(cur, nxt);
+            if (taps) {
+                char name[32];
+                std::snprintf(name, sizeof(name), "transformer.%d", i);
+                taps->tap(name, cur, L, X);
+            }
         }
     }
 
     // 8) head -> pre-gate preds
     out.preds.resize(static_cast<std::size_t>(L) * SPK);
-    diar_head_forward(cur, w.head_hidden_w(), w.head_hidden_b(), w.head_spks_w(),
-        w.head_spks_b(), out.preds.data(), L, X, SPK);
+    {
+        DIAR_PROFILE_SCOPE("head");
+        diar_head_forward(cur, w.head_hidden_w(), w.head_hidden_b(), w.head_spks_w(),
+            w.head_spks_b(), out.preds.data(), L, X, SPK);
+    }
     if (taps) taps->tap("preds", out.preds.data(), L, SPK);
     return out;
 }

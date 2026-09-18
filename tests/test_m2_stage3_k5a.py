@@ -319,16 +319,38 @@ def _tiny_case_inputs(tmp_path, runner):
     return wpath, audio
 
 
+def _subsampled_len(t_mel: int, stages: int = 3) -> int:
+    """(l + 2 - 3)//2 + 1 chain, stages times — the stem's k3s2p1 formula
+    (sortformer_subsampled_len mirror)."""
+    l = t_mel
+    for _ in range(stages):
+        l = (l + 2 - 3) // 2 + 1
+    return l
+
+
 def _synthetic_ref_npz(audio, whole_run):
-    """NeMo-shaped npz: reference == ours PLUS one all-zero phantom pad row."""
+    """NeMo-shaped npz: reference == ours PLUS the python-NeMo phantom pad
+    rows the tailfix engine trims.
+
+    Geometry (tailfix era, 89817b9): our final ledger chunk runs the masked
+    stem on the 32-padded window, so t3 (chunk_frames) is the PADDED
+    subsampled length while `emitted` is the valid one. python-NeMo on the
+    same window emits t3_pad rows with the tail (t3_pad - t3_valid) rows
+    being all-zero phantoms (G5 forensics: short +1, mid +2). The synthetic
+    reference mirrors that; a whole-grid final window yields zero phantoms.
+    """
     ours = whole_run["pregate"]
     ledger = whole_run["ledger"]
     aosc_index = whole_run["aosc_index"]
     emb_dim = 16  # tiny cfg d_model
     blob = whole_run["aosc_blob"]
-    phantom = np.zeros((1, 4), dtype=np.float64)
-    tp = np.concatenate([ours.astype(np.float64), phantom], axis=0)
     last = ledger[-1]
+    t_mel = int(last["t_mel"])
+    t3_pad = int(last["t3"])  # ledger t3 == padded-window rows on tail chunks
+    t3_valid = _subsampled_len(t_mel)
+    phantom_rows = max(0, t3_pad - t3_valid)
+    phantom = np.zeros((phantom_rows, 4), dtype=np.float64)
+    tp = np.concatenate([ours.astype(np.float64), phantom], axis=0)
     ci_last = f"chunk{last['chunk']:03d}"
     z: dict = {
         "audio": audio,
@@ -337,12 +359,11 @@ def _synthetic_ref_npz(audio, whole_run):
         "n_chunks": np.array([len(ledger)]),
         "compression_chunks": np.array([], dtype=np.int64),
     }
-    feat_len_last = int(last["t_mel"])
-    z[f"{ci_last}/feat_length"] = np.array([feat_len_last])
+    z[f"{ci_last}/feat_length"] = np.array([t_mel])
     z[f"{ci_last}/state_lens_before"] = np.array(
-        [0, last["fifo_frames"], last["t3"]])
+        [0, last["fifo_frames"], t3_valid])
     z[f"{ci_last}/preds_full"] = np.zeros(
-        (last["spkcache_frames"] + last["fifo_frames"] + last["t3"] + 1, 4))
+        (last["spkcache_frames"] + last["fifo_frames"] + t3_pad, 4))
     for i, snap in enumerate(aosc_index):
         ci = f"chunk{i:03d}"
         spk = blob[snap["spk_off"]:snap["spk_off"] + snap["spk_frames"] * emb_dim] \
@@ -400,7 +421,9 @@ def test_k5a_dress_rehearsal(tmp_path):
     assert r["G3_aosc"]["mean_sil_max_abs"] == pytest.approx(0.0, abs=1e-6)
     assert r["G4_compress"]["match"] is True
     assert r["G5_length"]["diff"] == 0
-    assert r["G5_length"]["phantom_rows"] == 1
+    led_last = runs["whole"]["ledger"][-1]
+    expected_phantom = int(led_last["t3"]) - _subsampled_len(int(led_last["t_mel"]))
+    assert r["G5_length"]["phantom_rows"] == expected_phantom
     assert r["G5_length"]["phantom_all_zero"] is True
     assert r["G6_determinism"]["bit_identical"] is True
 
@@ -463,9 +486,15 @@ def test_k5a_g3_last_chunk_phantom_exemption(tmp_path):
         return z
 
     last = n_chunks - 1
+    # The reference's phantom count (padded - valid final T3). The tiny case
+    # (final t_mel 141 -> pad 160 -> t3 20 vs valid 18) yields 2; a whole-grid
+    # final would yield 0 and this test would be vacuous.
+    led = whole["ledger"][-1]
+    phantom_rows = int(led["t3"]) - _subsampled_len(int(led["t_mel"]))
+    assert phantom_rows >= 1, "tiny case must end mid-grid for this gate"
 
     # 1) exact-phantom delta on the final chunk -> forgiven, prefix compared.
-    r = k5a.compare_audio("tiny", _npz_with_fifo(1, last), runner, wpath,
+    r = k5a.compare_audio("tiny", _npz_with_fifo(phantom_rows, last), runner, wpath,
                           tmp_path, n_spk=4, runs={k: dict(v) for k, v in runs.items()})
     assert "error" not in r, r.get("error")
     assert r["G3_aosc"]["geometry_ok"] is True
@@ -474,19 +503,19 @@ def test_k5a_g3_last_chunk_phantom_exemption(tmp_path):
     assert cell["max_abs"] == pytest.approx(0.0, abs=1e-6)
 
     # 2) wrong delta on the final chunk -> still hard-fails geometry.
-    r = k5a.compare_audio("tiny", _npz_with_fifo(2, last), runner, wpath,
+    r = k5a.compare_audio("tiny", _npz_with_fifo(phantom_rows + 1, last), runner, wpath,
                           tmp_path, n_spk=4, runs={k: dict(v) for k, v in runs.items()})
     assert "error" not in r, r.get("error")
     assert r["G3_aosc"]["geometry_ok"] is False
 
     # 3) exact delta on a NON-final chunk -> still hard-fails geometry.
-    r = k5a.compare_audio("tiny", _npz_with_fifo(1, 0), runner, wpath,
+    r = k5a.compare_audio("tiny", _npz_with_fifo(phantom_rows, 0), runner, wpath,
                           tmp_path, n_spk=4, runs={k: dict(v) for k, v in runs.items()})
     assert "error" not in r, r.get("error")
     assert r["G3_aosc"]["geometry_ok"] is False
     assert r["G3_aosc"]["per_chunk"][0]["fifo"].get("geometry-mismatch") == [
         whole["aosc_index"][0]["fifo_frames"],
-        whole["aosc_index"][0]["fifo_frames"] + 1]
+        whole["aosc_index"][0]["fifo_frames"] + phantom_rows]
 
 def test_k5a_fe_extra_frame_exemption(tmp_path):
     """K5 v3 forensics: the production C++ FE emits exactly ONE more final
@@ -524,13 +553,19 @@ def test_k5a_fe_extra_frame_exemption(tmp_path):
     def _mid_shape_npz(fifo_extra: int):
         """Self-consistent mid-shape npz: feat=declared-1, valid rows v_nemo,
         preds_full = spk+fifo+v_nemo+2 (2 phantom fill), total_preds keeps
-        its global +1 phantom, final fifo_after = ours + fifo_extra rows."""
+        its global +1 phantom (the synthetic base now carries the tiny case's
+        own +2 tailfix phantoms — trim back to the mid pattern of exactly 1),
+        final fifo_after = ours + fifo_extra rows."""
         z = _synthetic_ref_npz(audio, whole)
         led = whole["ledger"][last]
         spk_b, fifo_b = int(led["spkcache_frames"]), int(led["fifo_frames"])
         z[f"{ci}/feat_length"] = np.array([nemo_feat])
         z[f"{ci}/state_lens_before"] = np.array([0, fifo_b, v_nemo])
         z[f"{ci}/preds_full"] = np.zeros((spk_b + fifo_b + v_nemo + 2, 4))
+        ours_rows = int(np.asarray(whole["pregate"]).shape[0])
+        tp = np.asarray(z["total_preds"])
+        if tp.shape[0] > ours_rows + 1:
+            z["total_preds"] = tp[: ours_rows + 1]
         fifo = np.asarray(z[f"{ci}/fifo_after"])
         z[f"{ci}/fifo_after"] = np.concatenate(
             [fifo, np.zeros((fifo_extra, fifo.shape[1]))], axis=0)

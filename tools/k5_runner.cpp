@@ -32,6 +32,7 @@
 // parseable outputs — infra, not numerics (numerics are the kernel's gates).
 #include "diar/engine.hpp"
 #include "diar/gguf.hpp"
+#include "diar/profile.hpp"
 #include "diar/sortformer.hpp"
 
 #include <cmath>
@@ -627,7 +628,7 @@ int selftest() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string mode, weights, audio, out, feed = "whole";
+    std::string mode, weights, audio, out, feed = "whole", profile_out;
     bool offline = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -644,9 +645,11 @@ int main(int argc, char** argv) {
         else if (a == "--audio") audio = next("--audio");
         else if (a == "--out") out = next("--out");
         else if (a == "--feed") feed = next("--feed");
+        else if (a == "--profile-out") profile_out = next("--profile-out");
         else if (a == "--offline") offline = true;
         else die("unknown arg: " + a);
     }
+    const int rc = [&]() -> int {
     if (mode == "selftest") return selftest();
     if (mode == "names") return expected_names_mode();
     if (mode == "probe") {
@@ -664,4 +667,17 @@ int main(int argc, char** argv) {
         return run_full_offline(weights, audio, out);
     }
     die("no mode: pass --run | --full-offline | --probe-weights | --expected-names | --selftest");
+    }();
+#if defined(DIAR_PROFILE_STAGE)
+    if (!profile_out.empty()) {
+        std::FILE* f = std::fopen(profile_out.c_str(), "w");
+        if (f) {
+            std::fputs(diar::profile::report_json().c_str(), f);
+            std::fclose(f);
+        } else {
+            std::fprintf(stderr, "profile-out: cannot write %s\n", profile_out.c_str());
+        }
+    }
+#endif
+    return rc;
 }

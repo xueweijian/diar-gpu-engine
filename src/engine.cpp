@@ -1,5 +1,6 @@
 // M2 Stage 3.2c — engine implementation. Upstream pins per section.
 #include "diar/engine.hpp"
+#include "diar/profile.hpp"
 #include "diar/tailfix.hpp"
 
 #include <algorithm>
@@ -29,6 +30,7 @@ DiarEngine::DiarEngine(SortformerWeights weights, EngineConfig cfg)
 }
 
 void DiarEngine::ensure_mel() {
+    DIAR_PROFILE_SCOPE("fe");
     std::vector<float> new_mel;
     const int n = produce_new_mel_frames(fe_, audio_buf_, audio_base_, mel_produced(), new_mel);
     if (n > 0)
@@ -154,21 +156,32 @@ bool DiarEngine::run_one_chunk(bool force, bool final_flush) {
     if (is_tail)
         t3_valid = tail_valid_frames(feat_len, weights_.config().subsampling_factor);
     const int trim = out.chunk_frames - t3_valid;
-    std::vector<float> chunk_embs_trim(out.chunk_embs.begin(),
-        out.chunk_embs.begin() + static_cast<std::size_t>(t3_valid) * weights_.config().d_model);
-    const int n_spk_cfg = weights_.config().num_speakers;
-    const int l_valid = out.total_frames - trim;
-    std::vector<float> preds_trim(out.preds.begin(),
-        out.preds.begin() + static_cast<std::size_t>(l_valid) * n_spk_cfg);
-    std::vector<float> emitted = aosc_.update(chunk_embs_trim.data(), t3_valid,
-        preds_trim.data(), lc_enc, rc_enc);
+    std::vector<float> chunk_embs_trim, preds_trim;
+    {
+        DIAR_PROFILE_SCOPE("trim");
+        chunk_embs_trim.assign(out.chunk_embs.begin(),
+            out.chunk_embs.begin() + static_cast<std::size_t>(t3_valid) * weights_.config().d_model);
+        const int n_spk_cfg = weights_.config().num_speakers;
+        const int l_valid = out.total_frames - trim;
+        preds_trim.assign(out.preds.begin(),
+            out.preds.begin() + static_cast<std::size_t>(l_valid) * n_spk_cfg);
+    }
+    std::vector<float> emitted;
+    {
+        DIAR_PROFILE_SCOPE("aosc");
+        emitted = aosc_.update(chunk_embs_trim.data(), t3_valid,
+            preds_trim.data(), lc_enc, rc_enc);
+    }
     entry.emitted = static_cast<int>(emitted.size()) / n_spk_;
     ledger_.push_back(entry);
     if (aosc_recorder_ != nullptr) aosc_recorder_->push_back(aosc_snapshot());
     // BirthGate consumes a relabeled COPY; the raw emitted chain is the K5
     // pre-gate face.
     pre_gate_.insert(pre_gate_.end(), emitted.begin(), emitted.end());
-    gate_.append(emitted, probs_);
+    {
+        DIAR_PROFILE_SCOPE("gate");
+        gate_.append(emitted, probs_);
+    }
     mel_consumed_ = end;
 
     // Trim consumed buffers; the next window starts at mel_consumed_ -
