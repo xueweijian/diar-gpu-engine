@@ -42,6 +42,9 @@ Do not download the 471 MB/147 MB model artifacts to the phone. Use a Kaggle run
 - Device-resident FIFO/AOSC state.
 - CPU and GPU outputs compared on the same fixture.
 
+CUDA-side delivery is planned in [M3-P100-CUDA-PLAN.md](M3-P100-CUDA-PLAN.md)
+(draft); M2 closes on CPU parity + the production-fixture endorsement.
+
 ## M3 — P100 optimization
 
 Optimize only after M2 parity is green:
