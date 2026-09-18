@@ -470,7 +470,7 @@ def test_k5a_g3_last_chunk_phantom_exemption(tmp_path):
     assert "error" not in r, r.get("error")
     assert r["G3_aosc"]["geometry_ok"] is True
     cell = r["G3_aosc"]["per_chunk"][last]["fifo"]
-    assert cell.get("phantom_prefix_rows") == whole["aosc_index"][last]["fifo_frames"]
+    assert cell.get("tail_prefix_rows") is not None
     assert cell["max_abs"] == pytest.approx(0.0, abs=1e-6)
 
     # 2) wrong delta on the final chunk -> still hard-fails geometry.
@@ -487,3 +487,98 @@ def test_k5a_g3_last_chunk_phantom_exemption(tmp_path):
     assert r["G3_aosc"]["per_chunk"][0]["fifo"].get("geometry-mismatch") == [
         whole["aosc_index"][0]["fifo_frames"],
         whole["aosc_index"][0]["fifo_frames"] + 1]
+
+def test_k5a_fe_extra_frame_exemption(tmp_path):
+    """K5 v3 forensics: the production C++ FE emits exactly ONE more final
+    mel frame than python-NeMo's loader (ledger t_mel 87/49 vs npz feat
+    86/48; ggml binary 711/4467 rows vs NeMo 712/4468 — Stage-0 admitted).
+    When the extra frame crosses a (len+1)//2 ceil boundary (mid 49->7 vs
+    48->6) it surfaces as: G5 diff == fe_extra_rows (exempt), G3 tail delta
+    == phantom - fe_extra_rows (exempt, receptive-field-trimmed compare).
+    Any other delta, or fe delta outside {0,+1}, still fails loudly.
+    """
+    import copy
+    import importlib
+    k5a = importlib.import_module("m2_stage3_k5a")
+    runner = _runner()
+    wpath, audio = _tiny_case_inputs(tmp_path, runner)
+    runs = _run_feeds("feextra", ["whole", "drip"], runner, wpath, tmp_path, audio)
+    whole = runs["whole"]
+    last = len(whole["ledger"]) - 1
+    ci = f"chunk{last:03d}"
+    t_mel = int(whole["ledger"][last]["t_mel"])
+
+    # Pick a declared tail geometry that actually crosses a ceil boundary:
+    # masked chain (len+1)//2 x3 must differ by exactly one row.
+    def _masked(x):
+        for _ in range(3):
+            x = (x + 1) // 2
+        return x
+    crossing = next(x for x in range(t_mel + 1, t_mel + 64)
+                    if _masked(x) - _masked(x - 1) == 1)
+    declared = crossing          # our (FE) tail frame count
+    nemo_feat = crossing - 1     # python loader sees one frame less
+    v_nemo = _masked(nemo_feat)
+    assert _masked(declared) - v_nemo == 1
+
+    def _mid_shape_npz(fifo_extra: int):
+        """Self-consistent mid-shape npz: feat=declared-1, valid rows v_nemo,
+        preds_full = spk+fifo+v_nemo+2 (2 phantom fill), total_preds keeps
+        its global +1 phantom, final fifo_after = ours + fifo_extra rows."""
+        z = _synthetic_ref_npz(audio, whole)
+        led = whole["ledger"][last]
+        spk_b, fifo_b = int(led["spkcache_frames"]), int(led["fifo_frames"])
+        z[f"{ci}/feat_length"] = np.array([nemo_feat])
+        z[f"{ci}/state_lens_before"] = np.array([0, fifo_b, v_nemo])
+        z[f"{ci}/preds_full"] = np.zeros((spk_b + fifo_b + v_nemo + 2, 4))
+        fifo = np.asarray(z[f"{ci}/fifo_after"])
+        z[f"{ci}/fifo_after"] = np.concatenate(
+            [fifo, np.zeros((fifo_extra, fifo.shape[1]))], axis=0)
+        # G5: tp - (preds_full - spk - fifo) + v  == ours_rows - 1
+        # => phantom == 2, and diff == 1 == fe_extra_rows
+        return z
+
+    def _runs_declared():
+        cp = {k: {kk: (copy.deepcopy(vv) if isinstance(vv, (list, dict))
+                       else vv) for kk, vv in v.items()}
+              for k, v in runs.items()}
+        cp["whole"]["ledger"][-1]["t_mel"] = declared
+        return cp
+
+    # 1) mid shape: delta == phantom(2) - fe_extra_rows(1) == 1 -> exempt,
+    #    numeric compare trimmed to the receptive-field-safe prefix.
+    r = k5a.compare_audio("tiny", _mid_shape_npz(1), runner, wpath,
+                          tmp_path, n_spk=4, runs=_runs_declared())
+    assert "error" not in r, r.get("error")
+    g5 = r["G5_length"]
+    assert g5["fe_tail_frame_delta"] == 1
+    assert g5["fe_extra_rows"] == 1
+    assert g5["diff"] == 1 == g5["fe_extra_rows"]
+    assert g5["phantom_rows"] == 2
+    cell = r["G3_aosc"]["per_chunk"][last]["fifo"]
+    assert cell.get("tail_prefix_rows") is not None, cell
+    snap_frames = whole["aosc_index"][last]["fifo_frames"]
+    assert cell["tail_prefix_rows"] == min((nemo_feat - 8) // 8 + 1, snap_frames)
+    assert cell["tail_exempt_rows"] == snap_frames - cell["tail_prefix_rows"]
+    assert cell["max_abs"] == pytest.approx(0.0, abs=1e-6)
+    assert r["G3_aosc"]["geometry_ok"] is True
+
+    # 2) delta == phantom (2) with fe_extra active -> still exempt (the
+    #    pre-existing branch must survive the fe_extra generalisation).
+    r = k5a.compare_audio("tiny", _mid_shape_npz(2), runner, wpath,
+                          tmp_path, n_spk=4, runs=_runs_declared())
+    assert "error" not in r, r.get("error")
+    assert r["G3_aosc"]["geometry_ok"] is True
+
+    # 3) any other delta (3) -> hard geometry failure.
+    r = k5a.compare_audio("tiny", _mid_shape_npz(3), runner, wpath,
+                          tmp_path, n_spk=4, runs=_runs_declared())
+    assert "error" not in r, r.get("error")
+    assert r["G3_aosc"]["geometry_ok"] is False
+
+    # 4) FE tail delta of 2 frames -> loud error, not a silent exemption.
+    cp = _runs_declared()
+    cp["whole"]["ledger"][-1]["t_mel"] = declared + 1
+    r = k5a.compare_audio("tiny", _mid_shape_npz(1), runner, wpath,
+                          tmp_path, n_spk=4, runs=cp)
+    assert "error" in r and "not in (0,+1)" in r["error"], r.get("error")

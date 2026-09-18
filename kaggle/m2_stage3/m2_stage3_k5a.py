@@ -158,6 +158,24 @@ def compare_audio(label: str, z, runner: Path, dfw1: Path, work: Path,
     phantom = int(tp.shape[0]) - expected_ours
     phantom_rows = tp[expected_ours:] if phantom > 0 else np.zeros((0, tp.shape[1]))
     phantom_all_zero = bool(np.all(phantom_rows == 0.0)) if phantom > 0 else True
+
+    # ---- FE tail-frame delta (upstream C++ flush vs python loader) ----
+    # Stage-0 forensics (admitted difference): the production C++ FE emits
+    # exactly ONE more mel frame on the final window than python-NeMo's
+    # loader (ggml binary short=711/mid=4467 rows vs NeMo 712/4468; K5 v3
+    # ledger t_mel 87/49 vs npz feat 86/48). The extra frame either
+    # vanishes in the (len+1)//2 chain (87->11 == 86->11, short) or
+    # crosses a ceil boundary (49->7 vs 48->6, mid G5 diff=1). Structural
+    # exemption, NOT a tolerance: any delta outside {0,+1} fails loudly.
+    t_mel_last = int(ledger[-1]["t_mel"])
+    fe_extra = t_mel_last - feat_len_last
+    if fe_extra not in (0, 1):
+        return {"error": f"FE tail frame delta {t_mel_last}-{feat_len_last}"
+                         f"={fe_extra} not in (0,+1)"}
+    valid_last_fe = t_mel_last
+    for _ in range(3):  # same three (len+1)/2 stages
+        valid_last_fe = (valid_last_fe + 1) // 2
+    fe_extra_rows = valid_last_fe - valid_last
     len_diff = int(n_ours - expected_ours)
 
     # ---- G1 chunk0 open-loop ----
@@ -229,12 +247,25 @@ def compare_audio(label: str, z, runner: Path, dfw1: Path, work: Path,
             if n_ref is not None:
                 ref = np.asarray(n_ref, dtype=np.float64)
                 if ref.shape[0] != snap[frames]:
+                    delta = int(ref.shape[0]) - int(snap[frames])
                     if (i == n_last and phantom > 0
-                            and int(ref.shape[0]) - int(snap[frames]) == phantom):
-                        ref = ref[:snap[frames]]
-                        got = blob[snap[off]:snap[off] + ref.size].astype(np.float64).reshape(ref.shape)
-                        m = metrics(ref, got)
-                        m["phantom_prefix_rows"] = int(snap[frames])
+                            and (delta == phantom
+                                 or (delta == phantom - fe_extra_rows and delta > 0))):
+                        # Prefix compare over rows whose stem receptive
+                        # field lies fully inside min(ours_feat, nemo_feat)
+                        # (3-stage k3s2 stem: t3 row r reads mel
+                        # [8r-7, 8r+7], so row r is clean iff 8r+7 <
+                        # min_feat). The FE +1 frame and the padded-window
+                        # boundary row have no counterpart on the other
+                        # side and are exempted from the numeric compare.
+                        min_feat = min(t_mel_last, feat_len_last)
+                        n_rows = min((min_feat - 8) // 8 + 1,
+                                     int(snap[frames]), int(ref.shape[0]))
+                        ref_c = ref[:n_rows]
+                        got = blob[snap[off]:snap[off] + ref_c.size].astype(np.float64).reshape(ref_c.shape)
+                        m = metrics(ref_c, got)
+                        m["tail_prefix_rows"] = int(n_rows)
+                        m["tail_exempt_rows"] = int(snap[frames]) - int(n_rows)
                         entry[kind] = m
                     else:
                         entry[kind] = {"geometry-mismatch": [snap[frames], int(ref.shape[0])]}
@@ -270,6 +301,8 @@ def compare_audio(label: str, z, runner: Path, dfw1: Path, work: Path,
         "n_chunks_ours": len(ledger),
         "G5_length": {"ours": int(n_ours), "nemo": int(tp.shape[0]),
                       "expected_ours": int(expected_ours), "diff": len_diff,
+                      "fe_tail_frame_delta": int(fe_extra),
+                      "fe_extra_rows": int(fe_extra_rows),
                       "phantom_rows": phantom,
                       "phantom_all_zero": phantom_all_zero},
         "G1_chunk0": g1,
@@ -420,9 +453,16 @@ def main() -> int:
         if not r["G4_compress"]["match"]:
             reasons.append(f"{label}: G4 compress events {r['G4_compress']['ours_sim']} "
                            f"!= {r['G4_compress']['nemo']}")
-        if r["G5_length"]["diff"] != 0:
-            reasons.append(f"{label}: G5 rows {r['G5_length']['ours']} != "
-                           f"expected {r['G5_length']['expected_ours']}")
+        # FE tail-frame exemption: the production C++ FE admits exactly one
+        # extra final mel frame vs python-NeMo's loader; when that frame
+        # crosses a (len+1)//2 ceil boundary it shows up as exactly
+        # fe_extra_rows extra emitted rows (K5 v3: mid 49->7 vs 48->6).
+        g5 = r["G5_length"]
+        if g5["diff"] not in (0, g5["fe_extra_rows"]):
+            reasons.append(f"{label}: G5 rows {g5['ours']} != "
+                           f"expected {g5['expected_ours']}"
+                           + (f" (+fe_extra_rows {g5['fe_extra_rows']} allowed)"
+                              if g5["fe_extra_rows"] else ""))
         if not r["G5_length"]["phantom_all_zero"]:
             reasons.append(f"{label}: G5 phantom rows not all-zero")
         if not r["G6_determinism"]["bit_identical"]:
