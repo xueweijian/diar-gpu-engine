@@ -33,13 +33,14 @@ TEXT_ANCHORS = {
 CPP_FILES = [
     "tools/k5_runner.cpp",
     "src/sortformer.cpp", "src/engine.cpp", "src/fe.cpp", "src/diar.cpp",
-    "src/aosc.cpp", "src/birth_gate.cpp", "src/gguf.cpp",
+    "src/aosc.cpp", "src/birth_gate.cpp", "src/gguf.cpp", "src/tailfix.cpp",
     "src/nn.cpp", "src/layers.cpp", "src/mha.cpp", "src/conv.cpp",
     "src/conformer.cpp", "src/subsampling.cpp", "src/posenc.cpp",
     "include/diar/conformer.hpp", "include/diar/conv.hpp", "include/diar/diar.hpp",
     "include/diar/engine.hpp", "include/diar/gguf.hpp", "include/diar/layers.hpp",
     "include/diar/mha.hpp", "include/diar/nn.hpp", "include/diar/posenc.hpp",
     "include/diar/sortformer.hpp", "include/diar/subsampling.hpp",
+    "include/diar/tailfix.hpp",
 ]
 REPO = DIR.parent.parent
 

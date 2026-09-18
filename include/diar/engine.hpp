@@ -18,16 +18,19 @@
 
 namespace diar {
 
-// Tail semantics (T9, settled 2026-09-18 against upstream a5b6953 source +
-// m2-ref npz): there is NO tail flag. Upstream DiarStream::run_one_chunk
-// calls run_chunk(mel, t_mel, spk, fifo) — no feat_len, no window padding;
-// the final chunk runs the real mel rows (incl. the zero-after-preemphasis
-// decay tail) and subsampled_len = whole-window ceil. The m2-ref npz's extra
-// final-chunk rows (short 12 vs our 11, mid 8 vs our 6) are PYTHON NeMo's
-// streaming loader padding the tail window to a 32-mel multiple and masking
-// the pad rows — a python-stack artifact with all-zero probs, NOT production
-// behavior. The K5 gate compares the real prefix and reports the phantom
-// count.
+// Tail semantics (T9 + tail-fixture, settled 2026-09-18 against upstream
+// a5b6953 source + m2-ref npz + tail_slice probe):
+//   - PRODUCTION (a5b6953 ggml run_chunk): no feat_len, no window padding;
+//     subsampled_len = whole-window ceil. The tail_slice probe (body 0.028,
+//     tail row 0.9964) proves the final window's extra computed rows are
+//     WRONG speech values where python NeMo has masked rows.
+//   - PYTHON NeMo reference: streaming loader pads the tail window to a
+//     32-mel multiple and masks pad rows (masked rows == out.bias fill,
+//     all-zero probs); emission trims phantom rows.
+// The engine follows production on full windows and takes the NeMo route
+// (pad32 + feat_len>0 + trim) on the final flush window. tail_feat_len in
+// the ledger marks which route a chunk took (0 = production). The K5 gate
+// compares the real prefix and reports the phantom count.
 
 struct EngineConfig {
     StreamGeometry geometry = StreamGeometry::streaming();
@@ -46,6 +49,10 @@ struct ChunkLedgerEntry {
     int emitted = 0;             // timeline frames appended (t3 - lc - rc)
     int spkcache_frames = 0, fifo_frames = 0;  // state sizes BEFORE this chunk
     int window_frames = 0;                     // spkcache + fifo + t3
+    // Tailfix route (NeMo tail-window semantics): 0 = production path
+    // (whole-window stem, feat_len=-1); >0 = padded masked tail window with
+    // this many VALID mel rows (feat_len), emission trimmed to valid rows.
+    int tail_feat_len = 0;
 };
 
 class DiarEngine {

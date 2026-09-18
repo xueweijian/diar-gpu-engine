@@ -489,6 +489,7 @@ int run_mode(const std::string& weights, const std::string& audio, const std::st
                  ", \"spkcache_frames\": " + std::to_string(e.spkcache_frames) +
                  ", \"fifo_frames\": " + std::to_string(e.fifo_frames) +
                  ", \"window_frames\": " + std::to_string(e.window_frames) +
+                 ", \"tail_feat_len\": " + std::to_string(e.tail_feat_len) +
                  "}" +
                  (i + 1 < led.size() ? "," : "") + "\n";
         }

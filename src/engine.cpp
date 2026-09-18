@@ -1,8 +1,10 @@
 // M2 Stage 3.2c — engine implementation. Upstream pins per section.
 #include "diar/engine.hpp"
+#include "diar/tailfix.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 namespace diar {
@@ -107,11 +109,27 @@ bool DiarEngine::run_one_chunk(bool force, bool final_flush) {
         throw std::runtime_error("DiarEngine: mel window trimmed too aggressively");
     const float* mel = mel_buf_.data() + (w0 - mel_base_) * n_mels_;
 
-    // Upstream verbatim (a5b6953 diar_pipeline.cpp): run_chunk gets the whole
-    // window — no feat_len mask, no tail-window padding. The final chunk's
-    // decay-tail rows (post-preemphasis zeros) are computed like any other
-    // row; python NeMo's masked pad rows are not production behavior.
-    SortformerChunkOutput out = sortformer_run_chunk(mel, t_mel, -1,
+    // Tailfix route (tail_slice probe 2026-09-18): the FINAL flush window is
+    // the only one that can end mid-grid — earlier windows always cover a
+    // full hop (lc/rc may clamp at stream edges but the window itself is
+    // whole). On the final window, take the NeMo route: pad the window to a
+    // 32-mel multiple with zero rows (loader pin), run the masked stem with
+    // feat_len = valid rows, then trim emission to valid rows.
+    // Condition: final_flush && this chunk drains the stream (end reached
+    // mel_produced) && the window is not already a multiple of 32.
+    // All non-tail chunks keep production behavior bit-exact (feat_len=-1).
+    const bool is_tail = final_flush && end >= mel_produced() &&
+                         t_mel % kNemoWindowPadMultiple != 0;
+    const int t_mel_pad = is_tail ? nemo_padded_window(t_mel) : t_mel;
+    const int feat_len = is_tail ? t_mel : -1;
+    std::vector<float> padded;
+    const float* mel_run = mel;
+    if (is_tail) {
+        padded.assign(static_cast<std::size_t>(t_mel_pad) * n_mels_, 0.0F);
+        std::memcpy(padded.data(), mel, static_cast<std::size_t>(t_mel) * n_mels_ * sizeof(float));
+        mel_run = padded.data();
+    }
+    SortformerChunkOutput out = sortformer_run_chunk(mel_run, t_mel_pad, feat_len,
         aosc_.spkcache_frames() ? aosc_.spkcache().data() : nullptr, aosc_.spkcache_frames(),
         aosc_.fifo_frames() ? aosc_.fifo().data() : nullptr, aosc_.fifo_frames(), weights_,
         tap_sink_);
@@ -127,8 +145,23 @@ bool DiarEngine::run_one_chunk(bool force, bool final_flush) {
     entry.spkcache_frames = aosc_.spkcache_frames();
     entry.fifo_frames = aosc_.fifo_frames();
     entry.window_frames = out.total_frames;
-    std::vector<float> emitted =
-        aosc_.update(out.chunk_embs.data(), out.chunk_frames, out.preds.data(), lc_enc, rc_enc);
+    entry.tail_feat_len = feat_len > 0 ? feat_len : 0;
+    // Trim phantom rows: masked stem emits T3_pad rows, but only
+    // valid_T3 = subsampled(feat_len) carry signal; rows beyond are out.bias
+    // fill (gate-invisible zeros in NeMo, wrong speech values in old
+    // production). AOSC consumes the valid prefix only.
+    int t3_valid = out.chunk_frames;
+    if (is_tail)
+        t3_valid = tail_valid_frames(feat_len, weights_.config().subsampling_factor);
+    const int trim = out.chunk_frames - t3_valid;
+    std::vector<float> chunk_embs_trim(out.chunk_embs.begin(),
+        out.chunk_embs.begin() + static_cast<std::size_t>(t3_valid) * weights_.config().d_model);
+    const int n_spk_cfg = weights_.config().num_speakers;
+    const int l_valid = out.total_frames - trim;
+    std::vector<float> preds_trim(out.preds.begin(),
+        out.preds.begin() + static_cast<std::size_t>(l_valid) * n_spk_cfg);
+    std::vector<float> emitted = aosc_.update(chunk_embs_trim.data(), t3_valid,
+        preds_trim.data(), lc_enc, rc_enc);
     entry.emitted = static_cast<int>(emitted.size()) / n_spk_;
     ledger_.push_back(entry);
     if (aosc_recorder_ != nullptr) aosc_recorder_->push_back(aosc_snapshot());

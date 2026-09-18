@@ -3,6 +3,7 @@
 // state geometry and tap plumbing. Tiny weights from the shared fixture
 // (independent byte writers).
 #include "diar/engine.hpp"
+#include "diar/tailfix.hpp"
 #include "tiny_fixture.hpp"
 
 #include <cmath>
@@ -283,9 +284,9 @@ void test_finish_tail_and_determinism() {
 
 void test_tail_and_offline() {
     const diar::SortformerWeights w = load_tiny();
-    // Final-chunk semantics (T9, upstream verbatim): no pad, no mask — the
-    // final chunk's t3 = subsampled_len(real tail mel), emitted frames label
-    // the timeline exactly once (no phantom rows, unlike python NeMo).
+    // Tailfix semantics (tail_slice probe 2026-09-18): full windows keep
+    // production behavior; the FINAL flush window takes the NeMo route
+    // (pad32 + feat_len>0 + trim). Ledger marks it via tail_feat_len.
     diar::DiarEngine eng(load_tiny(), base_cfg());
     const std::vector<float> audio = make_audio(16000 * 4, 5);
     eng.feed_audio(audio.data(), audio.size());
@@ -298,13 +299,21 @@ void test_tail_and_offline() {
     expect(sum_emitted == eng.n_frames(),
         "tail: emitted chain == timeline (no phantom rows)");
     const diar::ChunkLedgerEntry& last = led.back();
-    expect(last.t3 > 0 && last.emitted == last.t3 - last.lc_enc - last.rc_enc,
-        "tail: final chunk emits its whole valid window");
-    expect(last.t_mel < base_cfg().geometry.chunk_len * 8 ||
-               static_cast<std::int64_t>(led.size()) *
-                       base_cfg().geometry.chunk_len * 8 >
-                   last.t_mel,
-           "tail: final window is the real remainder");
+    // Final window takes the NeMo route iff it ends mid-grid (not a
+    // multiple of 32 mel). Either way the timeline stays gapless.
+    if (last.tail_feat_len > 0) {
+        expect(last.t_mel == last.tail_feat_len, "tail: feat_len == valid mel rows");
+        expect(last.t_mel % 32 != 0, "tail: route only on non-32-multiple windows");
+        const int valid_t3 = diar::tail_valid_frames(last.tail_feat_len, 8);
+        expect(last.emitted == valid_t3 - last.lc_enc - last.rc_enc,
+            "tail: final chunk emits valid rows only (phantom trimmed)");
+    } else {
+        expect(last.t_mel % 32 == 0, "tail: production route only on full windows");
+        expect(last.emitted == last.t3 - last.lc_enc - last.rc_enc,
+            "tail: full final window emits whole");
+    }
+    for (std::size_t i = 0; i + 1 < led.size(); i++)
+        expect(led[i].tail_feat_len == 0, "tail: only the final chunk takes the NeMo route");
 
     // Offline entries.
     const diar::OfflineDiarizationResult off =
@@ -329,6 +338,57 @@ void test_tail_and_offline() {
 
 }  // namespace
 
+void test_tailfix_helpers() {
+    // pad32 geometry: full windows unchanged, tails round up.
+    expect(diar::nemo_padded_window(160) == 160, "pad32: full window unchanged");
+    expect(diar::nemo_padded_window(96) == 96, "pad32: 96 unchanged");
+    expect(diar::nemo_padded_window(80) == 96, "pad32: 80 -> 96 (tail_slice pin)");
+    expect(diar::nemo_padded_window(86) == 96, "pad32: 86 -> 96 (m2-ref short pin)");
+    expect(diar::nemo_padded_window(48) == 64, "pad32: 48 -> 64 (m2-ref mid pin)");
+    expect(diar::nemo_padded_window(81) == 96, "pad32: 81 -> 96");
+    expect(diar::nemo_padded_window(0) == 0, "pad32: empty stays empty");
+    // valid-row chain: subsampled(feat_len), not subsampled(padded).
+    expect(diar::tail_valid_frames(80, 8) == 10, "valid: 80 -> 10 (tail_slice pin)");
+    expect(diar::tail_valid_frames(86, 8) == 11, "valid: 86 -> 11 (m2-ref short pin)");
+    expect(diar::tail_valid_frames(48, 8) == 6, "valid: 48 -> 6 (m2-ref mid pin)");
+    expect(diar::tail_valid_frames(80, 8) == diar::sortformer_subsampled_len(80, 8),
+        "valid: same chain as subsampled_len");
+}
+
+void test_tailfix_trims_phantom() {
+    // End-to-end on tiny weights: the NeMo route (pad32 + mask + trim) must
+    // emit exactly the valid prefix, and the trimmed phantom rows must be
+    // the out.bias fill (= what NeMo reports as all-zero probs).
+    const diar::SortformerWeights w = load_tiny();
+    const int D = w.config().d_model;
+    const int F = 8;  // chunk frames: partial window != 32 multiple
+    // fake a tail mel window: F valid rows of signal + zero pad to 32
+    std::vector<float> mel(static_cast<std::size_t>(32) * 128, 0.0F);
+    for (int t = 0; t < F; t++)
+        for (int c = 0; c < 128; c++)
+            mel[static_cast<std::size_t>(t) * 128 + c] = 0.05F * ((t + c) % 7 + 1);
+    diar::SortformerChunkOutput out = diar::sortformer_run_chunk(
+        mel.data(), 32, F, nullptr, 0, nullptr, 0, w, nullptr);
+    const int valid = diar::tail_valid_frames(F, 8);
+    expect(out.chunk_frames == diar::sortformer_subsampled_len(32, 8),
+        "trim: padded window emits padded T3");
+    expect(valid < out.chunk_frames, "trim: valid < padded (phantom exists)");
+    expect(valid == diar::sortformer_subsampled_len(F, 8), "trim: valid == subsampled(feat)");
+    // phantom rows are the bias fill (NeMo's all-zero-prob rows)
+    for (int r = valid; r < out.chunk_frames; r++)
+        for (int c = 0; c < D; c++)
+            expect(out.chunk_embs[static_cast<std::size_t>(r) * D + c] ==
+                       w.stem().out_b[c],
+                "trim: phantom rows == out.bias fill");
+    // valid rows carry real signal
+    bool live = false;
+    for (int r = 0; r < valid; r++)
+        for (int c = 0; c < D; c++)
+            live |= out.chunk_embs[static_cast<std::size_t>(r) * D + c] !=
+                    w.stem().out_b[c];
+    expect(live, "trim: valid rows are real conv rows");
+}
+
 int main() {
     test_ledger_and_sharding_invariance();
     test_state_geometry_and_taps();
@@ -336,6 +396,8 @@ int main() {
     test_offline_preset_geometry();
     test_finish_tail_and_determinism();
     test_tail_and_offline();
+    test_tailfix_helpers();
+    test_tailfix_trims_phantom();
     std::cout << "PASS: diar engine tests\n";
     return 0;
 }
