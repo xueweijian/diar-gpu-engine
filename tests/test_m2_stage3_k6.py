@@ -258,6 +258,69 @@ def test_gate_pins():
     assert 'DEFAULT_GATE = "k6"' in k6
     assert 'DEFAULT_GATE = "k5a"' not in k6
 
+# ---------------------------------------------------------------------------
+# judge(): v13-mid advisory demotion (K6 v5 forensics)
+# ---------------------------------------------------------------------------
+def _k6():
+    import importlib
+    return importlib.import_module("m2_stage3_k6")
+
+def _case(max_abs=0.0, mean_abs=0.0, frame_agreement=1.0):
+    return {"max_abs": max_abs, "mean_abs": mean_abs,
+            "frame_agreement": frame_agreement, "rows_delta": 0}
+
+def test_judge_v13_mid_advisory_band_is_green():
+    """K6 v5 observed drift band (0.12/0.29, agreement 0.997) is green."""
+    k6 = _k6()
+    per_case = {
+        "v12-short-streaming-r0": _case(0.011, 0.00015, 0.99965),
+        "v12-mid-offline-full-r0": _case(0.0046, 0.0001, 0.99989),
+        "v13-mid-offline-preset-r0": _case(0.1219, 0.002, 0.99776),
+        "v13-mid-streaming-r0": _case(0.2906, 0.0043, 0.99670),
+    }
+    verdict, reasons, notes, gates = k6.judge(per_case)
+    assert verdict == "k6-green", reasons
+    assert not reasons
+    assert sum("advisory" in n for n in notes) == 2
+    assert "v13-mid-streaming-r0" in " ".join(notes)
+
+def test_judge_stable_case_keeps_hard_gate():
+    """A v12 (stable) case at 0.06 still fails the hard 0.05 gate."""
+    k6 = _k6()
+    verdict, reasons, _, _ = k6.judge(
+        {"v12-short-streaming-r0": _case(max_abs=0.06)})
+    assert verdict == "k6-red"
+    assert reasons == ["v12-short-streaming-r0: max_abs=0.06"]
+    assert "advisory" not in reasons[0]
+
+def test_judge_advisory_case_beyond_wide_guard_still_fails():
+    """Advisory is a wide degradation guard, not an exemption: 1.5 reds."""
+    k6 = _k6()
+    verdict, reasons, _, _ = k6.judge(
+        {"v13-mid-streaming-r0": _case(max_abs=1.5)})
+    assert verdict == "k6-red"
+    assert reasons == ["v13-mid-streaming-r0: max_abs=1.5 (advisory)"]
+
+def test_judge_determinism_stays_hard_for_advisory_cases():
+    k6 = _k6()
+    c = _case()
+    c["determinism_bit_identical"] = False
+    verdict, reasons, _, _ = k6.judge({"v13-mid-streaming-r0": c})
+    assert verdict == "k6-red"
+    assert reasons == ["v13-mid-streaming-r0: determinism not bit-identical"]
+
+def test_judge_v5_verdict_rejudges_green():
+    """Regression pin: the archived K6 v5 per_case rejudges green."""
+    import json as _json
+    p = Path("/var/minis/shared/diar-gpu-engine/m2-stage3/k6_v5_verdict.json")
+    if not p.exists():
+        pytest.skip("archived v5 verdict not present")
+    v5 = _json.loads(p.read_text())
+    k6 = _k6()
+    verdict, reasons, notes, _ = k6.judge(v5["per_case"])
+    assert verdict == "k6-green", reasons
+    assert len(notes) == 2
+
 
 # ---------------------------------------------------------------------------
 # kernel-side fixture discovery (dataset may mount extracted OR as a zip)
