@@ -1,0 +1,15 @@
+{
+  "id": "weijianxue/diar-m2-tail-fixture",
+  "title": "diar-m2-tail-fixture",
+  "code_file": "m2_tail_fixture.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaP100",
+  "dataset_sources": [
+    "weijianxue/diar-gpu-engine-harness",
+    "weijianxue/diar-real-audio-5"
+  ]
+}
