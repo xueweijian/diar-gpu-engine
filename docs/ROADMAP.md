@@ -49,6 +49,13 @@ delivery moved to [M3-P100-CUDA-PLAN.md](M3-P100-CUDA-PLAN.md).
 
 ## M3 — P100 optimization
 
+**Stage 1 OPEN (2026-09-19):** per-stage profiler landed (`DIAR_PROFILE_STAGE`,
+12 taps, zero behavior change pinned by tests) — kernel
+`weijianxue/diar-m3-stage1-prof` (m3prof gate) runs the real d=512 engine
+over the short reference; delivers the top-3/5 operator coverage table for
+the port order. Entry discipline: `embed_stage3.py` → `build_k6_entry.py` →
+`build_m3_entry.py` before every push.
+
 Optimize only after M2 parity is green:
 
 1. Profile end-to-end and neural-core boundaries separately.
