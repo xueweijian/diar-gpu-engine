@@ -36,6 +36,7 @@ import sys
 import time
 import traceback
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -221,6 +222,9 @@ def main() -> int:
     ap.add_argument("--gguf", required=True)
     ap.add_argument("--fixtures-dir", required=True)
     ap.add_argument("--cases", default="")
+    ap.add_argument("--jobs", type=int, default=4,
+                    help="parallel case runners (independent processes; "
+                         "results are bit-identical to sequential)")
     ap.add_argument("--audio-roots", default="/kaggle/input,/kaggle/working")
     ap.add_argument("--out", default=str(OUT / "m2_stage3_k6_verdict.json"))
     args = ap.parse_args()
@@ -261,12 +265,34 @@ def main() -> int:
 
     per_case: dict[str, dict] = {}
     t0 = time.time()
-    for d in case_dirs:
+
+    def _one(d: Path) -> tuple[str, dict]:
         try:
-            per_case[d.name] = run_case(d.name, d, runner, gguf, roots, WORK)
+            return d.name, run_case(d.name, d, runner, gguf, roots, WORK)
         except Exception as exc:  # a FAIL is data; keep the other cases
             traceback.print_exc()
-            per_case[d.name] = {"error": f"{type(exc).__name__}: {exc}"}
+            return d.name, {"error": f"{type(exc).__name__}: {exc}"}
+
+    # Long cases first (a chunked mid case costs ~n_frames forwards; the
+    # full-offline case is one full-attention forward, far cheaper) so the
+    # critical path starts immediately when workers < cases.
+    def _cost(d: Path) -> float:
+        man = json.loads((d / "manifest.json").read_text())
+        _argv, which = classify(man)
+        n_frames = float(man["observation"]["n_frames"])
+        return n_frames * (1.0 if which == "postgate" else 0.15)
+
+    ordered = sorted(case_dirs, key=_cost, reverse=True)
+    n_workers = max(1, min(args.jobs, len(ordered)))
+    print(f"[k6] cases={[d.name for d in ordered]} workers={n_workers}",
+          flush=True)
+    REPORT["workers"] = n_workers
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futs = {ex.submit(_one, d): d.name for d in ordered}
+        for fut in as_completed(futs):
+            name, res = fut.result()
+            per_case[name] = res
+            print(f"[k6] done {name} (t+{time.time() - t0:.0f}s)", flush=True)
     per_case = dict(sorted(per_case.items()))
     REPORT["per_case"] = per_case
     REPORT["seconds"] = round(time.time() - t0, 1)

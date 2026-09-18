@@ -38,6 +38,7 @@ import json
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -85,9 +86,38 @@ def run_runner(runner: Path, args: list[str], timeout: int = 3600) -> subprocess
     return subprocess.run([str(runner), *args], capture_output=True, text=True, timeout=timeout)
 
 
+def run_feed(label: str, feed: str, runner: Path, dfw1: Path, work: Path,
+             pcm: Path, n_spk: int, offline: bool = False) -> tuple[str, dict]:
+    """Run ONE feed of one case (the unit of parallelism).
+
+    Each job is an independent k5_runner process writing its own
+    <label>_<feed>.* files, so jobs are order-free and bit-identical to
+    running them sequentially (same binary, same inputs).
+    """
+    prefix = str(work / f"{label}_{feed}")
+    args = ["--run", "--weights", str(dfw1), "--audio", str(pcm),
+            "--out", prefix, "--feed", feed]
+    if offline:
+        args.append("--offline")
+    p = run_runner(runner, args)
+    if p.returncode != 0:
+        return feed, {"error": f"runner rc={p.returncode}: {(p.stderr or p.stdout)[-400:]}"}
+    return feed, {
+        "meta": json.loads(Path(prefix + ".meta.json").read_text()),
+        "ledger": json.loads(Path(prefix + ".ledger.json").read_text()),
+        "aosc_index": json.loads(Path(prefix + ".aosc.json").read_text()),
+        "aosc_f32": prefix + ".aosc.f32",
+        "pregate": np.fromfile(prefix + ".pregate.f32", dtype="<f4").reshape(-1, n_spk),
+    }
+
+
 def compare_audio(label: str, z, runner: Path, dfw1: Path, work: Path,
-                  n_spk: int, offline: bool = False) -> dict:
-    """Free-run one npz case and gate it. Returns the report subtree."""
+                  n_spk: int, offline: bool = False, runs: dict | None = None) -> dict:
+    """Free-run one npz case and gate it. Returns the report subtree.
+
+    ``runs`` may carry pre-executed {feed: run-record} (parallel driver);
+    when None the feeds run sequentially here (legacy path / tests).
+    """
     audio = np.asarray(z["audio"], dtype=np.float32)
     tp = np.asarray(z["total_preds"], dtype=np.float64)
     geometry = [int(v) for v in z["geometry"]]
@@ -97,22 +127,14 @@ def compare_audio(label: str, z, runner: Path, dfw1: Path, work: Path,
     pcm = work / f"{label}.f32"
     pcm.write_bytes(np.ascontiguousarray(audio, dtype="<f4").tobytes())
 
-    runs: dict[str, dict] = {}
-    for feed in ("whole", "drip"):
-        prefix = str(work / f"{label}_{feed}")
-        args = ["--run", "--weights", str(dfw1), "--audio", str(pcm),
-                "--out", prefix, "--feed", feed]
-        if offline:
-            args.append("--offline")
-        p = run_runner(runner, args)
-        if p.returncode != 0:
-            return {"error": f"runner rc={p.returncode}: {(p.stderr or p.stdout)[-400:]}"}
-        runs[feed] = {
-            "meta": json.loads(Path(prefix + ".meta.json").read_text()),
-            "ledger": json.loads(Path(prefix + ".ledger.json").read_text()),
-            "aosc_index": json.loads(Path(prefix + ".aosc.json").read_text()),
-            "pregate": np.fromfile(prefix + ".pregate.f32", dtype="<f4").reshape(-1, n_spk),
-        }
+    if runs is None:
+        runs = {}
+        for feed in ("whole", "drip"):
+            feed, rec = run_feed(label, feed, runner, dfw1, work, pcm, n_spk, offline)
+            runs[feed] = rec
+    for rec in runs.values():
+        if "error" in rec:
+            return {"error": rec["error"]}
 
     ours = runs["whole"]["pregate"]
     ledger = runs["whole"]["ledger"]
@@ -184,7 +206,11 @@ def compare_audio(label: str, z, runner: Path, dfw1: Path, work: Path,
     # ---- G3 AOSC state embeddings ----
     aosc = []
     snaps = runs["whole"]["aosc_index"]
-    blob = np.fromfile(str(work / f"{label}_whole.aosc.f32"), dtype="<f4")
+    # Blob path travels WITH the run record (label-derived fallback keeps
+    # older callers working): the parallel driver's runs may have been
+    # executed under a different label than this comparison's.
+    blob_path = runs["whole"].get("aosc_f32", str(work / f"{label}_whole.aosc.f32"))
+    blob = np.fromfile(blob_path, dtype="<f4")
     state_geometry_ok = True
     for i, (snap, ci) in enumerate(zip(snaps, [f"chunk{c:03d}" for c in range(len(snaps))])):
         entry: dict = {"chunk": i}
@@ -266,6 +292,10 @@ def main() -> int:
     ap.add_argument("--dfw1", required=True)
     ap.add_argument("--ref-dir", required=True)
     ap.add_argument("--labels", default="short,mid")
+    ap.add_argument("--jobs", type=int, default=4,
+                    help="parallel k5_runner processes (each run is an "
+                         "independent process; results are bit-identical "
+                         "to sequential execution)")
     ap.add_argument("--out", default=str(OUT / "m2_stage3_k5a_verdict.json"))
     args = ap.parse_args()
 
@@ -287,19 +317,67 @@ def main() -> int:
         _emit(args.out)
         return 0
 
-    per_audio: dict[str, dict] = {}
-    for label in args.labels.split(","):
+    WORK.mkdir(parents=True, exist_ok=True)
+    labels = [lb for lb in args.labels.split(",")]
+    zs: dict[str, object] = {}
+    for label in labels:
         zpath = ref_dir / f"m2_ref_{label}.npz"
-        if not zpath.exists():
-            per_audio[label] = {"error": f"missing {zpath}"}
+        if zpath.exists():
+            zs[label] = load_npz(zpath)
+
+    # ---- parallel driver: one job per (label, feed) ----
+    # Jobs are independent processes; long audio first so the critical path
+    # starts immediately even when workers < jobs.
+    jobs: list[tuple[str, str]] = []
+    pcm_paths: dict[str, Path] = {}
+    for label in labels:
+        z = zs.get(label)
+        if z is None:
             continue
-        z = load_npz(zpath)
+        audio = np.asarray(z["audio"], dtype=np.float32)
+        pcm = WORK / f"{label}.f32"
+        pcm.write_bytes(np.ascontiguousarray(audio, dtype="<f4").tobytes())
+        pcm_paths[label] = pcm
+        jobs += [(label, "whole"), (label, "drip")]
+    jobs.sort(key=lambda j: -(pcm_paths[j[0]].stat().st_size))
+    n_workers = max(1, min(args.jobs, len(jobs)))
+    print(f"[k5a] jobs={len(jobs)} workers={n_workers} "
+          f"({', '.join(f'{lb}/{fd}' for lb, fd in jobs)})", flush=True)
+    REPORT["jobs"] = [{"label": lb, "feed": fd} for lb, fd in jobs]
+    REPORT["workers"] = n_workers
+
+    runs_by_label: dict[str, dict] = {lb: {} for lb in pcm_paths}
+    t0_all = time.time()
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futs = {}
+        for label, feed in jobs:
+            z = zs[label]
+            n_spk = int(np.asarray(z["total_preds"]).shape[1])
+            futs[ex.submit(run_feed, label, feed, runner, dfw1, WORK,
+                           pcm_paths[label], n_spk, False)] = (label, feed)
+        for fut in as_completed(futs):
+            label, feed = futs[fut]
+            try:
+                feed_name, rec = fut.result()
+                runs_by_label[label][feed_name] = rec
+            except Exception as exc:  # keep the other jobs' results
+                runs_by_label[label][feed] = {"error": f"{type(exc).__name__}: {exc}"}
+            print(f"[k5a] done {label}/{feed} "
+                  f"(t+{time.time() - t0_all:.0f}s)", flush=True)
+
+    per_audio: dict[str, dict] = {}
+    for label in labels:
+        if label not in zs:
+            per_audio[label] = {"error": f"missing {ref_dir / f'm2_ref_{label}.npz'}"}
+            continue
+        z = zs[label]
         n_spk = int(np.asarray(z["total_preds"]).shape[1])
-        WORK.mkdir(parents=True, exist_ok=True)
         t0 = time.time()
-        per_audio[label] = compare_audio(label, z, runner, dfw1, WORK, n_spk)
+        per_audio[label] = compare_audio(label, z, runner, dfw1, WORK, n_spk,
+                                         runs=runs_by_label[label])
         per_audio[label]["seconds"] = round(time.time() - t0, 1)
     REPORT["per_audio"] = per_audio
+    REPORT["runner_wall_seconds"] = round(time.time() - t0_all, 1)
 
     # ---- verdict ----
     reasons: list[str] = []

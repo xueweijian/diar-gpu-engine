@@ -189,6 +189,92 @@ def cmd_datasets_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_kernels_live_log(args: argparse.Namespace) -> int:
+    """Stream a kernel's live log over SSE (api channel).
+
+    Works while the session is RUNNING (proxied upstream feed, END_OF_LOG
+    sentinel) and falls back to the persisted blob once it is done. Exits
+    after --seconds so callers are never blocked on a long tail. Reconnects
+    on idle socket timeouts; the server replays from the start, so events
+    already seen are skipped by count (same strategy as the CLI --follow).
+    """
+    import time as _time
+    token = os.environ["KAGGLE_API_TOKEN"]
+    path = f"/v1/kernels/logs/stream/{args.ref}"
+    url = f"https://{API_IP}{path}"
+    headers = {
+        "Host": API_HOST,
+        "Authorization": f"Bearer {token}",
+        "Accept": "text/event-stream, */*",
+        "User-Agent": "kaggle-api/v1.7.0",
+    }
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    deadline = _time.time() + args.seconds
+    seen = 0          # data events already printed (server replays on reconnect)
+    idle_reconnects = 0
+
+    def _print_event(ev: dict) -> None:
+        t = ev.get("time")
+        data = ev.get("data", "")
+        if isinstance(t, (int, float)):
+            print(f"[{t:9.1f}] {data}", end="", flush=True)
+        else:
+            print(data, end="", flush=True)
+
+    while _time.time() < deadline:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=45, context=ctx) as resp:
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if seen == 0:
+                    print(f"# content-type: {ctype}", file=sys.stderr)
+                got = 0
+                while True:
+                    if _time.time() > deadline:
+                        print("# (time limit reached)", file=sys.stderr)
+                        return 0
+                    raw = resp.readline()
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", "replace").rstrip("\n")
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if payload == "END_OF_LOG":
+                        print("# END_OF_LOG", file=sys.stderr)
+                        return 0
+                    try:
+                        ev = json.loads(payload)
+                    except ValueError:
+                        ev = {"data": payload}
+                    got += 1
+                    if got <= seen:
+                        continue          # replay overlap
+                    seen = got
+                    if isinstance(ev, dict):
+                        _print_event(ev)
+                    else:
+                        print(ev)
+                if got == 0 and seen == 0 and ctype and "event-stream" not in ctype:
+                    # persisted blob served in one shot; anything above is all
+                    return 0
+        except urllib.error.HTTPError as e:
+            print(f"HTTP {e.code}: {e.read()[:300]!r}", file=sys.stderr)
+            return 1
+        except (TimeoutError, OSError) as e:
+            idle_reconnects += 1
+            if idle_reconnects > args.max_reconnects:
+                print(f"# giving up after {idle_reconnects} reconnects ({e})",
+                      file=sys.stderr)
+                return 0
+            _time.sleep(2)
+            continue
+    print("# (time limit reached)", file=sys.stderr)
+    return 0
+
+
 def cmd_kernels_push(args: argparse.Namespace) -> int:
     folder = args.folder
     meta = json.load(open(os.path.join(folder, "kernel-metadata.json"), encoding="utf-8"))
@@ -256,6 +342,11 @@ def main() -> int:
     p = sub.add_parser("datasets-status")
     p.add_argument("--ref", required=True)
     p.set_defaults(fn=cmd_datasets_status)
+    p = sub.add_parser("kernels-live-log")
+    p.add_argument("--ref", required=True)
+    p.add_argument("--seconds", type=int, default=30)
+    p.add_argument("--max-reconnects", type=int, default=8)
+    p.set_defaults(fn=cmd_kernels_live_log)
     args = ap.parse_args()
     return args.fn(args)
 

@@ -303,49 +303,33 @@ def test_k5a_metrics_hand_case():
 # typos die here, not on Kaggle. All gates must come back green (identity
 # comparison) except informational fields.
 # ---------------------------------------------------------------------------
-def test_k5a_dress_rehearsal(tmp_path):
-    import importlib
-    k5a = importlib.import_module("m2_stage3_k5a")
-    runner = _runner()
-
+def _tiny_case_inputs(tmp_path, runner):
+    """Tiny DFW1 + 3 s audio (shared by the rehearsal and parallel tests)."""
     wpath = tmp_path / "tiny.dfw1"
-    # Reuse the selftest's own writer through the runner (keeps one writer).
     subprocess.run([str(runner), "--selftest"], check=True, capture_output=True,
                    timeout=120)
     src = Path("/tmp/k5_selftest.dfw1")
     assert src.exists()
     wpath.write_bytes(src.read_bytes())
 
-    # 3 s sine mix: 2 chunks (full 20-frame chunk0 + 18-frame tail), so the
-    # G1 20-row gate and multi-chunk G3 walk are both exercised.
     n = 48000
     t = np.arange(n) / 16000.0
     audio = (0.3 * np.sin(2 * np.pi * 220 * t) + 0.2 * np.sin(2 * np.pi * 331 * t + 0.7)
              + 0.1 * np.sin(2 * np.pi * 517 * t + 1.3)).astype(np.float32)
+    return wpath, audio
 
-    pcm = tmp_path / "audio.f32"
-    pcm.write_bytes(np.ascontiguousarray(audio, dtype="<f4").tobytes())
-    prefix = str(tmp_path / "rehearsal")
-    p = subprocess.run([str(runner), "--run", "--weights", str(wpath),
-                        "--audio", str(pcm), "--out", prefix,
-                        "--feed", "whole"],
-                       capture_output=True, text=True, timeout=300)
-    assert p.returncode == 0, p.stderr[-400:]
 
-    ours = np.fromfile(prefix + ".pregate.f32", dtype="<f4").reshape(-1, 4)
-    ledger = json.loads(Path(prefix + ".ledger.json").read_text())
-    aosc_index = json.loads(Path(prefix + ".aosc.json").read_text())
-    blob = np.fromfile(prefix + ".aosc.f32", dtype="<f4")
+def _synthetic_ref_npz(audio, whole_run):
+    """NeMo-shaped npz: reference == ours PLUS one all-zero phantom pad row."""
+    ours = whole_run["pregate"]
+    ledger = whole_run["ledger"]
+    aosc_index = whole_run["aosc_index"]
     emb_dim = 16  # tiny cfg d_model
-
-    # Synthetic npz: reference == ours PLUS one python-NeMo phantom pad row
-    # (all-zero) on the final chunk, plus the state keys the G5 derivation
-    # reads (feat_length/state_lens_before/preds_full on the last chunk).
+    blob = whole_run["aosc_blob"]
     phantom = np.zeros((1, 4), dtype=np.float64)
     tp = np.concatenate([ours.astype(np.float64), phantom], axis=0)
     last = ledger[-1]
     ci_last = f"chunk{last['chunk']:03d}"
-    # final window rows = state_lens_before[0] + [1] + t3 (window geometry)
     z: dict = {
         "audio": audio,
         "total_preds": tp,
@@ -371,6 +355,40 @@ def test_k5a_dress_rehearsal(tmp_path):
         z[f"{ci}/fifo_after"] = fifo
         z[f"{ci}/mean_sil_emb_after"] = mean
         z[f"{ci}/n_sil_frames_after"] = np.array([snap["silence_frames"]])
+    return z
+
+
+def _run_feeds(label, feeds, runner, wpath, tmp_path, audio):
+    """Execute the requested feeds (in parallel threads, like the kernel
+    driver) and return the runs dict incl. the aosc blob."""
+    import importlib
+    k5a = importlib.import_module("m2_stage3_k5a")
+    pcm = tmp_path / "audio.f32"
+    pcm.write_bytes(np.ascontiguousarray(audio, dtype="<f4").tobytes())
+    runs: dict = {}
+
+    def _one(feed):
+        _, rec = k5a.run_feed(label, feed, runner, wpath, tmp_path, pcm, 4)
+        prefix = str(tmp_path / f"{label}_{feed}")
+        rec["aosc_blob"] = np.fromfile(prefix + ".aosc.f32", dtype="<f4")
+        return feed, rec
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(feeds)) as ex:
+        for feed, rec in ex.map(_one, feeds):
+            runs[feed] = rec
+    return runs
+
+
+def test_k5a_dress_rehearsal(tmp_path):
+    """Legacy sequential path (runs=None) on the synthetic NeMo-shaped case:
+    every gate green except informational fields."""
+    import importlib
+    k5a = importlib.import_module("m2_stage3_k5a")
+    runner = _runner()
+    wpath, audio = _tiny_case_inputs(tmp_path, runner)
+    runs = _run_feeds("rehearsal", ["whole"], runner, wpath, tmp_path, audio)
+    z = _synthetic_ref_npz(audio, runs["whole"])
 
     r = k5a.compare_audio("tiny", z, runner, wpath, tmp_path, n_spk=4)
     assert "error" not in r, r.get("error")
@@ -385,3 +403,31 @@ def test_k5a_dress_rehearsal(tmp_path):
     assert r["G5_length"]["phantom_rows"] == 1
     assert r["G5_length"]["phantom_all_zero"] is True
     assert r["G6_determinism"]["bit_identical"] is True
+
+
+def test_k5a_parallel_runs_match_sequential(tmp_path):
+    """The kernel driver's path (both feeds pre-run CONCURRENTLY, passed as
+    runs=) yields a verdict identical to the legacy sequential path."""
+    import importlib
+    k5a = importlib.import_module("m2_stage3_k5a")
+    runner = _runner()
+    wpath, audio = _tiny_case_inputs(tmp_path, runner)
+
+    par_runs = _run_feeds("par", ["whole", "drip"], runner, wpath, tmp_path, audio)
+    assert all("error" not in rec for rec in par_runs.values())
+    seq_runs = _run_feeds("seq", ["whole", "drip"], runner, wpath, tmp_path, audio)
+    assert all("error" not in rec for rec in seq_runs.values())
+
+    # concurrent feeds must produce byte-identical artifacts (same prefix
+    # files would collide otherwise; distinct labels keep them apart)
+    for feed in ("whole", "drip"):
+        np.testing.assert_array_equal(par_runs[feed]["pregate"],
+                                      seq_runs[feed]["pregate"])
+
+    z = _synthetic_ref_npz(audio, par_runs["whole"])
+    r_par = k5a.compare_audio("tiny", z, runner, wpath, tmp_path, n_spk=4,
+                              runs=par_runs)
+    r_seq = k5a.compare_audio("tiny", z, runner, wpath, tmp_path, n_spk=4)
+    assert "error" not in r_par and "error" not in r_seq
+    assert json.dumps(r_par, sort_keys=True) == json.dumps(r_seq, sort_keys=True)
+    assert r_par["G6_determinism"]["bit_identical"] is True
