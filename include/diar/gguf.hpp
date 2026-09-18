@@ -14,9 +14,15 @@
 //
 // DFW1 is our own fp32 container (K5-A truth anchor: .nemo -> fp32 dump
 // written in-kernel by kaggle/m2_stage3/f32bin_writer.py):
-//   u32 magic 'DFW1', u32 version=1, u32 n_tensors,
+//   u32 magic 'DFW1', u32 version, then
+//   version 1: u32 n_tensors, tensors...
+//   version 2: u32 n_cfg, n_cfg x {u32 key_len, key, u32 val_len, val},
+//              u32 n_tensors, tensors...   (text config pairs; typed at read)
 //   per tensor: u32 name_len, name bytes, u32 ndim, u32 dims[ndim]
 //               (row-major, dims[0] = outermost), u64 n_floats, f32 data.
+// The v2 config section mirrors the GGUF sortformer.* KVs (same keys), so a
+// small-config dump is self-describing and the binding layer can validate
+// tiny test containers. v1 files carry no config: all defaults.
 // All integers little-endian.
 
 #include <cstdint>
@@ -56,6 +62,8 @@ public:
     const GgufTensor* find(const std::string& name) const;
     const GgufTensor& at(const std::string& name) const;  // throws on miss
     std::size_t tensor_count() const { return tensors_.size(); }
+    // All tensor names, file order (bidirectional coverage in callers).
+    std::vector<std::string> tensor_names() const;
 
 private:
     std::unordered_map<std::string, std::size_t> index_;
@@ -78,10 +86,19 @@ public:
     const F32Tensor* find(const std::string& name) const;
     const F32Tensor& at(const std::string& name) const;  // throws on miss
     std::size_t tensor_count() const { return tensors_.size(); }
+    std::vector<std::string> tensor_names() const;
+
+    // v2 config section accessors (same key namespace as the GGUF
+    // sortformer.* KVs). v1 files have no config: has_kv is always false.
+    bool has_kv(const std::string& key) const;
+    std::uint32_t kv_u32(const std::string& key) const;
+    float kv_f32(const std::string& key) const;
+    std::string kv_string(const std::string& key) const;
 
 private:
     std::unordered_map<std::string, std::size_t> index_;
     std::vector<F32Tensor> tensors_;
+    std::unordered_map<std::string, std::string> cfg_;
 };
 
 // IEEE-754 half -> float (handles zero/subnormal/inf/nan). Exposed for tests.

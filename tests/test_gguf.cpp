@@ -317,6 +317,58 @@ void test_dfw1_roundtrip() {
     expect(threw, "dfw1 bad magic throws");
 }
 
+void test_dfw1_v2_config() {
+    const auto build_v2 = [](const std::vector<std::pair<std::string, std::string>>& cfg) {
+        std::vector<std::uint8_t> b;
+        put_u32(b, 0x31574644u);  // DFW1
+        put_u32(b, 2);
+        put_u32(b, static_cast<std::uint32_t>(cfg.size()));
+        for (const auto& kv : cfg) {
+            put_u32(b, static_cast<std::uint32_t>(kv.first.size()));
+            b.insert(b.end(), kv.first.begin(), kv.first.end());
+            put_u32(b, static_cast<std::uint32_t>(kv.second.size()));
+            b.insert(b.end(), kv.second.begin(), kv.second.end());
+        }
+        put_u32(b, 0);  // 0 tensors
+        return std::string(b.begin(), b.end());
+    };
+    const diar::F32WeightFile f = diar::F32WeightFile::load(write_temp(build_v2(
+        {{"sortformer.encoder.d_model", "512"},
+            {"sortformer.encoder.xscaling", "1"},
+            {"sortformer.scoring.sil_threshold", "0.2"}})));
+    expect(f.has_kv("sortformer.encoder.d_model") && !f.has_kv("absent"), "dfw1 v2 has_kv");
+    expect(f.kv_u32("sortformer.encoder.d_model") == 512, "dfw1 v2 kv_u32");
+    expect(f.kv_u32("sortformer.encoder.xscaling") == 1, "dfw1 v2 numeric bool text");
+    expect_near(f.kv_f32("sortformer.scoring.sil_threshold"), 0.2, 1e-6, "dfw1 v2 kv_f32");
+    expect(f.kv_string("sortformer.encoder.xscaling") == "1", "dfw1 v2 kv_string");
+    bool threw = false;
+    try {
+        (void)f.kv_u32("sortformer.scoring.sil_threshold");  // "0.2" is not a u32
+    } catch (const diar::WeightFileError&) { threw = true; }
+    expect(threw, "dfw1 v2 typed parse rejects non-u32 text");
+    threw = false;
+    try {
+        (void)f.kv_u32("missing.key");
+    } catch (const diar::WeightFileError&) { threw = true; }
+    expect(threw, "dfw1 v2 missing key throws");
+    expect(f.tensor_count() == 0, "dfw1 v2 zero tensors ok");
+
+    // duplicate config key rejected at load; v1 keeps has_kv == false
+    threw = false;
+    try {
+        diar::F32WeightFile::load(write_temp(build_v2(
+            {{"k", "1"}, {"k", "2"}})));
+    } catch (const diar::WeightFileError& e) {
+        threw = std::string(e.what()).find("duplicate") != std::string::npos;
+    }
+    expect(threw, "dfw1 v2 duplicate key rejected");
+    std::vector<std::uint8_t> v1;
+    put_u32(v1, 0x31574644u); put_u32(v1, 1); put_u32(v1, 0);
+    const diar::F32WeightFile f1 =
+        diar::F32WeightFile::load(write_temp(std::string(v1.begin(), v1.end())));
+    expect(!f1.has_kv("anything"), "dfw1 v1 has no config");
+}
+
 }  // namespace
 
 int main() {
@@ -326,6 +378,7 @@ int main() {
     test_bad_magic_and_truncation();
     test_half_to_float_edges();
     test_dfw1_roundtrip();
+    test_dfw1_v2_config();
     for (const std::string& p : temp_paths()) std::remove(p.c_str());
     std::cout << "PASS: gguf/dfw1 weight reader tests\n";
     return 0;

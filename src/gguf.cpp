@@ -269,10 +269,25 @@ F32WeightFile F32WeightFile::load(const std::string& path) {
     const std::vector<std::uint8_t> bytes = slurp(path);
     Cursor c{bytes.data(), bytes.data() + bytes.size()};
     if (c.u32("magic") != 0x31574644u) bad("not a DFW1 file (bad magic): " + path);
-    if (c.u32("version") != 1) bad("unsupported DFW1 version");
-    const std::uint32_t n_tensors = c.u32("tensor count");
+    const std::uint32_t version = c.u32("version");
+    if (version != 1 && version != 2) bad("unsupported DFW1 version");
 
     F32WeightFile f;
+    if (version == 2) {
+        const std::uint32_t n_cfg = c.u32("config pair count");
+        for (std::uint32_t i = 0; i < n_cfg; i++) {
+            std::string key, val;
+            for (int which = 0; which < 2; which++) {
+                const std::uint32_t len = c.u32(which ? "value len" : "key len");
+                c.need(len, which ? "config value" : "config key");
+                std::string& dst = which ? val : key;
+                dst.assign(reinterpret_cast<const char*>(c.p), len);
+                c.p += len;
+            }
+            if (!f.cfg_.emplace(key, val).second) bad("duplicate config key '" + key + "'");
+        }
+    }
+    const std::uint32_t n_tensors = c.u32("tensor count");
     f.tensors_.resize(n_tensors);
     for (std::uint32_t i = 0; i < n_tensors; i++) {
         F32Tensor& t = f.tensors_[i];
@@ -311,6 +326,60 @@ const F32Tensor& F32WeightFile::at(const std::string& name) const {
         bad("missing tensor '" + name + "'; have:" + have);
     }
     return *t;
+}
+
+}  // namespace diar
+
+namespace diar {
+std::vector<std::string> GgufFile::tensor_names() const {
+    std::vector<std::string> names;
+    names.reserve(tensors_.size());
+    for (const GgufTensor& t : tensors_) names.push_back(t.name);
+    return names;
+}
+
+std::vector<std::string> F32WeightFile::tensor_names() const {
+    std::vector<std::string> names;
+    names.reserve(tensors_.size());
+    for (const F32Tensor& t : tensors_) names.push_back(t.name);
+    return names;
+}
+
+bool F32WeightFile::has_kv(const std::string& key) const {
+    return cfg_.find(key) != cfg_.end();
+}
+
+std::uint32_t F32WeightFile::kv_u32(const std::string& key) const {
+    const auto it = cfg_.find(key);
+    if (it == cfg_.end()) throw WeightFileError("DFW1 config missing key: " + key);
+    try {
+        std::size_t used = 0;
+        const unsigned long v = std::stoul(it->second, &used, 10);
+        if (used != it->second.size() || v > 0xFFFFFFFFul)
+            throw std::invalid_argument("range");
+        return static_cast<std::uint32_t>(v);
+    } catch (const std::exception&) {
+        throw WeightFileError("DFW1 config key '" + key + "' is not a u32: '" + it->second + "'");
+    }
+}
+
+float F32WeightFile::kv_f32(const std::string& key) const {
+    const auto it = cfg_.find(key);
+    if (it == cfg_.end()) throw WeightFileError("DFW1 config missing key: " + key);
+    try {
+        std::size_t used = 0;
+        const float v = std::stof(it->second, &used);
+        if (used != it->second.size()) throw std::invalid_argument("trailing");
+        return v;
+    } catch (const std::exception&) {
+        throw WeightFileError("DFW1 config key '" + key + "' is not an f32: '" + it->second + "'");
+    }
+}
+
+std::string F32WeightFile::kv_string(const std::string& key) const {
+    const auto it = cfg_.find(key);
+    if (it == cfg_.end()) throw WeightFileError("DFW1 config missing key: " + key);
+    return it->second;
 }
 
 }  // namespace diar
