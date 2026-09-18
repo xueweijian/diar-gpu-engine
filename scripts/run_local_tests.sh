@@ -39,6 +39,15 @@ ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   -I"$ROOT/include" "$ROOT/src/gguf.cpp" "$ROOT/tests/test_gguf.cpp" -o "$BUILD/test_gguf"
 "$BUILD/test_gguf"
+NN_SRC="$ROOT/src/nn.cpp $ROOT/src/layers.cpp $ROOT/src/mha.cpp $ROOT/src/conv.cpp $ROOT/src/conformer.cpp $ROOT/src/subsampling.cpp $ROOT/src/posenc.cpp"
+${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
+  -I"$ROOT/include" -I"$ROOT/tests" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" $NN_SRC "$ROOT/tests/test_sortformer_weights.cpp" -o "$BUILD/test_sortformer_weights"
+"$BUILD/test_sortformer_weights"
+${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
+  -I"$ROOT/include" -I"$ROOT/tests" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" $NN_SRC "$ROOT/tests/test_sortformer_forward.cpp" -o "$BUILD/test_sortformer_forward"
+"$BUILD/test_sortformer_forward"
+${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
+  -I"$ROOT/include" -I"$ROOT/tests" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" $NN_SRC "$ROOT/tools/dump_forward.cpp" -o "$BUILD/diar_dump_forward"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   "$ROOT/tests/probdump_oracle.cpp" -o "$BUILD/probdump_oracle"
 "$BUILD/probdump_oracle"

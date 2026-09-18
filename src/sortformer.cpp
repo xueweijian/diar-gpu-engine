@@ -3,6 +3,7 @@
 #include "diar/sortformer.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -184,8 +185,7 @@ std::vector<SortformerWeights::Slot> SortformerWeights::collect_slots(
     const std::uint64_t D = c.d_model, C = c.subsampling_conv_channels,
                        F = c.feat_in, K = c.conv_kernel, H = c.encoder_heads,
                        DK = D / H, FF = c.encoder_d_ff, X = c.transformer_hidden,
-                       I = c.transformer_inner, TH = c.transformer_heads,
-                       SPK = c.num_speakers;
+                       I = c.transformer_inner, SPK = c.num_speakers;
     const std::uint64_t fbins = subsampling_freq_bins(c.feat_in, c.subsampling_factor);
 
     // ---- stem (encoder.pre_encode.*, indices conv.{0,2,3,5,6}) ----
@@ -398,6 +398,123 @@ SortformerWeights SortformerWeights::load(const std::string& path) {
 
     w.bound_ = bound;
     return w;
+}
+
+
+
+// ---------------------------------------------------------------------------
+// 3.2b forward assembly — order pinned in sortformer.hpp.
+int sortformer_subsampled_len(int t_mel, int subsampling_factor) {
+    if (t_mel <= 0) return 0;  // C++ trunc-div would say 1 here; python floor says 0
+    int stages = 0;
+    for (int f = subsampling_factor; f > 1; f >>= 1) ++stages;
+    int len = t_mel;
+    for (int s = 0; s < stages; ++s) len = (len + 2 * 1 - 3) / 2 + 1;  // k3 s2 p1
+    return len;
+}
+
+SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat_len,
+    const float* spkcache, int spkcache_frames, const float* fifo, int fifo_frames,
+    const SortformerWeights& w, TapSink* taps) {
+    const SortformerConfig& c = w.config();
+    const int D = c.d_model, X = c.transformer_hidden, SPK = c.num_speakers;
+    const int T3 = sortformer_subsampled_len(t_mel, c.subsampling_factor);
+    const int L = spkcache_frames + fifo_frames + T3;
+
+    SortformerChunkOutput out;
+    out.total_frames = L;
+    out.chunk_frames = T3;
+    if (L <= 0) return out;
+
+    // 1) stem — raw pre-encode embeddings (chunk_embs BEFORE any scaling)
+    out.chunk_embs.resize(static_cast<std::size_t>(T3) * D);
+    if (T3 > 0)
+        subsampling_forward(mel, w.stem(), out.chunk_embs.data(), t_mel, c.feat_in,
+            c.subsampling_conv_channels, D, feat_len);
+    if (taps && T3 > 0) taps->tap("stem.out", out.chunk_embs.data(), T3, D);
+
+    // 2) concat [spkcache | fifo | chunk]
+    std::vector<float> x(static_cast<std::size_t>(L) * D);
+    {
+        float* dst = x.data();
+        if (spkcache_frames > 0) {
+            std::memcpy(dst, spkcache, sizeof(float) * spkcache_frames * D);
+            dst += static_cast<std::size_t>(spkcache_frames) * D;
+        }
+        if (fifo_frames > 0) {
+            std::memcpy(dst, fifo, sizeof(float) * fifo_frames * D);
+            dst += static_cast<std::size_t>(fifo_frames) * D;
+        }
+        if (T3 > 0)
+            std::memcpy(dst, out.chunk_embs.data(), sizeof(float) * T3 * D);
+    }
+    if (taps) taps->tap("concat.raw", x.data(), L, D);
+
+    // 3) xscale on the whole concat (state prefix included)
+    if (c.xscaling) {
+        const float scale = std::sqrt(static_cast<float>(D));
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] *= scale;  // element-wise
+        if (taps) taps->tap("xscaled", x.data(), L, D);
+    }
+
+    // 4) rel-pos table: slice the stored GGUF table exactly like production,
+    //    or rebuild by the pinned formula (DFW1 route).
+    if (L > c.pos_emb_max_len)
+        throw std::invalid_argument(
+            "sortformer_run_chunk: L=" + std::to_string(L) + " exceeds pos_emb_max_len=" +
+            std::to_string(c.pos_emb_max_len) + " (upstream validate_stream_geometry guard)");
+    std::vector<float> pe(static_cast<std::size_t>(2 * L - 1) * D);
+    if (w.pe_table() != nullptr) {
+        const int center = w.pe_rows() / 2 + 1;  // v12 live probe pin
+        std::memcpy(pe.data(), w.pe_table() + static_cast<std::size_t>(center - L) * D,
+            sizeof(float) * (2 * L - 1) * D);
+    } else {
+        relpos_table_forward(pe.data(), L, D);
+    }
+    if (taps) taps->tap("pos_emb", pe.data(), 2 * L - 1, D);
+
+    // 5) conformer chain (ping-pong)
+    std::vector<float> y(static_cast<std::size_t>(L) * D);
+    float* cur = x.data();
+    float* nxt = y.data();
+    for (int i = 0; i < c.encoder_layers; ++i) {
+        conformer_layer_forward(cur, pe.data(), w.conformer(i), nxt, L, D, c.encoder_d_ff,
+            c.encoder_heads, c.conv_kernel);
+        std::swap(cur, nxt);
+        if (taps) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "conformer.%d", i);
+            taps->tap(name, cur, L, D);
+        }
+    }
+
+    // 6) encoder_proj
+    std::vector<float> px(static_cast<std::size_t>(L) * X);
+    nn::linear_forward(cur, w.proj_w(), w.proj_b(), px.data(), static_cast<std::size_t>(L),
+        static_cast<std::size_t>(D), static_cast<std::size_t>(X));
+    if (taps) taps->tap("proj.out", px.data(), L, X);
+
+    // 7) transformer chain (post-LN)
+    std::vector<float> py(static_cast<std::size_t>(L) * X);
+    cur = px.data();
+    nxt = py.data();
+    for (int i = 0; i < c.transformer_layers; ++i) {
+        transformer_block_forward(cur, w.transformer(i), nxt, L, X, c.transformer_inner,
+            c.transformer_heads);
+        std::swap(cur, nxt);
+        if (taps) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "transformer.%d", i);
+            taps->tap(name, cur, L, X);
+        }
+    }
+
+    // 8) head -> pre-gate preds
+    out.preds.resize(static_cast<std::size_t>(L) * SPK);
+    diar_head_forward(cur, w.head_hidden_w(), w.head_hidden_b(), w.head_spks_w(),
+        w.head_spks_b(), out.preds.data(), L, X, SPK);
+    if (taps) taps->tap("preds", out.preds.data(), L, SPK);
+    return out;
 }
 
 }  // namespace diar

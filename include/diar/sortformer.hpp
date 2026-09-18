@@ -69,6 +69,8 @@
 #include "diar/diar.hpp"  // AoscScoringConfig, FrontendConfig pins
 #include "diar/gguf.hpp"
 #include "diar/layers.hpp"
+#include "diar/nn.hpp"
+#include "diar/posenc.hpp"
 #include "diar/subsampling.hpp"
 
 #include <cstddef>
@@ -177,5 +179,63 @@ private:
 // Surviving frequency bins after log2(subsampling_factor) striding stages of
 // the stem (subsampling.hpp geometry: L' = (L + 2 - 3)/2 + 1). 128 -> 16.
 int subsampling_freq_bins(int feat_in, int subsampling_factor);
+
+// ---------------------------------------------------------------------------
+// Stage 3.2b — per-chunk forward assembly.
+// ---------------------------------------------------------------------------
+// Upstream pin (sortformer_model.cpp build_graph + build_graph_from_embeddings,
+// a5b6953), in order:
+//   mel -> pre_encode stem                      [T3, D]   (NO xscale here)
+//   concat [spkcache | fifo | chunk_embs]       [L, D]    (AOSC caches store
+//                                                          RAW pre-encode
+//                                                          embeddings; the
+//                                                          state prefix is
+//                                                          re-scaled every
+//                                                          chunk)
+//   xscale by sqrt(D) on the WHOLE concat      (only if cfg.xscaling)
+//   rel-pos table for L                        [2L-1, D] (stored GGUF table
+//                                                          sliced like
+//                                                          production, else
+//                                                          formula)
+//   conformer layers x N                        [L, D]
+//   encoder_proj Linear D -> X                  [L, X]
+//   transformer blocks x M (post-LN)            [L, X]
+//   head relu->Linear->relu->Linear->sigmoid    [L, n_spk] pre-gate preds
+// Scalar run (B=1): no attention/valid masks exist on this path — masks are
+// a batching artifact only (upstream run_chunk takes none).
+//
+// Tail-semantics switch (Step 0 verdict, machine-enforced by tests):
+//   feat_len > 0  : NeMo reference — masked stem; rows >= valid become
+//                   out.bias fill rows (K5-A route)
+//   feat_len <= 0 : production — full-window stem, no mask (K6 route)
+// Frame GEOMETRY (T3, L) is identical in both modes; only tail-row VALUES
+// differ, so the host state machine (3.2c) is shared.
+
+struct TapSink {
+    virtual ~TapSink() = default;
+    // data is rows*cols row-major. Names emitted by sortformer_run_chunk:
+    //   "stem.out" [T3,D] pre-xscale (== chunk_embs, bit-exact)
+    //   "concat.raw" [L,D] (pre-xscale), "xscaled" [L,D] (post)
+    //   "pos_emb" [2L-1,D], "conformer.{i}" [L,D], "proj.out" [L,X],
+    //   "transformer.{i}" [L,X], "preds" [L,n_spk]
+    virtual void tap(const char* name, const float* data, int rows, int cols) = 0;
+};
+
+struct SortformerChunkOutput {
+    std::vector<float> preds;       // [L, n_spk] frame-major, pre-gate sigmoid
+    std::vector<float> chunk_embs;  // [T3, D] raw pre-encode (no xscale — AOSC
+                                    // cache contract; bit-equal to "stem.out")
+    int total_frames = 0;           // L = spkcache + fifo + T3
+    int chunk_frames = 0;           // T3 (full-window geometry both modes)
+};
+
+// Full-window encoder frame count for a mel window (3-stage formula
+// (L-1)/2+1 applied log2(subampling_factor) times; 160 -> 20, 86 -> 11).
+int sortformer_subsampled_len(int t_mel, int subsampling_factor);
+
+// Throws std::invalid_argument on L exceeding the PE budget.
+SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat_len,
+    const float* spkcache, int spkcache_frames, const float* fifo, int fifo_frames,
+    const SortformerWeights& w, TapSink* taps = nullptr);
 
 }  // namespace diar
