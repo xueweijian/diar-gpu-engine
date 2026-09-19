@@ -160,6 +160,29 @@ Autotune hygiene (M1/M2 lessons) unchanged: pinned workspace + env
 for gate runs; report pinned and free-running numbers; compare gates
 on pinned only.
 
+## 5b. Official baseline (measured 2026-09-19, locked)
+
+Kernel `weijianxue/diar-official-bench` v4, archived at
+`shared/diar-gpu-engine/m3-official-bench/official_bench_t4.json`:
+
+- NeMo PyTorch eager, fp32, streaming (the only official form — the model
+  has no offline `.transcribe`), torch 2.10.0+cu128, T4 (cc 7.5, 40 SM).
+- short 56.86 s / 36 chunks: **45.5 ms/chunk** (wall 1.65 s, RTF 0.029)
+- mid 357.29 s / 224 chunks: **46.1 ms/chunk** (p50 45.5, wall 10.37 s,
+  RTF 0.029; 3-run variance <1%, warmup excluded)
+- Estimated composition: ~12-16 ms PyTorch op-dispatch overhead per chunk
+  (~700 eager ops) on top of ~30 ms of actual GPU compute.
+
+**G-D extension (the M3 bar):** the CUDA engine must beat the official
+baseline on the same card class — on Kaggle T4: **≤ 25 ms/chunk mean
+(≥1.8x)** for the mid feed to declare the port successful; stretch goal
+≤ 20 ms/chunk with fp16 storage enabled. The python-dispatch overhead we
+eliminate (~30%) is the floor of the win; fusions, residency and fp16
+storage are the upside. On user P100/V100 the official number is not
+directly measurable on Kaggle anymore (P100 retired) — the acceptance
+protocol is our engine vs the T4-official RTF scaled by card class, plus
+absolute ms/chunk targets recorded at first bench.
+
 ## 6. Acceptance and bench protocol on user hardware
 
 - Deliverable: one fatbin + `diar-bench` harness. The user runs
