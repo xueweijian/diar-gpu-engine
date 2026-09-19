@@ -39,10 +39,18 @@ jobs:
           nvcc -O2 -std=c++17 -DDIAR_WITH_CUDA -Iinclude -gencode arch=compute_60,code=sm_60 -gencode arch=compute_70,code=sm_70 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_60,code=compute_60 -x cu src/backend_cuda.cpp -x cu tools/step3_bench_main.cpp src/backend.cpp src/cublas_layout.cpp src/nn.cpp src/gguf.cpp -lcublas -o /tmp/step3_bench
           nvcc -O2 -std=c++17 -DDIAR_WITH_CUDA -Iinclude -gencode arch=compute_60,code=sm_60 -gencode arch=compute_70,code=sm_70 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_60,code=compute_60 -x cu src/backend_cuda.cpp -x cu tools/step4_bench_main.cpp src/backend.cpp src/cublas_layout.cpp src/nn.cpp src/gguf.cpp src/mha.cpp src/conv.cpp src/conformer.cpp src/layers.cpp src/posenc.cpp src/subsampling.cpp -lcublas -o /tmp/step4_bench
           nvcc -O2 -std=c++17 -DDIAR_WITH_CUDA -Iinclude -gencode arch=compute_60,code=sm_60 -gencode arch=compute_70,code=sm_70 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_60,code=compute_60 -x cu src/backend_cuda.cpp -x cu tools/step5_bench_main.cpp src/backend.cpp src/cublas_layout.cpp src/nn.cpp src/gguf.cpp src/mha.cpp src/conv.cpp src/conformer.cpp src/layers.cpp src/posenc.cpp src/subsampling.cpp -lcublas -o /tmp/step5_bench
+ -x cu src/backend_cuda.cpp -x cu src/encoder_cuda.cpp -x cu tools/diar_bench_main.cpp src/backend.cpp src/cublas_layout.cpp src/nn.cpp src/gguf.cpp src/mha.cpp src/conv.cpp src/conformer.cpp src/layers.cpp src/posenc.cpp src/subsampling.cpp src/sortformer.cpp src/engine.cpp src/fe.cpp src/diar.cpp src/aosc.cpp src/birth_gate.cpp src/tailfix.cpp src/profile.cpp -DDIAR_PROFILE_STAGE -lcublas -o /tmp/diar_bench
       - name: Fatbin arch verification
         run: |
           cuobjdump --list-elf /tmp/step4_bench | tee /tmp/elf.txt
           cuobjdump --list-ptx /tmp/step4_bench | tee /tmp/ptx.txt
+          cuobjdump --list-elf /tmp/diar_bench > /tmp/elf6.txt
+          cuobjdump --list-ptx /tmp/diar_bench > /tmp/ptx6.txt
+          for a in sm_60 sm_70 sm_75; do
+            grep -q "$a" /tmp/elf6.txt || { echo "diar_bench MISSING SASS $a"; exit 1; }
+          done
+          grep -Eq "sm_60\.ptx|compute_60" /tmp/ptx6.txt || { echo "diar_bench MISSING PTX compute_60"; exit 1; }
+          echo "diar_bench fatbin carries all 3 SASS + PTX: OK"
           for a in sm_60 sm_70 sm_75; do
             grep -q "$a" /tmp/elf.txt || { echo "MISSING SASS $a"; exit 1; }
           done
@@ -59,6 +67,9 @@ jobs:
           g++ -std=c++17 -Wall -Wextra -Iinclude -O2             tools/step5_bench_main.cpp src/nn.cpp src/mha.cpp src/conv.cpp             src/conformer.cpp src/layers.cpp src/posenc.cpp             src/subsampling.cpp src/gguf.cpp src/cublas_layout.cpp -o /tmp/step5_selftest
           /tmp/step5_selftest | tee /tmp/selftest5.txt
           grep -q '"mode":"cpu-selftest-complete"' /tmp/selftest5.txt
+          g++ -std=c++17 -Wall -Wextra -Iinclude -O2 tools/diar_bench_main.cpp src/backend.cpp src/cublas_layout.cpp src/nn.cpp src/mha.cpp src/conv.cpp src/conformer.cpp src/layers.cpp src/posenc.cpp src/subsampling.cpp src/gguf.cpp src/sortformer.cpp src/engine.cpp src/fe.cpp src/diar.cpp src/aosc.cpp src/birth_gate.cpp src/tailfix.cpp src/profile.cpp -o /tmp/diar_bench_cpu
+          /tmp/diar_bench_cpu --selftest | tee /tmp/diar_bench_selftest.txt
+          grep -q "OK" /tmp/diar_bench_selftest.txt
 
   sanitizer:
     name: asan-ubsan

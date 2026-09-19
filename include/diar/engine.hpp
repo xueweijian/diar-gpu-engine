@@ -88,6 +88,12 @@ public:
     // order). K5 stage-isolation diagnostics — production never sets one.
     void set_tap_sink(TapSink* sink) { tap_sink_ = sink; }
 
+    // M3 Step 6: optional device-resident encoder chain (steps 5-7 of
+    // sortformer_run_chunk). Null (default) = the CPU reference. Setting a
+    // sink via set_tap_sink after this keeps taps authoritative: taps force
+    // the CPU chain inside run_chunk.
+    void set_encoder_route(EncoderRoute* route) { encoder_route_ = route; }
+
     const std::vector<ChunkLedgerEntry>& chunk_ledger() const { return ledger_; }
 
     // Full copy of the AOSC state — the closed-loop comparison face for 3.3
@@ -141,6 +147,7 @@ private:
     std::vector<float> pre_gate_;  // pre-gate emitted chain (frames x n_spk)
     std::vector<ChunkLedgerEntry> ledger_;
     TapSink* tap_sink_ = nullptr;
+    EncoderRoute* encoder_route_ = nullptr;
     std::vector<AoscSnapshot>* aosc_recorder_ = nullptr;
 };
 

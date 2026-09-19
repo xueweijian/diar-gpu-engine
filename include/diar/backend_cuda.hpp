@@ -215,6 +215,17 @@ void bench_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
                   const float* x, const float* w, const float* b, float* y,
                   int t, int in, int out);
 
+// device-resident linear, exported for encoder_cuda.cpp (Step 6 encoder
+// proj GEMM — the same body the resident conformer/transformer layers
+// call; fp32 Sgemm route, or fp16-storage GemmEx with the activation cast
+// into cast16, cast16 >= t*in halves).
+void dev_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
+                const float* x, const float* w, const float* bias, float* y,
+                int t, int in, int out, __half* cast16);
+void dev_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
+                const float* x, const __half* w, const float* bias, float* y,
+                int t, int in, int out, __half* cast16);
+
 // ---- Step 5 bench entries (fp16-storage route) ----------------------------
 // fp16-weights linear: w is a DEVICE __half array (host-packed via
 // pack_weights_f16), x stays fp32 and is cast into cast16 (DEVICE scratch

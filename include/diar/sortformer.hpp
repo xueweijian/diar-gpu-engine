@@ -234,8 +234,38 @@ struct SortformerChunkOutput {
 int sortformer_subsampled_len(int t_mel, int subsampling_factor);
 
 // Throws std::invalid_argument on L exceeding the PE budget.
+// route: optional Step-6 accelerator (steps 5-7). Taps force the CPU chain
+// (per-layer taps are a CPU contract; a routed run fires no layer taps).
+struct EncoderRoute;  // defined below (pointer param — incomplete here)
 SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat_len,
     const float* spkcache, int spkcache_frames, const float* fifo, int fifo_frames,
-    const SortformerWeights& w, TapSink* taps = nullptr);
+    const SortformerWeights& w, TapSink* taps = nullptr,
+    EncoderRoute* route = nullptr);
+
+// M3 Step 6 — accelerator hook for steps 5-7 of sortformer_run_chunk
+// (conformer chain + encoder_proj + transformer chain; the 99.2 % profile
+// share). Deliberately CUDA-free: CPU builds see the interface and never
+// set it, the CUDA backend (src/encoder_cuda.cpp, DIAR_WITH_CUDA) derives
+// from it. One object per engine; not thread-safe by contract (the host
+// state machine is host-serial).
+struct EncoderRouteConfig {
+    int d_model = 0;
+    int encoder_layers = 0, encoder_heads = 0, encoder_d_ff = 0,
+        conv_kernel = 0;
+    int transformer_layers = 0, transformer_hidden = 0, transformer_inner = 0,
+        transformer_heads = 0;
+};
+
+struct EncoderRoute {
+    virtual ~EncoderRoute() = default;
+    // x [L,D] xscaled concat, pe [2L-1,D] rel-pos table, px [L,X] out (the
+    // post-transformer chain, i.e. the "proj.out" domain of the head).
+    // Returns false to fall back to the CPU chain — the only legal reason
+    // is L beyond the route's sized budget (never a silent wrong answer).
+    // A route must be deterministic: same inputs -> bit-identical px
+    // (single stream, fixed kernel order — G-C pins this).
+    virtual bool encoder_forward(const float* x, const float* pe, float* px,
+        int L, const EncoderRouteConfig& cfg) = 0;
+};
 
 }  // namespace diar

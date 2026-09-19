@@ -499,6 +499,8 @@ __global__ void plain_softmax_kernel(const float* ac, float* probs, int t,
     for (int j = 0; j < t; ++j) pr[j] *= isum;
 }
 
+}  // namespace
+
 // device-resident linear: y = x @ w + bias (zero-pack plan, no host copies).
 // Template over the weight type: float = fp32 Sgemm route (cast16 unused);
 // __half = fp16-storage route (Step 5): x is cast fp32->fp16 into cast16
@@ -538,7 +540,12 @@ void dev_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
     }
 }
 
-}  // namespace
+// Exported for encoder_cuda.cpp (Step 6 proj GEMM same body the resident
+// layers use; explicit instantiations, no header template).
+template void dev_linear<float>(cublasHandle_t, cudaStream_t, int,
+    const float*, const float*, const float*, float*, int, int, int, __half*);
+template void dev_linear<__half>(cublasHandle_t, cudaStream_t, int,
+    const float*, const __half*, const float*, float*, int, int, int, __half*);
 
 std::size_t mha_scratch_floats(int t, int c, int h) {
     const int p = 2 * t - 1;

@@ -417,7 +417,7 @@ int sortformer_subsampled_len(int t_mel, int subsampling_factor) {
 
 SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat_len,
     const float* spkcache, int spkcache_frames, const float* fifo, int fifo_frames,
-    const SortformerWeights& w, TapSink* taps) {
+    const SortformerWeights& w, TapSink* taps, EncoderRoute* route) {
     const SortformerConfig& c = w.config();
     const int D = c.d_model, X = c.transformer_hidden, SPK = c.num_speakers;
     const int T3 = sortformer_subsampled_len(t_mel, c.subsampling_factor);
@@ -482,56 +482,81 @@ SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat
     }
     if (taps) taps->tap("pos_emb", pe.data(), 2 * L - 1, D);
 
-    // 5) conformer chain (ping-pong)
-    std::vector<float> y(static_cast<std::size_t>(L) * D);
-    float* cur = x.data();
-    float* nxt = y.data();
-    {
-        DIAR_PROFILE_SCOPE("conformer");
-        for (int i = 0; i < c.encoder_layers; ++i) {
-            conformer_layer_forward(cur, pe.data(), w.conformer(i), nxt, L, D, c.encoder_d_ff,
-                c.encoder_heads, c.conv_kernel);
-            std::swap(cur, nxt);
-            if (taps) {
-                char name[32];
-                std::snprintf(name, sizeof(name), "conformer.%d", i);
-                taps->tap(name, cur, L, D);
-            }
-        }
-    }
-
-    // 6) encoder_proj
+    // 5-7) conformer chain + encoder_proj + transformer chain. CPU
+    // reference below, or the attached Step-6 route (device-resident chain;
+    // one H2D/D2H pair per chunk). Taps force the CPU chain — per-layer
+    // taps are a CPU contract, a routed run fires none.
     std::vector<float> px(static_cast<std::size_t>(L) * X);
-    {
-        DIAR_PROFILE_SCOPE("proj");
-        nn::linear_forward(cur, w.proj_w(), w.proj_b(), px.data(), static_cast<std::size_t>(L),
-            static_cast<std::size_t>(D), static_cast<std::size_t>(X));
+    const float* enc_out = nullptr;
+    bool routed = false;
+    if (route && !taps) {
+        EncoderRouteConfig rc{};
+        rc.d_model = D;
+        rc.encoder_layers = c.encoder_layers;
+        rc.encoder_heads = c.encoder_heads;
+        rc.encoder_d_ff = c.encoder_d_ff;
+        rc.conv_kernel = c.conv_kernel;
+        rc.transformer_layers = c.transformer_layers;
+        rc.transformer_hidden = X;
+        rc.transformer_inner = c.transformer_inner;
+        rc.transformer_heads = c.transformer_heads;
+        DIAR_PROFILE_SCOPE("encoder_route");
+        routed = route->encoder_forward(x.data(), pe.data(), px.data(), L, rc);
     }
-    if (taps) taps->tap("proj.out", px.data(), L, X);
-
-    // 7) transformer chain (post-LN)
-    std::vector<float> py(static_cast<std::size_t>(L) * X);
-    cur = px.data();
-    nxt = py.data();
-    {
-        DIAR_PROFILE_SCOPE("transformer");
-        for (int i = 0; i < c.transformer_layers; ++i) {
-            transformer_block_forward(cur, w.transformer(i), nxt, L, X, c.transformer_inner,
-                c.transformer_heads);
-            std::swap(cur, nxt);
-            if (taps) {
-                char name[32];
-                std::snprintf(name, sizeof(name), "transformer.%d", i);
-                taps->tap(name, cur, L, X);
+    if (routed) {
+        enc_out = px.data();
+    } else {
+        // 5) conformer chain (ping-pong)
+        std::vector<float> y(static_cast<std::size_t>(L) * D);
+        float* cur = x.data();
+        float* nxt = y.data();
+        {
+            DIAR_PROFILE_SCOPE("conformer");
+            for (int i = 0; i < c.encoder_layers; ++i) {
+                conformer_layer_forward(cur, pe.data(), w.conformer(i), nxt, L, D, c.encoder_d_ff,
+                    c.encoder_heads, c.conv_kernel);
+                std::swap(cur, nxt);
+                if (taps) {
+                    char name[32];
+                    std::snprintf(name, sizeof(name), "conformer.%d", i);
+                    taps->tap(name, cur, L, D);
+                }
             }
         }
+
+        // 6) encoder_proj
+        {
+            DIAR_PROFILE_SCOPE("proj");
+            nn::linear_forward(cur, w.proj_w(), w.proj_b(), px.data(), static_cast<std::size_t>(L),
+                static_cast<std::size_t>(D), static_cast<std::size_t>(X));
+        }
+        if (taps) taps->tap("proj.out", px.data(), L, X);
+
+        // 7) transformer chain (post-LN)
+        std::vector<float> py(static_cast<std::size_t>(L) * X);
+        cur = px.data();
+        nxt = py.data();
+        {
+            DIAR_PROFILE_SCOPE("transformer");
+            for (int i = 0; i < c.transformer_layers; ++i) {
+                transformer_block_forward(cur, w.transformer(i), nxt, L, X, c.transformer_inner,
+                    c.transformer_heads);
+                std::swap(cur, nxt);
+                if (taps) {
+                    char name[32];
+                    std::snprintf(name, sizeof(name), "transformer.%d", i);
+                    taps->tap(name, cur, L, X);
+                }
+            }
+        }
+        enc_out = cur;
     }
 
     // 8) head -> pre-gate preds
     out.preds.resize(static_cast<std::size_t>(L) * SPK);
     {
         DIAR_PROFILE_SCOPE("head");
-        diar_head_forward(cur, w.head_hidden_w(), w.head_hidden_b(), w.head_spks_w(),
+        diar_head_forward(enc_out, w.head_hidden_w(), w.head_hidden_b(), w.head_spks_w(),
             w.head_spks_b(), out.preds.data(), L, X, SPK);
     }
     if (taps) taps->tap("preds", out.preds.data(), L, SPK);
