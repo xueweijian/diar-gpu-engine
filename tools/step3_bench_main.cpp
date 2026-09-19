@@ -128,7 +128,9 @@ double parity_one(diar::backend::Context& ctx, const Shape& s) {
     std::vector<float> y_ref(static_cast<std::size_t>(s.t) * s.out);
     std::vector<float> y_gpu(y_ref.size());
     ref_linear(x, w, b, y_ref, s.t, s.in, s.out);
-    const diar::backend::LinearOp op{s.t, s.in, s.out};
+    const diar::backend::LinearOp op{
+        static_cast<std::size_t>(s.t), static_cast<std::size_t>(s.in),
+        static_cast<std::size_t>(s.out)};
     if (ctx.linear(op, x.data(), w.data(), b.data(), y_gpu.data()) !=
         diar::backend::Status::ok) {
         std::printf("[s3] {\"k\":\"fatal\",\"what\":\"ctx.linear unsupported\"}\n");
