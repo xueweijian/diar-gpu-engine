@@ -88,7 +88,7 @@ def test_framework_placeholder_and_gates_present() -> None:
                  "ms_per_chunk_best", "vs_cpu_max_abs", "vs_fixture"):
         assert gate in text, f"gate {gate} missing from framework"
     # routes per mode: full-offline is CPU-only (L unbounded on GPU by design)
-    assert '[("cpu", 2)] if mode == "full-offline"' in text
+    assert 'routes = [] if _rr == "gpu" else [("cpu", _reps_cpu)]' in text
     # G-E artifacts land in /kaggle/working for the user-card diff
     assert "/kaggle/working/ge_t4_" in text
 

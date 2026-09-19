@@ -30,7 +30,7 @@ import numpy as np
 #              1 = split-rep mode, determinism moves to harvest merge)
 #   tag:       dump-label suffix for split-rep mode (".rep0"/".rep1")
 #__ROLE_PINS__
-S6_ROLE = {"cases": "", "routes": "all", "cpu_reps": 2, "tag": ""}
+S6_ROLE = {"cases": "v13-mid-streaming", "routes": "cpu", "cpu_reps": 1, "tag": ".rep0"}
 
 EMBED = {}
 EMBED["hpp_backend"] = "Ly8gTTMgU3RlcCAyIOKAlCBiYWNrZW5kIHNrZWxldG9uIChwbGFuIE0zLVAxMDAtQ1VEQS1QTEFOLm1kIMKnMykuCi8vCi8vIEFuIG9wYXF1ZSBkZXZpY2UvZGlzcGF0Y2ggbGF5ZXIgaW4gZnJvbnQgb2YgdGhlIG5uOjogcHJpbWl0aXZlcy4gVGhlIENQVQovLyBiYWNrZW5kIGRlbGVnYXRlcyAxOjEgdG8gdGhlIGV4aXN0aW5nIHJlZmVyZW5jZSBpbXBsZW1lbnRhdGlvbnMgKGJpdAovLyBpZGVudGl0eSBwaW5uZWQgYnkgdGVzdHMvdGVzdF9iYWNrZW5kLmNwcCk7IGEgQ1VEQSBiYWNrZW5kLCB3aGVuIGNvbXBpbGVkCi8vIGluIChDTWFrZSBESUFSX1dJVEhfQ1VEQSwgT0ZGIGJ5IGRlZmF1bHQpLCBhbnN3ZXJzIHBlci1vcCB3aXRoIFN0YXR1czsKLy8gYW55dGhpbmcgbm90IHlldCBtaWdyYXRlZCByZXR1cm5zIFN0YXR1czo6dW5zdXBwb3J0ZWQgYW5kIGNhbGxlcnMgZmFsbAovLyBiYWNrIHRvIHRoZSBDUFUgcGF0aC4gTm8gZW5naW5lLWxvZ2ljIGNoYW5nZXMgYXJlIGFsbG93ZWQgaW4gdGhpcyBsYXllci4KI2lmbmRlZiBESUFSX0JBQ0tFTkRfSFBQCiNkZWZpbmUgRElBUl9CQUNLRU5EX0hQUAoKI2luY2x1ZGUgPGNzdGRkZWY+CiNpbmNsdWRlIDxtZW1vcnk+CgpuYW1lc3BhY2UgZGlhcjo6YmFja2VuZCB7CgplbnVtIGNsYXNzIEtpbmQgeyBjcHUsIGN1ZGEgfTsKCmVudW0gY2xhc3MgU3RhdHVzIHsgb2ssIHVuc3VwcG9ydGVkIH07CgovLyBBY3RpdmF0aW9uIGxheW91dCBldmVyeXdoZXJlOiBbVCwgQ10gcm93LW1ham9yIChubi5ocHAgY29udHJhY3QpLgpzdHJ1Y3QgTGluZWFyT3AgewogICAgc3RkOjpzaXplX3Qgcm93cywgaW5fZGltLCBvdXRfZGltOwp9OwpzdHJ1Y3QgTGF5ZXJOb3JtT3AgewogICAgc3RkOjpzaXplX3Qgcm93cywgZGltOyAgLy8gZXBzIGZpeGVkIGF0IHRoZSBubi5ocHAgcGluICgxZS01KQp9OwpzdHJ1Y3QgU29mdG1heE9wIHsKICAgIHN0ZDo6c2l6ZV90IHJvd3MsIGNvbHM7ICAvLyBsYXN0LWRpbSBzb2Z0bWF4Cn07CnN0cnVjdCBQb2ludHdpc2VPcCB7CiAgICBzdGQ6OnNpemVfdCBuOyAgLy8gcmVsdSAvIHNpbHUgLyBzaWdtb2lkIC8geHNjYWxlKHNjYWxlKQogICAgZmxvYXQgc2NhbGU7ICAgIC8vIHhzY2FsZSBvbmx5Cn07CnN0cnVjdCBHbHVPcCB7CiAgICBzdGQ6OnNpemVfdCB0LCBjOwp9OwpzdHJ1Y3QgQ29udjFkT3AgewogICAgaW50IHRfaW4sIGNfaW4sIGNfb3V0LCBrLCBzdHJpZGUsIHBhZDsgIC8vIHN5bW1ldHJpYyB6ZXJvIHBhZCAobm4uaHBwKQogICAgYm9vbCBkZXB0aHdpc2U7Cn07CnN0cnVjdCBDb252MmRPcCB7CiAgICBpbnQgY19pbiwgY19vdXQsIGhfaW4sIHdfaW4sIGssIHN0cmlkZSwgcGFkOwp9OwoKLy8gT3BhcXVlIHN0cmVhbS9jb250ZXh0LiBBIENvbnRleHQgb3ducyBkZXZpY2UgcmVzb3VyY2VzIGZvciBvbmUgZW5naW5lCi8vIGluc3RhbmNlOyBDUFUgY29udGV4dHMgYXJlIHN0YXRlbGVzcyBzaGVsbHMuCmNsYXNzIENvbnRleHQgewpwdWJsaWM6CiAgICB2aXJ0dWFsIH5Db250ZXh0KCkgPSBkZWZhdWx0OwogICAgdmlydHVhbCBLaW5kIGtpbmQoKSBjb25zdCA9IDA7CgogICAgLy8gRXZlcnkgb3AgdGFrZXMgaG9zdC12aXNpYmxlIHBvaW50ZXJzOyB0aGUgYmFja2VuZCBkZWNpZGVzIHdoZXRoZXIgdGhlCiAgICAvLyBjb3B5IGhhcHBlbnMgYXQgYWxsIChDUFU6IG5vbmUpLiBCbG9ja2luZyBjYWxscyDigJQgYXN5bmMgYXJyaXZlcyB3aXRoCiAgICAvLyB0aGUgQ1VEQSBpbXBsZW1lbnRhdGlvbiAoU3RlcCA0LzUpLgogICAgdmlydHVhbCBTdGF0dXMgbGluZWFyKGNvbnN0IExpbmVhck9wJiwgY29uc3QgZmxvYXQqIHgsIGNvbnN0IGZsb2F0KiB3LAogICAgICAgICAgICAgICAgICAgICAgICAgIGNvbnN0IGZsb2F0KiBiLCBmbG9hdCogeSkgPSAwOwogICAgdmlydHVhbCBTdGF0dXMgbGF5ZXJub3JtKGNvbnN0IExheWVyTm9ybU9wJiwgY29uc3QgZmxvYXQqIHgsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgY29uc3QgZmxvYXQqIGdhbW1hLCBjb25zdCBmbG9hdCogYmV0YSwgZmxvYXQqIHkpID0gMDsKICAgIHZpcnR1YWwgU3RhdHVzIHNvZnRtYXgoY29uc3QgU29mdG1heE9wJiwgY29uc3QgZmxvYXQqIHgsIGZsb2F0KiB5KSA9IDA7CiAgICB2aXJ0dWFsIFN0YXR1cyBwb2ludHdpc2Vfc2lsdShjb25zdCBQb2ludHdpc2VPcCYsIGNvbnN0IGZsb2F0KiB4LCBmbG9hdCogeSkgPSAwOwogICAgdmlydHVhbCBTdGF0dXMgcG9pbnR3aXNlX3JlbHUoY29uc3QgUG9pbnR3aXNlT3AmLCBmbG9hdCogeCkgPSAwOwogICAgdmlydHVhbCBTdGF0dXMgcG9pbnR3aXNlX3NpZ21vaWQoY29uc3QgUG9pbnR3aXNlT3AmLCBjb25zdCBmbG9hdCogeCwgZmxvYXQqIHkpID0gMDsKICAgIHZpcnR1YWwgU3RhdHVzIHBvaW50d2lzZV94c2NhbGUoY29uc3QgUG9pbnR3aXNlT3AmLCBjb25zdCBmbG9hdCogeCwgZmxvYXQqIHkpID0gMDsKICAgIHZpcnR1YWwgU3RhdHVzIGdsdShjb25zdCBHbHVPcCYsIGNvbnN0IGZsb2F0KiB4LCBmbG9hdCogeSkgPSAwOwogICAgdmlydHVhbCBTdGF0dXMgY29udjFkKGNvbnN0IENvbnYxZE9wJiwgY29uc3QgZmxvYXQqIHgsIGNvbnN0IGZsb2F0KiB3LAogICAgICAgICAgICAgICAgICAgICAgICAgIGNvbnN0IGZsb2F0KiBiLCBmbG9hdCogeSkgPSAwOwogICAgdmlydHVhbCBTdGF0dXMgY29udjJkKGNvbnN0IENvbnYyZE9wJiwgY29uc3QgZmxvYXQqIHgsIGNvbnN0IGZsb2F0KiB3LAogICAgICAgICAgICAgICAgICAgICAgICAgIGNvbnN0IGZsb2F0KiBiLCBmbG9hdCogeSkgPSAwOwoKICAgIC8vIHJlbF9zaGlmdCBzdGF5cyBDUFUtc2lkZSBpbiB0aGUgZmlyc3QgbWlncmF0aW9uIHdhdmUgKHNtYWxsLCBsYXlvdXQtCiAgICAvLyBmaWRkbHkpOyBpdCBpcyBpbnRlbnRpb25hbGx5IGFic2VudCBmcm9tIHRoaXMgc3VyZmFjZS4KfTsKCi8vIEZhY3Rvcnk6IHRoZSBvbmx5IGVudHJ5IHBvaW50LiBUaHJvd3Mgc3RkOjpydW50aW1lX2Vycm9yIG9uIGEgY3VkYSByZXF1ZXN0Ci8vIHdoZW4gY29tcGlsZWQgd2l0aG91dCBESUFSX1dJVEhfQ1VEQSAoQ0kgc3RheXMgQ1BVLW9ubHkpLgpzdGQ6OnVuaXF1ZV9wdHI8Q29udGV4dD4gY3JlYXRlKEtpbmQga2luZCk7Cgpjb25zdCBjaGFyKiBzdGF0dXNfbmFtZShTdGF0dXMgcykgbm9leGNlcHQ7Cgp9ICAvLyBuYW1lc3BhY2UgZGlhcjo6YmFja2VuZAoKI2VuZGlmICAvLyBESUFSX0JBQ0tFTkRfSFBQCg=="
@@ -152,10 +152,7 @@ def sh(cmd, timeout=3600, check=True, env=None):
         if p.stderr.strip():
             print(p.stderr[-3000:], flush=True)
         REPORT["notes"].append(f"FAILED: {' '.join(cmd[:6])} rc={p.returncode}")
-        # RuntimeError (NOT SystemExit): SystemExit escapes the per-case
-        # `except Exception` isolation in the futures loop and hard-kills
-        # the whole session when re-raised by fut.result() (s6b-gpu v1)
-        raise RuntimeError(f"command failed rc={p.returncode}: {cmd[:4]}")
+        raise SystemExit(3)
     return p
 
 # 1) CPU selftest of diar-bench (wire round-trip + metrics oracles)
@@ -169,12 +166,10 @@ REPORT["gates"]["cpu_selftest"] = "OK" in st.stdout
 # build the deliverable fatbin shape (3 SASS + PTX), profiled build.
 if S6_ROLE.get("routes", "all") == "cpu":
     BENCH = WORK + "/diar_bench_cpu"
-    BENCH_JIT = BENCH  # never used on cpu-only roles (no jit routes)
     REPORT["gates"]["fatbin_3sass"] = None  # n/a on CPU-only sessions
     REPORT["gates"]["fatbin_ptx60"] = None
 else:
     BENCH = WORK + "/diar_bench"
-    BENCH_JIT = WORK + "/diar_bench_jit"
     sh(["nvcc", "-O2", "-std=c++17", "-DDIAR_WITH_CUDA", "-DDIAR_PROFILE_STAGE",
         "-I", WORK + "/include", *GENCODE,
         "-x", "cu", FILES["cpp_backend_cuda"],
@@ -188,23 +183,6 @@ else:
     ptx = sh(["cuobjdump", "--list-ptx", BENCH]).stdout
     REPORT["gates"]["fatbin_3sass"] = all(a in elf for a in ("sm_60", "sm_70", "sm_75"))
     REPORT["gates"]["fatbin_ptx60"] = ("sm_60" in ptx) or ("compute_60" in ptx)
-
-    # PTX-only twin (JIT face): same sources, compute_60 code only. The
-    # fp32jit route runs this binary — our kernels JIT from PTX, cuBLAS
-    # loads its own SASS normally (CUDA_FORCE_JIT breaks cuBLAS, see
-    # run_bench note).
-    sh(["nvcc", "-O2", "-std=c++17", "-DDIAR_WITH_CUDA", "-DDIAR_PROFILE_STAGE",
-        "-I", WORK + "/include",
-        "-gencode", "arch=compute_60,code=compute_60",
-        "-x", "cu", FILES["cpp_backend_cuda"],
-        "-x", "cu", FILES["cpp_encoder_cuda"],
-        "-x", "cu", FILES["cpp_stem_cuda"],
-        "-x", "cu", FILES["cpp_bench_main"],
-        *SRC_CPU, "-lcublas", "-o", BENCH_JIT])
-    jit_ptx = sh(["cuobjdump", "--list-ptx", BENCH_JIT]).stdout
-    jit_elf = sh(["cuobjdump", "--list-elf", BENCH_JIT]).stdout
-    REPORT["gates"]["jit_bin_ptx_only"] = ("compute_60" in jit_ptx) and \
-                                          ("sm_" not in jit_elf)
 
 # 4) weights + fixtures + audio
 HF_REPO = "nvidia/diar_streaming_sortformer_4spk-v2"
@@ -284,20 +262,22 @@ OFFICIAL_T4_MS = 45.5
 def run_bench(tag: str, mode: str, route: str, audio_f32: Path,
               ref: Path | None, ref_face: str, reps: int) -> dict:
     prefix = str(Path(WORK) / tag)
-    # fp32jit: runs the PTX-ONLY build (arch=compute_60,code=compute_60,
-    # no SASS) -> the driver JIT-compiles OUR kernels from the embedded
-    # compute_60 PTX. This is the Step 3 G-S3b mechanism, and crucially
-    # it does NOT touch cuBLAS: CUDA_FORCE_JIT=1 also force-JITs the
-    # library's SASS-only cubins -> cublasCreate fails NOT_INITIALIZED
-    # (s6b-gpu v1 lesson). Pascal-codegen semantics proxy on T4.
+    # fp32jit: same fp32 bench, but CUDA_FORCE_JIT=1 loads the fatbin via
+    # the embedded compute_60 PTX -> runtime JIT instead of the sm_75 SASS.
+    # The Pascal-codegen semantics proxy from Step 3's G-S3b (user has no
+    # P100 access right now; G-E cross-card check is deferred, this pins
+    # the sm_60 SEMANTICS on T4).
     bench_route = "fp32" if route == "fp32jit" else route
-    bench_exe = BENCH_JIT if route == "fp32jit" else BENCH
-    cmd = [bench_exe, "--weights", str(GGUF), "--audio", str(audio_f32),
+    cmd = [BENCH, "--weights", str(GGUF), "--audio", str(audio_f32),
            "--mode", mode, "--route", bench_route, "--reps", str(reps),
            "--label", tag, "--out", prefix]
     if ref is not None:
         cmd += ["--ref", str(ref), "--ref-face", ref_face]
-    sh(cmd, timeout=6 * 3600)
+    env = None
+    if route == "fp32jit":
+        env = dict(os.environ)
+        env["CUDA_FORCE_JIT"] = "1"
+    sh(cmd, timeout=6 * 3600, env=env)
     with open(prefix + ".bench.json") as f:
         return json.load(f)
 
@@ -372,11 +352,8 @@ def wire_diff(a: Path, b: Path) -> float:
     n = min(len(ra), len(rb))
     return float(np.abs(ra[:n].astype(np.float64) - rb[:n].astype(np.float64)).max())
 
-# 5) run the fixtures in parallel (CPU baselines dominate; K6 shape).
-# GPU-role sessions serialize (max_workers=1): concurrent bench processes
-# share the T4 -> G-D timing contention + doubled host/device memory
-# (s6b-gpu v1 had 2-way overlap when the jit bench hit cublasCreate).
-JOBS = 1 if S6_ROLE.get("routes", "all") == "gpu" else 4
+# 5) run the four fixtures in parallel (CPU baselines dominate; K6 shape)
+JOBS = 4
 with ThreadPoolExecutor(max_workers=JOBS) as ex:
     futs = {ex.submit(case_job, label, fdir): label
             for label, fdir in CASES.items()}

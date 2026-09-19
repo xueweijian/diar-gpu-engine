@@ -21,6 +21,17 @@ from pathlib import Path
 
 import numpy as np
 
+# M3 Step 6b — session ROLE pins (multi-session parallel split: 4 CPU
+# sessions + 1 GPU session; the build script rewrites this line per
+# variant kernel). Default = legacy single-session "all" role.
+#   cases:     comma substrings filtering case labels ("" = all)
+#   routes:    "all" | "cpu" | "gpu"  (gpu = fp32/fp16[+fp32jit])
+#   cpu_reps:  CPU baseline reps IN-SESSION (2 = in-process determinism;
+#              1 = split-rep mode, determinism moves to harvest merge)
+#   tag:       dump-label suffix for split-rep mode (".rep0"/".rep1")
+#__ROLE_PINS__
+S6_ROLE = {"cases": "", "routes": "all", "cpu_reps": 2, "tag": ""}
+
 EMBED = {}
 #__EMBED_TABLE__
 
@@ -76,7 +87,7 @@ for key, path in FILES.items():
         f.write(base64.b64decode(EMBED[key]))
 print("[s6k] sources materialized:", len(FILES))
 
-REPORT = {"gates": {}, "notes": [], "cases": {}}
+REPORT = {"gates": {}, "notes": [], "cases": {}, "role": dict(S6_ROLE)}
 T0 = time.time()
 
 GENCODE = ["-gencode", "arch=compute_60,code=sm_60",
@@ -102,7 +113,10 @@ def sh(cmd, timeout=3600, check=True, env=None):
         if p.stderr.strip():
             print(p.stderr[-3000:], flush=True)
         REPORT["notes"].append(f"FAILED: {' '.join(cmd[:6])} rc={p.returncode}")
-        raise SystemExit(3)
+        # RuntimeError (NOT SystemExit): SystemExit escapes the per-case
+        # `except Exception` isolation in the futures loop and hard-kills
+        # the whole session when re-raised by fut.result() (s6b-gpu v1)
+        raise RuntimeError(f"command failed rc={p.returncode}: {cmd[:4]}")
     return p
 
 # 1) CPU selftest of diar-bench (wire round-trip + metrics oracles)
@@ -111,21 +125,47 @@ sh(["g++", "-std=c++17", "-Wall", "-Wextra", "-I", WORK + "/include", "-O2",
 st = sh([WORK + "/diar_bench_cpu", "--selftest"])
 REPORT["gates"]["cpu_selftest"] = "OK" in st.stdout
 
-# 2) nvcc build: the deliverable fatbin shape (3 SASS + PTX), profiled build
-BENCH = WORK + "/diar_bench"
-sh(["nvcc", "-O2", "-std=c++17", "-DDIAR_WITH_CUDA", "-DDIAR_PROFILE_STAGE",
-    "-I", WORK + "/include", *GENCODE,
-    "-x", "cu", FILES["cpp_backend_cuda"],
-    "-x", "cu", FILES["cpp_encoder_cuda"],
-    "-x", "cu", FILES["cpp_stem_cuda"],
-    "-x", "cu", FILES["cpp_bench_main"],
-    *SRC_CPU, "-lcublas", "-o", BENCH])
+# 2) build: role "cpu" sessions have no nvcc/GPU — the selftest g++ binary
+# IS the bench (CUDA TUs excluded, no DIAR_WITH_CUDA). Roles "gpu"/"all"
+# build the deliverable fatbin shape (3 SASS + PTX), profiled build.
+if S6_ROLE.get("routes", "all") == "cpu":
+    BENCH = WORK + "/diar_bench_cpu"
+    BENCH_JIT = BENCH  # never used on cpu-only roles (no jit routes)
+    REPORT["gates"]["fatbin_3sass"] = None  # n/a on CPU-only sessions
+    REPORT["gates"]["fatbin_ptx60"] = None
+else:
+    BENCH = WORK + "/diar_bench"
+    BENCH_JIT = WORK + "/diar_bench_jit"
+    sh(["nvcc", "-O2", "-std=c++17", "-DDIAR_WITH_CUDA", "-DDIAR_PROFILE_STAGE",
+        "-I", WORK + "/include", *GENCODE,
+        "-x", "cu", FILES["cpp_backend_cuda"],
+        "-x", "cu", FILES["cpp_encoder_cuda"],
+        "-x", "cu", FILES["cpp_stem_cuda"],
+        "-x", "cu", FILES["cpp_bench_main"],
+        *SRC_CPU, "-lcublas", "-o", BENCH])
 
-# 3) fatbin verification on the exact binary that will run
-elf = sh(["cuobjdump", "--list-elf", BENCH]).stdout
-ptx = sh(["cuobjdump", "--list-ptx", BENCH]).stdout
-REPORT["gates"]["fatbin_3sass"] = all(a in elf for a in ("sm_60", "sm_70", "sm_75"))
-REPORT["gates"]["fatbin_ptx60"] = ("sm_60" in ptx) or ("compute_60" in ptx)
+    # 3) fatbin verification on the exact binary that will run
+    elf = sh(["cuobjdump", "--list-elf", BENCH]).stdout
+    ptx = sh(["cuobjdump", "--list-ptx", BENCH]).stdout
+    REPORT["gates"]["fatbin_3sass"] = all(a in elf for a in ("sm_60", "sm_70", "sm_75"))
+    REPORT["gates"]["fatbin_ptx60"] = ("sm_60" in ptx) or ("compute_60" in ptx)
+
+    # PTX-only twin (JIT face): same sources, compute_60 code only. The
+    # fp32jit route runs this binary — our kernels JIT from PTX, cuBLAS
+    # loads its own SASS normally (CUDA_FORCE_JIT breaks cuBLAS, see
+    # run_bench note).
+    sh(["nvcc", "-O2", "-std=c++17", "-DDIAR_WITH_CUDA", "-DDIAR_PROFILE_STAGE",
+        "-I", WORK + "/include",
+        "-gencode", "arch=compute_60,code=compute_60",
+        "-x", "cu", FILES["cpp_backend_cuda"],
+        "-x", "cu", FILES["cpp_encoder_cuda"],
+        "-x", "cu", FILES["cpp_stem_cuda"],
+        "-x", "cu", FILES["cpp_bench_main"],
+        *SRC_CPU, "-lcublas", "-o", BENCH_JIT])
+    jit_ptx = sh(["cuobjdump", "--list-ptx", BENCH_JIT]).stdout
+    jit_elf = sh(["cuobjdump", "--list-elf", BENCH_JIT]).stdout
+    REPORT["gates"]["jit_bin_ptx_only"] = ("compute_60" in jit_ptx) and \
+                                          ("sm_" not in jit_elf)
 
 # 4) weights + fixtures + audio
 HF_REPO = "nvidia/diar_streaming_sortformer_4spk-v2"
@@ -179,6 +219,10 @@ def find_audio(basename: str, roots: list) -> Path:
 GGUF = ensure_gguf()
 FIXROOT = find_fixtures_dir()
 CASES = case_dirs(FIXROOT)
+_pats = [p for p in str(S6_ROLE.get("cases", "")).split(",") if p]
+if _pats:
+    CASES = {k: v for k, v in CASES.items()
+             if any(p in k for p in _pats)}
 print("[s6k] fixtures:", sorted(CASES), flush=True)
 AUDIO_ROOTS = ["/kaggle/input"]
 
@@ -201,22 +245,20 @@ OFFICIAL_T4_MS = 45.5
 def run_bench(tag: str, mode: str, route: str, audio_f32: Path,
               ref: Path | None, ref_face: str, reps: int) -> dict:
     prefix = str(Path(WORK) / tag)
-    # fp32jit: same fp32 bench, but CUDA_FORCE_JIT=1 loads the fatbin via
-    # the embedded compute_60 PTX -> runtime JIT instead of the sm_75 SASS.
-    # The Pascal-codegen semantics proxy from Step 3's G-S3b (user has no
-    # P100 access right now; G-E cross-card check is deferred, this pins
-    # the sm_60 SEMANTICS on T4).
+    # fp32jit: runs the PTX-ONLY build (arch=compute_60,code=compute_60,
+    # no SASS) -> the driver JIT-compiles OUR kernels from the embedded
+    # compute_60 PTX. This is the Step 3 G-S3b mechanism, and crucially
+    # it does NOT touch cuBLAS: CUDA_FORCE_JIT=1 also force-JITs the
+    # library's SASS-only cubins -> cublasCreate fails NOT_INITIALIZED
+    # (s6b-gpu v1 lesson). Pascal-codegen semantics proxy on T4.
     bench_route = "fp32" if route == "fp32jit" else route
-    cmd = [BENCH, "--weights", str(GGUF), "--audio", str(audio_f32),
+    bench_exe = BENCH_JIT if route == "fp32jit" else BENCH
+    cmd = [bench_exe, "--weights", str(GGUF), "--audio", str(audio_f32),
            "--mode", mode, "--route", bench_route, "--reps", str(reps),
            "--label", tag, "--out", prefix]
     if ref is not None:
         cmd += ["--ref", str(ref), "--ref-face", ref_face]
-    env = None
-    if route == "fp32jit":
-        env = dict(os.environ)
-        env["CUDA_FORCE_JIT"] = "1"
-    sh(cmd, timeout=6 * 3600, env=env)
+    sh(cmd, timeout=6 * 3600)
     with open(prefix + ".bench.json") as f:
         return json.load(f)
 
@@ -231,24 +273,39 @@ def case_job(label: str, fdir: Path) -> dict:
     audio_f32.write_bytes(pcm.tobytes())
 
     out = {"mode": mode, "face": face, "routes": {}}
-    # fp32jit on streaming cases: compute_60 PTX-JIT semantics proxy
-    routes = [("cpu", 2)] if mode == "full-offline" else \
-             [("cpu", 2), ("fp32", 3), ("fp16", 3)]
-    if mode == "streaming":
-        routes += [("fp32jit", 2)]
+    # route selection by session role; fp32jit on streaming cases:
+    # compute_60 PTX-JIT semantics proxy (GPU sessions only)
+    _rr = S6_ROLE.get("routes", "all")
+    _reps_cpu = int(S6_ROLE.get("cpu_reps", 2))
+    _tag = str(S6_ROLE.get("tag", ""))
+    if mode == "full-offline":
+        routes = [] if _rr == "gpu" else [("cpu", _reps_cpu)]
+    elif _rr == "cpu":
+        routes = [("cpu", _reps_cpu)]
+    elif _rr == "gpu":
+        routes = [("fp32", 3), ("fp16", 3)]
+        if mode == "streaming":
+            routes += [("fp32jit", 2)]
+    else:
+        routes = [("cpu", _reps_cpu), ("fp32", 3), ("fp16", 3)]
+        if mode == "streaming":
+            routes += [("fp32jit", 2)]
     cpu_probs = None
     for route, reps in routes:
         ref = ref_fixture  # every route compares against the FIXTURE
-        bj = run_bench(f"{label}.{route}", mode, route, audio_f32, ref, face, reps)
+        bench_tag = f"{label}.{route}{_tag if route == 'cpu' else ''}"
+        bj = run_bench(bench_tag, mode, route, audio_f32, ref, face, reps)
         entry = {"bench": bj, "vs_fixture": bj.get("vs_ref")}
         if route == "cpu":
-            cpu_probs = Path(WORK) / f"{label}.cpu.postgate.f32"
+            cpu_probs = Path(WORK) / f"{bench_tag}.postgate.f32"
             if face == "pregate":
-                cpu_probs = Path(WORK) / f"{label}.cpu.pregate.f32"
+                cpu_probs = Path(WORK) / f"{bench_tag}.pregate.f32"
         else:
             # route-vs-cpu: compare the routed dump against the cpu dump
-            dump = Path(WORK) / f"{label}.{route}.{face}.f32"
-            entry["vs_cpu_max_abs"] = wire_diff(dump, cpu_probs)
+            # (absent on gpu-role sessions — deferred to the merge/harvest)
+            dump = Path(WORK) / f"{bench_tag}.{face}.f32"
+            if cpu_probs is not None:
+                entry["vs_cpu_max_abs"] = wire_diff(dump, cpu_probs)
         # JIT-vs-SASS: compute_60 PTX-JIT must be BIT-IDENTICAL to the
         # sm_75 SASS run (Step 3 G-S3b precedent) — the strongest no-P100
         # Pascal semantics pin.
@@ -276,8 +333,11 @@ def wire_diff(a: Path, b: Path) -> float:
     n = min(len(ra), len(rb))
     return float(np.abs(ra[:n].astype(np.float64) - rb[:n].astype(np.float64)).max())
 
-# 5) run the four fixtures in parallel (CPU baselines dominate; K6 shape)
-JOBS = 4
+# 5) run the fixtures in parallel (CPU baselines dominate; K6 shape).
+# GPU-role sessions serialize (max_workers=1): concurrent bench processes
+# share the T4 -> G-D timing contention + doubled host/device memory
+# (s6b-gpu v1 had 2-way overlap when the jit bench hit cublasCreate).
+JOBS = 1 if S6_ROLE.get("routes", "all") == "gpu" else 4
 with ThreadPoolExecutor(max_workers=JOBS) as ex:
     futs = {ex.submit(case_job, label, fdir): label
             for label, fdir in CASES.items()}

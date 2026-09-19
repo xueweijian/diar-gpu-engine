@@ -1,13 +1,12 @@
 {
-  "id": "weijianxue/diar-m3-step6",
-  "title": "diar-m3-step6",
+  "id": "weijianxue/diar-m3-s6b-a",
+  "title": "diar-m3-s6b-a",
   "code_file": "m6_step6_run.py",
   "language": "python",
   "kernel_type": "script",
   "is_private": true,
-  "enable_gpu": true,
+  "enable_gpu": false,
   "enable_internet": true,
-  "machine_shape": "NvidiaTeslaT4",
   "dataset_sources": [
     "weijianxue/diar-m2-fixtures",
     "weijianxue/diar-smoke-audio",
