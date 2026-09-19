@@ -13,6 +13,11 @@
 
 #include <cstddef>
 
+#ifdef DIAR_WITH_CUDA
+#include <cuda_runtime.h>  // at FILE SCOPE — inside a namespace it would
+// drag the whole CUDA runtime API into diar::backend (v4's compile error)
+#endif
+
 namespace diar::backend {
 namespace cuda {
 
@@ -40,8 +45,6 @@ int bench_device_sm_count();
 const char* bench_device_name();
 
 #ifdef DIAR_WITH_CUDA
-#include <cuda_runtime.h>  // cudaStream_t — never rely on include order
-
 void bench_empty_launch(cudaStream_t s, int block);
 void bench_ff_residual(float* ff, const float* res, std::size_t n,
                        cudaStream_t s, int block);
