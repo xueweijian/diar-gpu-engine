@@ -36,6 +36,12 @@ accumulation, ASR anything.
 - Output: `m3_stage1_profile.json` + decision note on which 3–5 operators
   cover ≥80% of time. Do not port anything before this lands.
 
+## 2b. Step 1 verdict (2026-09-19, docs/M3-STAGE1-PROFILE-VERDICT.md)
+
+conformer 92.34 % / transformer 6.85 % / stem 0.68 % — top3 99.87 %.
+Port order settled: the 17-layer conformer chain first; everything else
+stays CPU-side. Step 2 (backend skeleton) landed in d4fe425.
+
 ## 3. Step 2 — backend skeleton (local + CI-compiled, CPU-run)
 
 - `include/diar/backend.hpp`: opaque DeviceBuffer, Stream, and an
