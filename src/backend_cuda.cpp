@@ -464,6 +464,30 @@ __global__ void mha_softmax_kernel(const float* ac, const float* bd,
     for (int j = 0; j < t; ++j) pr[j] *= isum;
 }
 
+// One thread per (h, query-row), plain (non-rel-pos) attention:
+// probs = softmax(ac[h,i,:] * inv). Same numerical shape as
+// mha_softmax_kernel minus the bd term (transformer stack has no pos emb).
+__global__ void plain_softmax_kernel(const float* ac, float* probs, int t,
+                                     float inv) {
+    const int flat = blockIdx.x;  // h * t + i
+    const float* ar = ac + static_cast<std::size_t>(flat) * t;
+    float* pr = probs + static_cast<std::size_t>(flat) * t;
+    float m = -3.0e38f;
+    for (int j = 0; j < t; ++j) {
+        const float s = ar[j] * inv;
+        pr[j] = s;
+        m = fmaxf(m, s);
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < t; ++j) {
+        const float e = __expf(pr[j] - m);
+        pr[j] = e;
+        sum += e;
+    }
+    const float isum = 1.0f / sum;
+    for (int j = 0; j < t; ++j) pr[j] *= isum;
+}
+
 // device-resident linear: y = x @ w + bias (zero-pack plan, no host copies)
 void dev_linear(cublasHandle_t cublas, int block, const float* x,
                 const float* w, const float* bias, float* y, int t, int in,
@@ -604,6 +628,76 @@ void gpu_relpos_mha(cublasHandle_t cublas, cudaStream_t stream, int block,
             heads));
     }
     dev_linear(cublas, block, otmp, w.out_w, w.out_b, y, t, c, c);
+}
+
+std::size_t transformer_block_scratch_floats(int t, int h, int inner,
+                                             int heads) {
+    // dq dk dv ctx attn_out(->h1) h1_ln ff_out [7*t*h] | ff_mid [t*inner]
+    // | ac probs [2*heads*t*t]
+    const std::size_t th = static_cast<std::size_t>(t) * h;
+    return 7 * th + static_cast<std::size_t>(t) * inner +
+           2 * static_cast<std::size_t>(heads) * t * t;
+}
+
+void gpu_transformer_block(cublasHandle_t cublas, cudaStream_t stream,
+                           int block, const TransformerDevWeights& w,
+                           const float* x, float* y, float* ws, int t, int h,
+                           int inner, int heads) {
+    const int dk = h / heads;
+    const std::size_t th = static_cast<std::size_t>(t) * h;
+    float* dq = ws;
+    float* dkbuf = dq + th;
+    float* dv = dkbuf + th;
+    float* ctx = dv + th;      // merged head slices [t,h]
+    float* attn_out = ctx + th;  // becomes h1 after the residual add
+    float* h1_ln = attn_out + th;
+    float* ff_out = h1_ln + th;
+    float* ff_mid = ff_out + th;                 // [t, inner]
+    float* ac = ff_mid + static_cast<std::size_t>(t) * inner;  // [heads,t,t]
+    float* probs = ac + static_cast<std::size_t>(heads) * t * t;
+
+    // q/k/v projections (k=h)
+    dev_linear(cublas, block, x, w.q_w, w.q_b, dq, t, h, h);
+    dev_linear(cublas, block, x, w.k_w, w.k_b, dkbuf, t, h, h);
+    dev_linear(cublas, block, x, w.v_w, w.v_b, dv, t, h, h);
+    // ac[h] = q_h @ k_h^T — same zero-pack contiguous head-split contract
+    // as the rel-pos MHA (col-major [dk,t] ld=h slices of row-major [t,h]).
+    {
+        const float alpha = 1.0f, beta = 0.0f;
+        CUBLAS_CHECK(cublasSgemmStridedBatched(
+            cublas, CUBLAS_OP_T, CUBLAS_OP_N, t, t, dk, &alpha, dkbuf, h, dk,
+            dq, h, dk, &beta, ac, t, static_cast<long long>(t) * t, heads));
+    }
+    plain_softmax_kernel<<<static_cast<std::size_t>(heads) * t, 1, 0, stream>>>(
+        ac, probs, t, 1.0f / std::sqrt(static_cast<float>(dk)));
+    CUDA_CHECK(cudaGetLastError());
+    // ctx_h [t,dk] = probs_h @ v_h, written into the merged [t,h] slice.
+    {
+        const float alpha = 1.0f, beta = 0.0f;
+        CUBLAS_CHECK(cublasSgemmStridedBatched(
+            cublas, CUBLAS_OP_N, CUBLAS_OP_N, dk, t, t, &alpha, dv, h, dk,
+            probs, t, static_cast<long long>(t) * t, &beta, ctx, h, dk,
+            heads));
+    }
+    // post-LN block: attn proj -> +res -> LN1 -> FF(relu) -> +res -> LN2
+    dev_linear(cublas, block, ctx, w.o_w, w.o_b, attn_out, t, h, h);
+    add_scaled_kernel<<<bench_grid_for(th, block), block, 0, stream>>>(
+        attn_out, x, 1.0f, th);  // h1 = attn_out + x
+    layernorm_kernel<<<static_cast<unsigned>(t), block,
+                       2 * block * sizeof(float), stream>>>(
+        attn_out, w.ln1_g, w.ln1_b, h1_ln, t, h);
+    dev_linear(cublas, block, h1_ln, w.f1_w, w.f1_b, ff_mid, t, h, inner);
+    relu_inplace_kernel<<<bench_grid_for(static_cast<std::size_t>(t) * inner,
+                                         block),
+                          block, 0, stream>>>(
+        ff_mid, static_cast<std::size_t>(t) * inner);
+    dev_linear(cublas, block, ff_mid, w.f2_w, w.f2_b, ff_out, t, inner, h);
+    add_scaled_kernel<<<bench_grid_for(th, block), block, 0, stream>>>(
+        ff_out, h1_ln, 1.0f, th);  // h2 = ff_out + h1_ln
+    layernorm_kernel<<<static_cast<unsigned>(t), block,
+                       2 * block * sizeof(float), stream>>>(
+        ff_out, w.ln2_g, w.ln2_b, y, t, h);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 std::size_t conformer_layer_scratch_floats(int t, int c, int d_ff, int h) {

@@ -120,9 +120,11 @@ gate_from(parsed, "parity_glu", "g_s4a_glu")
 gate_from(parsed, "parity_dwconv", "g_s4a_dwconv")
 mha_rows = gate_from(parsed, "parity_mha", "g_s4b_mha")
 gate_from(parsed, "parity_layer", "g_s4c_layer")
-tl = [r for r in parsed if r.get("k") == "timeline"]
-if tl:
-    REPORT["timeline"] = tl[0]
+gate_from(parsed, "parity_tf", "g_s4e_tf")
+for tl_key in ("timeline", "timeline_tf", "timeline_full"):
+    rows = [r for r in parsed if r.get("k") == tl_key]
+    if rows:
+        REPORT[tl_key] = rows
 
 # 4) PTX-only binary (compute_60 PTX; JIT-compiles to sm_75 at load) —
 #    parity section must reproduce the SASS numbers (Step-3 mechanism).
@@ -146,12 +148,13 @@ gate_from(parsed2, "parity_glu", "g_s4jit_glu")
 gate_from(parsed2, "parity_dwconv", "g_s4jit_dwconv")
 gate_from(parsed2, "parity_mha", "g_s4jit_mha")
 gate_from(parsed2, "parity_layer", "g_s4jit_layer")
+gate_from(parsed2, "parity_tf", "g_s4jit_tf")
 # PTX-JIT semantics identical to SASS: same worst numbers on EVERY parity
 # output. Rows are keyed by (kind, shape-or-out) so multi-shape sections
 # compare pairwise.
 def _jit_identical() -> bool:
     kinds = ("parity_softmax", "parity_glu", "parity_dwconv", "parity_layer",
-             "parity_linear", "parity_mha")
+             "parity_linear", "parity_mha", "parity_tf")
 
     def index(rows):
         out = {}
@@ -183,5 +186,6 @@ REPORT["wall_s"] = round(time.time() - T0, 1)
 with open("/kaggle/working/step4_verdict.json", "w") as f:
     json.dump(REPORT, f, indent=1)
 print("[s4k] VERDICT:", verdict, "gates:", REPORT["gates"])
-print("[s4k] timeline:", REPORT.get("timeline"))
+for k in ("timeline", "timeline_tf", "timeline_full"):
+    print("[s4k]", k + ":", REPORT.get(k))
 print("[s4k] wall", REPORT["wall_s"], "s")

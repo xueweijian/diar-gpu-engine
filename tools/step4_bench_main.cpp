@@ -8,7 +8,10 @@
 //      G-S4b  rel-pos MHA parity (t=12/20/26)            <= 2*parity_gate(512)
 //      G-S4b2 raw GEMM baseline at k=512 (gate evidence)  <= parity_gate(512)
 //      G-S4c  full conformer layer parity (t=20)         <= 2e-4
-//      G-S4d  17-layer device-resident timeline (ms/chunk) — decision input
+//      G-S4e  transformer block parity (t=12/20/26)      <= 2*parity_gate(768)
+//      G-S4d  17-layer conformer timeline (ms/chunk) — decision input
+//      G-S4d2 18-layer transformer timeline
+//      G-S4d3 full-encoder timeline (conf x17 + proj + tf x18) vs G-D gate
 //  Reports [s4] JSON lines. All Step-4 chains run device-resident (GpuArena,
 //  zero H2D per chunk) — this is the production shape, not the Context
 //  per-call-copy path.
@@ -16,6 +19,7 @@
 #include "diar/conformer.hpp"
 #include "diar/conv.hpp"
 #include "diar/cublas_layout.hpp"
+#include "diar/layers.hpp"
 #include "diar/mha.hpp"
 #include "diar/nn.hpp"
 #include "diar/posenc.hpp"
@@ -34,7 +38,9 @@ using diar::backend::bench_softmax_rows;
 using diar::backend::conformer_layer_scratch_floats;
 using diar::backend::gpu_conformer_layer;
 using diar::backend::gpu_relpos_mha;
+using diar::backend::gpu_transformer_block;
 using diar::backend::mha_scratch_floats;
+using diar::backend::transformer_block_scratch_floats;
 #endif
 
 #include <algorithm>
@@ -62,6 +68,11 @@ constexpr int kK = 9;
 constexpr int kLayerParityT = 20;
 constexpr int kTimelineLayers = 17;
 constexpr int kTimelineChunks = 30;
+// transformer stack (plan §3 item 2): H=192, inner=768, 8 heads, 18 layers
+constexpr int kTH = 192;
+constexpr int kTI = 768;
+constexpr int kTHeads = 8;
+constexpr int kTimelineTfLayers = 18;
 
 constexpr double kOpGate = 1e-5;
 
@@ -78,6 +89,11 @@ inline double parity_gate(int k) {
 // indexing effect; the layer gate below covers the same MHA in context).
 const double kMhaGate = 2.0 * parity_gate(512);
 constexpr double kLayerGate = 2e-4;
+// Transformer block: q/k/v/o proj (k=192) -> plain attention (T^2 softmax
+// chain, same tier argument as the rel-pos MHA) -> FF (k=768 up / k=768
+// down reduction via inner=768). Deepest GEMM tier is 768; gate mirrors
+// the MHA pattern at that tier.
+const double kTfGate = 2.0 * parity_gate(768);
 
 std::mt19937& rng() { static std::mt19937 r(20260919); return r; }
 
@@ -200,6 +216,33 @@ struct LayerHost {
     }
 };
 
+struct TfHost {
+    std::vector<float> q_w, q_b, k_w, k_b, v_w, v_b, o_w, o_b;
+    std::vector<float> ln1_g, ln1_b, ln2_g, ln2_b;
+    std::vector<float> f1_w, f1_b, f2_w, f2_b;
+    void build(int h, int inner) {
+        auto mk = [this](std::vector<float>& v, std::size_t n) {
+            v.resize(n);
+            fill_random(v);
+        };
+        mk(q_w, static_cast<std::size_t>(h) * h); mk(q_b, h);
+        mk(k_w, static_cast<std::size_t>(h) * h); mk(k_b, h);
+        mk(v_w, static_cast<std::size_t>(h) * h); mk(v_b, h);
+        mk(o_w, static_cast<std::size_t>(h) * h); mk(o_b, h);
+        ln1_g.assign(h, 1.0f); ln1_b.assign(h, 0.0f);
+        ln2_g.assign(h, 1.0f); ln2_b.assign(h, 0.0f);
+        mk(f1_w, static_cast<std::size_t>(inner) * h); mk(f1_b, inner);
+        mk(f2_w, static_cast<std::size_t>(h) * inner); mk(f2_b, h);
+    }
+    diar::TransformerBlockWeights host_ref() const {
+        return diar::TransformerBlockWeights{
+            q_w.data(), q_b.data(), k_w.data(), k_b.data(),
+            v_w.data(), v_b.data(), o_w.data(), o_b.data(),
+            ln1_g.data(), ln1_b.data(), ln2_g.data(), ln2_b.data(),
+            f1_w.data(), f1_b.data(), f2_w.data(), f2_b.data()};
+    }
+};
+
 }  // namespace
 
 #ifdef DIAR_WITH_CUDA
@@ -264,6 +307,23 @@ diar::backend::LayerDevWeights upload_layer(
     w.conv.bn_w = up(h.conv.bn_w, ".bw");   w.conv.bn_b = up(h.conv.bn_b, ".bb");
     w.conv.bn_mean = up(h.conv.bn_mean, ".bm"); w.conv.bn_var = up(h.conv.bn_var, ".bv2");
     w.conv.pw2_w = up(h.conv.pw2_w, ".c2w"); w.conv.pw2_b = up(h.conv.pw2_b, ".c2b");
+    return w;
+}
+
+diar::backend::TransformerDevWeights upload_tf(
+    diar::backend::GpuArena& arena, const TfHost& h, const std::string& tag) {
+    diar::backend::TransformerDevWeights w{};
+    auto up = [&](const std::vector<float>& v, const char* n) {
+        return h2d(v, arena, (tag + n).c_str());
+    };
+    w.q_w = up(h.q_w, ".qw"); w.q_b = up(h.q_b, ".qb");
+    w.k_w = up(h.k_w, ".kw"); w.k_b = up(h.k_b, ".kb");
+    w.v_w = up(h.v_w, ".vw"); w.v_b = up(h.v_b, ".vb");
+    w.o_w = up(h.o_w, ".ow"); w.o_b = up(h.o_b, ".ob");
+    w.ln1_g = up(h.ln1_g, ".l1g"); w.ln1_b = up(h.ln1_b, ".l1b");
+    w.ln2_g = up(h.ln2_g, ".l2g"); w.ln2_b = up(h.ln2_b, ".l2b");
+    w.f1_w = up(h.f1_w, ".f1w"); w.f1_b = up(h.f1_b, ".f1b");
+    w.f2_w = up(h.f2_w, ".f2w"); w.f2_b = up(h.f2_b, ".f2b");
     return w;
 }
 
@@ -519,6 +579,55 @@ int main(int argc, char** argv) {
                ",\"pass\":" + (m <= kLayerGate ? "true" : "false") + "}\n");
     }
 
+    // ---- G-S4e: transformer block parity (t=12/20/26) ---------------------
+    // (in --parity-only mode too: the PTX-JIT pass must gate every layer
+    // family the production chain runs)
+    {
+        for (const TShape& s : kTShapes) {
+            const int t = s.t;
+            TfHost th;
+            th.build(kTH, kTI);
+            diar::backend::GpuArena a;
+            a.init(8u * 1024u * 1024u);
+            diar::backend::TransformerDevWeights dw = [&] {
+                diar::backend::TransformerDevWeights w{};
+                auto up = [&](const std::vector<float>& v, const char* n) {
+                    return h2d(v, a, n);
+                };
+                w.q_w = up(th.q_w, "qw"); w.q_b = up(th.q_b, "qb");
+                w.k_w = up(th.k_w, "kw"); w.k_b = up(th.k_b, "kb");
+                w.v_w = up(th.v_w, "vw"); w.v_b = up(th.v_b, "vb");
+                w.o_w = up(th.o_w, "ow"); w.o_b = up(th.o_b, "ob");
+                w.ln1_g = up(th.ln1_g, "l1g"); w.ln1_b = up(th.ln1_b, "l1b");
+                w.ln2_g = up(th.ln2_g, "l2g"); w.ln2_b = up(th.ln2_b, "l2b");
+                w.f1_w = up(th.f1_w, "f1w"); w.f1_b = up(th.f1_b, "f1b");
+                w.f2_w = up(th.f2_w, "f2w"); w.f2_b = up(th.f2_b, "f2b");
+                return w;
+            }();
+            std::vector<float> x(static_cast<std::size_t>(t) * kTH);
+            fill_random(x);
+            float* dx = h2d(x, a, "x");
+            float* dy = a.alloc("y", static_cast<std::size_t>(t) * kTH);
+            const std::size_t ws_n =
+                transformer_block_scratch_floats(t, kTH, kTI, kTHeads);
+            float* dws = a.alloc("ws", ws_n);
+            gpu_transformer_block(cublas, stream, kBlock, dw, dx, dy, dws, t,
+                                  kTH, kTI, kTHeads);
+            CUDA4_CHECK(cudaStreamSynchronize(stream));
+            std::vector<float> got(static_cast<std::size_t>(t) * kTH);
+            CUDA4_CHECK(cudaMemcpy(got.data(), dy, got.size() * 4,
+                                   cudaMemcpyDeviceToHost));
+            std::vector<float> ref(got.size());
+            diar::transformer_block_forward(x.data(), th.host_ref(),
+                                            ref.data(), t, kTH, kTI, kTHeads);
+            const double m = max_abs(ref, got);
+            report("parity_tf", std::string("\"shape\":\"") + s.name +
+                   "\",\"max_abs\":" + fmt9(m) +
+                   ",\"gate\":" + fmt9(kTfGate) +
+                   ",\"pass\":" + (m <= kTfGate ? "true" : "false") + "}\n");
+        }
+    }
+
     // ---- G-S4d: 17-layer device-resident timeline ------------------------
     // Per-layer weight floats (exact): LN 10c | FF 4*(d_ff*c) + 4*d_ff + 4c
     // | MHA 5c^2 + 6c | conv 3c^2 + c*k + 8c. t=20 is the production chunk
@@ -590,6 +699,122 @@ int main(int argc, char** argv) {
                        fmt9(per_chunk * 1000.0 / kTimelineLayers) + "}\n");
             CUDA4_CHECK(cudaEventDestroy(e0));
             CUDA4_CHECK(cudaEventDestroy(e1));
+        }
+    }
+
+    // ---- G-S4d2/G-S4d3: transformer stack + full-encoder timelines --------
+    // G-S4d2: 18 transformer layers alone. G-S4d3: the production chunk
+    // chain end-to-end — conformer x17 -> encoder proj (512->192) ->
+    // transformer x18, all device-resident. This is the number the G-D
+    // gate (< 25 ms/chunk, stretch < 20) is judged against.
+    if (!parity_only) {
+        const std::size_t per_layer =
+            10u * kC + 4u * static_cast<std::size_t>(kF) * kC + 4u * kF +
+            4u * kC + 5u * kC * kC + 6u * kC + 3u * kC * kC +
+            static_cast<std::size_t>(kC) * kK + 8u * kC;
+        const std::size_t tf_per_layer =
+            4u * static_cast<std::size_t>(kTH) * kTH + 4u * kTH + 4u * kTH +
+            static_cast<std::size_t>(kTI) * kTH + kTI +
+            static_cast<std::size_t>(kTH) * kTI + kTH;
+        diar::backend::GpuArena a;
+        a.init(kTimelineLayers * per_layer +
+               kTimelineTfLayers * tf_per_layer +
+               static_cast<std::size_t>(kTH) * kC + kTH +  // proj w+b
+               16u * 1024u * 1024u);                       // activations+ws
+        std::vector<diar::backend::LayerDevWeights> conf;
+        for (int i = 0; i < kTimelineLayers; ++i) {
+            LayerHost lh;
+            lh.build(kC, kF, kK);
+            conf.push_back(upload_layer(a, lh, "F" + std::to_string(i)));
+        }
+        std::vector<diar::backend::TransformerDevWeights> tf;
+        for (int i = 0; i < kTimelineTfLayers; ++i) {
+            TfHost th;
+            th.build(kTH, kTI);
+            tf.push_back(upload_tf(a, th, "U" + std::to_string(i)));
+        }
+        // encoder proj [kTH,kC] + bias
+        std::vector<float> proj_w(static_cast<std::size_t>(kTH) * kC);
+        std::vector<float> proj_b(kTH);
+        fill_random(proj_w);
+        fill_random(proj_b);
+        float* dproj_w = h2d(proj_w, a, "pjw");
+        float* dproj_b = h2d(proj_b, a, "pjb");
+
+        struct FState {
+            int t;
+            float *dpos, *xc, *yc, *ws_c, *xt, *yt, *ws_t;
+        };
+        std::vector<FState> fstates;
+        for (const int t : {20, 26}) {
+            const int p = 2 * t - 1;
+            std::vector<float> x(static_cast<std::size_t>(t) * kC);
+            std::vector<float> pos(static_cast<std::size_t>(p) * kC);
+            fill_random(x);
+            diar::relpos_table_forward(pos.data(), t, kC);
+            const std::string tag = std::to_string(t);
+            fstates.push_back(FState{
+                t, h2d(pos, a, "pos" + tag), h2d(x, a, "xc" + tag),
+                a.alloc(("yc" + tag).c_str(),
+                        static_cast<std::size_t>(t) * kC),
+                a.alloc(("wsc" + tag).c_str(),
+                        conformer_layer_scratch_floats(t, kC, kF, kH)),
+                a.alloc(("xt" + tag).c_str(),
+                        static_cast<std::size_t>(t) * kTH),
+                a.alloc(("yt" + tag).c_str(),
+                        static_cast<std::size_t>(t) * kTH),
+                a.alloc(("wst" + tag).c_str(),
+                        transformer_block_scratch_floats(t, kTH, kTI,
+                                                          kTHeads))});
+        }
+        auto run_tf_chain = [&](const FState& st) {
+            float* in = st.xt;
+            float* out = st.yt;
+            for (int l = 0; l < kTimelineTfLayers; ++l) {
+                gpu_transformer_block(cublas, stream, kBlock, tf[l], in, out,
+                                      st.ws_t, st.t, kTH, kTI, kTHeads);
+                std::swap(in, out);
+            }
+        };
+        auto run_full_chain = [&](const FState& st) {
+            float* in = st.xc;
+            float* out = st.yc;
+            for (int l = 0; l < kTimelineLayers; ++l) {
+                gpu_conformer_layer(cublas, stream, kBlock, conf[l], in,
+                                    st.dpos, out, st.ws_c, st.t, kC, kF, kH);
+                std::swap(in, out);
+            }
+            diar::backend::bench_linear(cublas, stream, kBlock, in, dproj_w,
+                                        dproj_b, st.xt, st.t, kC, kTH);
+            run_tf_chain(st);
+        };
+        for (const FState& st : fstates)
+            for (int c = 0; c < 8; ++c) run_full_chain(st);
+        for (const FState& st : fstates) {
+            for (int which = 0; which < 2; ++which) {
+                cudaEvent_t e0, e1;
+                CUDA4_CHECK(cudaEventCreate(&e0));
+                CUDA4_CHECK(cudaEventCreate(&e1));
+                CUDA4_CHECK(cudaEventRecord(e0, stream));
+                for (int c = 0; c < kTimelineChunks; ++c)
+                    which == 0 ? run_tf_chain(st) : run_full_chain(st);
+                CUDA4_CHECK(cudaEventRecord(e1, stream));
+                CUDA4_CHECK(cudaEventSynchronize(e1));
+                float total_ms = 0.0f;
+                CUDA4_CHECK(cudaEventElapsedTime(&total_ms, e0, e1));
+                const double per_chunk = total_ms / kTimelineChunks;
+                const int nl =
+                    which == 0 ? kTimelineTfLayers
+                               : kTimelineLayers + kTimelineTfLayers + 1;
+                report(which == 0 ? "timeline_tf" : "timeline_full",
+                       "\"layers\":" + std::to_string(nl) +
+                           ",\"t\":" + std::to_string(st.t) +
+                           ",\"ms_per_chunk\":" + fmt9(per_chunk) +
+                           ",\"us_per_layer\":" +
+                           fmt9(per_chunk * 1000.0 / nl) + "}\n");
+                CUDA4_CHECK(cudaEventDestroy(e0));
+                CUDA4_CHECK(cudaEventDestroy(e1));
+            }
         }
     }
 
@@ -669,6 +894,35 @@ int main() {
         const float want[10] = {-0.400000f, 5.900000f, 1.100000f, 8.400000f, 3.100000f, 10.900000f, 5.100000f, 13.400000f, 12.600000f, -8.100000f};
         for (int i = 0; i < 10; ++i)
             expect(std::fabs(cy[i] - want[i]) < 1e-5, "dwconv naive oracle");
+    }
+    // transformer block reference: finite + post-LN rows are standardized
+    // (gamma=1/beta=0 host set => mean~0, biased var~1 per row) — the same
+    // reference the G-S4e GPU gate compares against.
+    {
+        const int tt = 6;
+        TfHost th;
+        th.build(kTH, kTI);
+        std::vector<float> tx(static_cast<std::size_t>(tt) * kTH);
+        fill_random(tx);
+        std::vector<float> ty(tx.size());
+        diar::transformer_block_forward(tx.data(), th.host_ref(), ty.data(),
+                                        tt, kTH, kTI, kTHeads);
+        for (int r = 0; r < tt; ++r) {
+            double mean = 0.0, var = 0.0;
+            for (int i = 0; i < kTH; ++i)
+                mean += ty[static_cast<std::size_t>(r) * kTH + i];
+            mean /= kTH;
+            for (int i = 0; i < kTH; ++i) {
+                const double d =
+                    ty[static_cast<std::size_t>(r) * kTH + i] - mean;
+                var += d * d;
+            }
+            var /= kTH;
+            expect(std::isfinite(mean) && std::isfinite(var),
+                   "tf row stats finite");
+            expect(std::fabs(mean) < 1e-4, "tf post-LN row mean ~ 0");
+            expect(std::fabs(var - 1.0) < 1e-3, "tf post-LN row var ~ 1");
+        }
     }
     report("verdict", "\"mode\":\"cpu-selftest-complete\"}\n");
     return 0;

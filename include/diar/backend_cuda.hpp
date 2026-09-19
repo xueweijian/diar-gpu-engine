@@ -120,6 +120,28 @@ void gpu_conformer_layer(cublasHandle_t cublas, cudaStream_t stream,
                          const float* x, const float* pos, float* y,
                          float* ws, int t, int c, int d_ff, int heads);
 
+// ---- Step 4b: transformer block (18-layer stack, plan §3 item 2) ---------
+//
+// Plain (non-rel-pos, unmasked) MHA + post-LN + ReLU FF. Mirrors
+// diar::transformer_block_forward (M2 K1 gate: numpy mirror matched NeMo
+// fp32 to 1.1e-6, so the CPU reference is the parity anchor). Post-LN
+// order: attn -> +res -> LN1 -> FF -> +res -> LN2. Weight layout PyTorch
+// [out,in] exactly as TransformerBlockWeights (device pointers).
+struct TransformerDevWeights {
+    const float *q_w, *q_b, *k_w, *k_b, *v_w, *v_b, *o_w, *o_b;
+    const float *ln1_g, *ln1_b, *ln2_g, *ln2_b;
+    const float *f1_w, *f1_b, *f2_w, *f2_b;
+};
+
+std::size_t transformer_block_scratch_floats(int t, int h, int inner,
+                                             int heads);
+
+// x [t,h] -> y [t,h]; ws >= transformer_block_scratch_floats.
+void gpu_transformer_block(cublasHandle_t cublas, cudaStream_t stream,
+                           int block, const TransformerDevWeights& w,
+                           const float* x, float* y, float* ws, int t, int h,
+                           int inner, int heads);
+
 // Raw device-resident linear (same plan as Step 3's Context::linear, no
 // host copies): gate-evidence probe for the cuBLAS reduction-noise tier.
 void bench_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
