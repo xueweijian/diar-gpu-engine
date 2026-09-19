@@ -26,6 +26,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace diar::backend {
@@ -132,6 +133,16 @@ __global__ void layernorm_kernel(const float* x, const float* gamma,
 
 // empty kernel for launch-overhead measurement (bench harness)
 __global__ void empty_kernel() {}
+
+// fp32 -> fp16 (RNE) cast for the Step-5 fp16-storage route. Must match
+// the host packer bit-for-bit (cublas_layout.hpp float_to_half) — gated
+// by bench_cast_f32_f16 parity in the Step-5 harness.
+__global__ void cast_f32_f16_kernel(const float* x, __half* y,
+                                    std::size_t n) {
+    const std::size_t i =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2half_rn(x[i]);
+}
 
 // ---- device buffer RAII ----------------------------------------------------
 
@@ -488,21 +499,41 @@ __global__ void plain_softmax_kernel(const float* ac, float* probs, int t,
     for (int j = 0; j < t; ++j) pr[j] *= isum;
 }
 
-// device-resident linear: y = x @ w + bias (zero-pack plan, no host copies)
-void dev_linear(cublasHandle_t cublas, int block, const float* x,
-                const float* w, const float* bias, float* y, int t, int in,
-                int out) {
+// device-resident linear: y = x @ w + bias (zero-pack plan, no host copies).
+// Template over the weight type: float = fp32 Sgemm route (cast16 unused);
+// __half = fp16-storage route (Step 5): x is cast fp32->fp16 into cast16
+// on-stream, then cublasGemmEx 16F-in / 32F-accumulate / 32F-out. The
+// bias-add now launches on the CALLER's stream (the Step-4 version used
+// the legacy default stream, which serialized against the caller's stream
+// once per GEMM — a silent per-GEMM pipeline stall, fixed here).
+template <typename WT>
+void dev_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
+                const float* x, const WT* w, const float* bias, float* y,
+                int t, int in, int out, __half* cast16) {
     const auto plan = linear_gemm_plan(t, in, out);
     const float alpha = 1.0f, beta = 0.0f;
-    CUBLAS_CHECK(cublasSgemm(cublas,
-                             static_cast<cublasOperation_t>(plan.op_a),
-                             static_cast<cublasOperation_t>(plan.op_b),
-                             plan.m, plan.n, plan.k, &alpha, w, plan.lda, x,
-                             plan.ldb, &beta, y, plan.ldc));
+    if constexpr (std::is_same<WT, float>::value) {
+        CUBLAS_CHECK(cublasSgemm(cublas,
+                                 static_cast<cublasOperation_t>(plan.op_a),
+                                 static_cast<cublasOperation_t>(plan.op_b),
+                                 plan.m, plan.n, plan.k, &alpha, w, plan.lda,
+                                 x, plan.ldb, &beta, y, plan.ldc));
+    } else {
+        const std::size_t xn = static_cast<std::size_t>(t) * in;
+        cast_f32_f16_kernel<<<bench_grid_for(xn, block), block, 0, stream>>>(
+            x, cast16, xn);
+        CUDA_CHECK(cudaGetLastError());
+        CUBLAS_CHECK(cublasGemmEx(
+            cublas, static_cast<cublasOperation_t>(plan.op_a),
+            static_cast<cublasOperation_t>(plan.op_b), plan.m, plan.n, plan.k,
+            &alpha, w, CUDA_R_16F, plan.lda, cast16, CUDA_R_16F, plan.ldb,
+            &beta, y, CUDA_R_32F, plan.ldc, CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT));
+    }
     if (bias) {
         const std::size_t yn = static_cast<std::size_t>(t) * out;
-        add_rows_bias_kernel<<<bench_grid_for(yn, block), block>>>(y, bias,
-                                                                   yn, out);
+        add_rows_bias_kernel<<<bench_grid_for(yn, block), block, 0, stream>>>(
+            y, bias, yn, out);
         CUDA_CHECK(cudaGetLastError());
     }
 }
@@ -513,8 +544,10 @@ std::size_t mha_scratch_floats(int t, int c, int h) {
     const int p = 2 * t - 1;
     const std::size_t tc = static_cast<std::size_t>(t) * c;
     // qu qv q k v [5*tc] | p [p*c] | out_tmp [tc] | ac bd probs [h*t*(2t+p)]
+    // | cast16 region (fp16 route: largest GEMM input is pos [p,c] halves)
     return 6 * tc + static_cast<std::size_t>(p) * c +
-           static_cast<std::size_t>(h) * t * (2 * t + p);
+           static_cast<std::size_t>(h) * t * (2 * t + p) +
+           ((static_cast<std::size_t>(p) * c + 1) / 2);
 }
 
 // GpuArena: one cudaMalloc, bump-allocated named spans (weights device
@@ -567,13 +600,21 @@ GpuArena::~GpuArena() {
     std::free(ptrs_);
 }
 
+template <typename W>
 void gpu_relpos_mha(cublasHandle_t cublas, cudaStream_t stream, int block,
-                    const MhaDevWeights& w, const float* x, const float* pos,
+                    const W& w, const float* x, const float* pos,
                     float* y, float* ws, int t, int c, int heads) {
     const int p = 2 * t - 1;
     const int dk = c / heads;
     const std::size_t tc = static_cast<std::size_t>(t) * c;
     const std::size_t pc = static_cast<std::size_t>(p) * c;
+    const std::size_t cast16_f =
+        (pc + 1) / 2;  // pos [p,c] halves, packed 2/float
+    float* ws_end = ws + (6 * tc + pc +
+                          static_cast<std::size_t>(heads) * t *
+                              (2 * t + p) +
+                          cast16_f);
+    __half* cast16 = reinterpret_cast<__half*>(ws_end - cast16_f);
     float* qu = ws;
     float* qv = qu + tc;
     float* dq = qv + tc;
@@ -586,10 +627,12 @@ void gpu_relpos_mha(cublasHandle_t cublas, cudaStream_t stream, int block,
     float* bd = ac + per_h * t;     // [h, t, p]
     float* probs = bd + per_h * p;  // [h, t, t]
 
-    dev_linear(cublas, block, x, w.q_w, w.q_b, dq, t, c, c);
-    dev_linear(cublas, block, x, w.k_w, w.k_b, dkbuf, t, c, c);
-    dev_linear(cublas, block, x, w.v_w, w.v_b, dv, t, c, c);
-    dev_linear(cublas, block, pos, w.pos_w, nullptr, dp, p, c, c);
+    dev_linear(cublas, stream, block, x, w.q_w, w.q_b, dq, t, c, c, cast16);
+    dev_linear(cublas, stream, block, x, w.k_w, w.k_b, dkbuf, t, c, c,
+               cast16);
+    dev_linear(cublas, stream, block, x, w.v_w, w.v_b, dv, t, c, c, cast16);
+    dev_linear(cublas, stream, block, pos, w.pos_w, nullptr, dp, p, c, c,
+               cast16);
     CUDA_CHECK(cudaMemcpyAsync(qu, dq, tc * sizeof(float),
                                cudaMemcpyDeviceToDevice, stream));
     add_rows_bias_kernel<<<bench_grid_for(tc, block), block, 0, stream>>>(
@@ -627,24 +670,34 @@ void gpu_relpos_mha(cublasHandle_t cublas, cudaStream_t stream, int block,
             probs, t, static_cast<long long>(t) * t, &beta, otmp, c, dk,
             heads));
     }
-    dev_linear(cublas, block, otmp, w.out_w, w.out_b, y, t, c, c);
+    dev_linear(cublas, stream, block, otmp, w.out_w, w.out_b, y, t, c, c,
+               cast16);
 }
 
 std::size_t transformer_block_scratch_floats(int t, int h, int inner,
                                              int heads) {
     // dq dk dv ctx attn_out(->h1) h1_ln ff_out [7*t*h] | ff_mid [t*inner]
-    // | ac probs [2*heads*t*t]
+    // | ac probs [2*heads*t*t] | cast16 region (fp16 route; largest GEMM
+    // input is ff_mid [t,inner] halves)
     const std::size_t th = static_cast<std::size_t>(t) * h;
     return 7 * th + static_cast<std::size_t>(t) * inner +
-           2 * static_cast<std::size_t>(heads) * t * t;
+           2 * static_cast<std::size_t>(heads) * t * t +
+           ((static_cast<std::size_t>(t) * inner + 1) / 2);
 }
 
+template <typename W>
 void gpu_transformer_block(cublasHandle_t cublas, cudaStream_t stream,
-                           int block, const TransformerDevWeights& w,
+                           int block, const W& w,
                            const float* x, float* y, float* ws, int t, int h,
                            int inner, int heads) {
     const int dk = h / heads;
     const std::size_t th = static_cast<std::size_t>(t) * h;
+    const std::size_t cast16_f =
+        (static_cast<std::size_t>(t) * inner + 1) / 2;
+    float* ws_end =
+        ws + 7 * th + static_cast<std::size_t>(t) * inner +
+        2 * static_cast<std::size_t>(heads) * t * t + cast16_f;
+    __half* cast16 = reinterpret_cast<__half*>(ws_end - cast16_f);
     float* dq = ws;
     float* dkbuf = dq + th;
     float* dv = dkbuf + th;
@@ -657,9 +710,10 @@ void gpu_transformer_block(cublasHandle_t cublas, cudaStream_t stream,
     float* probs = ac + static_cast<std::size_t>(heads) * t * t;
 
     // q/k/v projections (k=h)
-    dev_linear(cublas, block, x, w.q_w, w.q_b, dq, t, h, h);
-    dev_linear(cublas, block, x, w.k_w, w.k_b, dkbuf, t, h, h);
-    dev_linear(cublas, block, x, w.v_w, w.v_b, dv, t, h, h);
+    dev_linear(cublas, stream, block, x, w.q_w, w.q_b, dq, t, h, h, cast16);
+    dev_linear(cublas, stream, block, x, w.k_w, w.k_b, dkbuf, t, h, h,
+               cast16);
+    dev_linear(cublas, stream, block, x, w.v_w, w.v_b, dv, t, h, h, cast16);
     // ac[h] = q_h @ k_h^T — same zero-pack contiguous head-split contract
     // as the rel-pos MHA (col-major [dk,t] ld=h slices of row-major [t,h]).
     {
@@ -680,18 +734,21 @@ void gpu_transformer_block(cublasHandle_t cublas, cudaStream_t stream,
             heads));
     }
     // post-LN block: attn proj -> +res -> LN1 -> FF(relu) -> +res -> LN2
-    dev_linear(cublas, block, ctx, w.o_w, w.o_b, attn_out, t, h, h);
+    dev_linear(cublas, stream, block, ctx, w.o_w, w.o_b, attn_out, t, h, h,
+               cast16);
     add_scaled_kernel<<<bench_grid_for(th, block), block, 0, stream>>>(
         attn_out, x, 1.0f, th);  // h1 = attn_out + x
     layernorm_kernel<<<static_cast<unsigned>(t), block,
                        2 * block * sizeof(float), stream>>>(
         attn_out, w.ln1_g, w.ln1_b, h1_ln, t, h);
-    dev_linear(cublas, block, h1_ln, w.f1_w, w.f1_b, ff_mid, t, h, inner);
+    dev_linear(cublas, stream, block, h1_ln, w.f1_w, w.f1_b, ff_mid, t, h,
+               inner, cast16);
     relu_inplace_kernel<<<bench_grid_for(static_cast<std::size_t>(t) * inner,
                                          block),
                           block, 0, stream>>>(
         ff_mid, static_cast<std::size_t>(t) * inner);
-    dev_linear(cublas, block, ff_mid, w.f2_w, w.f2_b, ff_out, t, inner, h);
+    dev_linear(cublas, stream, block, ff_mid, w.f2_w, w.f2_b, ff_out, t,
+               inner, h, cast16);
     add_scaled_kernel<<<bench_grid_for(th, block), block, 0, stream>>>(
         ff_out, h1_ln, 1.0f, th);  // h2 = ff_out + h1_ln
     layernorm_kernel<<<static_cast<unsigned>(t), block,
@@ -702,17 +759,25 @@ void gpu_transformer_block(cublasHandle_t cublas, cudaStream_t stream,
 
 std::size_t conformer_layer_scratch_floats(int t, int c, int d_ff, int h) {
     // res tmp attn [3tc] | ff_up [t*ff] | pw1 [2tc] | glu_out dw_out [2tc]
-    // | mha scratch
+    // | mha scratch (own cast16 region inside) | layer cast16 region
+    // (fp16 route: largest own GEMM input is ff_up [t,d_ff] halves)
     const std::size_t tc = static_cast<std::size_t>(t) * c;
     return 7 * tc + static_cast<std::size_t>(t) * d_ff +
-           mha_scratch_floats(t, c, h);
+           mha_scratch_floats(t, c, h) +
+           ((static_cast<std::size_t>(t) * d_ff + 1) / 2);
 }
 
+template <typename W>
 void gpu_conformer_layer(cublasHandle_t cublas, cudaStream_t stream,
-                         int block, const LayerDevWeights& w, const float* x,
+                         int block, const W& w, const float* x,
                          const float* pos, float* y, float* ws, int t, int c,
                          int d_ff, int heads) {
     const std::size_t tc = static_cast<std::size_t>(t) * c;
+    const std::size_t cast16_f =
+        (static_cast<std::size_t>(t) * d_ff + 1) / 2;
+    float* ws_end = ws + 7 * tc + static_cast<std::size_t>(t) * d_ff +
+                    mha_scratch_floats(t, c, h) + cast16_f;
+    __half* cast16 = reinterpret_cast<__half*>(ws_end - cast16_f);
     float* res = ws;
     float* tmp = res + tc;
     float* attn = tmp + tc;
@@ -731,11 +796,13 @@ void gpu_conformer_layer(cublasHandle_t cublas, cudaStream_t stream,
     layernorm_kernel<<<static_cast<unsigned>(t), block,
                        2 * block * sizeof(float), stream>>>(
         res, w.n_ff1_g, w.n_ff1_b, tmp, t, c);
-    dev_linear(cublas, block, tmp, w.ff1_w1, w.ff1_b1, ff_up, t, c, d_ff);
+    dev_linear(cublas, stream, block, tmp, w.ff1_w1, w.ff1_b1, ff_up, t, c,
+               d_ff, cast16);
     silu_kernel<<<bench_grid_for(static_cast<std::size_t>(t) * d_ff, block),
                   block, 0, stream>>>(ff_up, ff_up,
                                       static_cast<std::size_t>(t) * d_ff);
-    dev_linear(cublas, block, ff_up, w.ff1_w2, w.ff1_b2, tmp, t, d_ff, c);
+    dev_linear(cublas, stream, block, ff_up, w.ff1_w2, w.ff1_b2, tmp, t,
+               d_ff, c, cast16);
     add_scaled_kernel<<<bench_grid_for(tc, pw_block), pw_block, 0, stream>>>(
         res, tmp, 0.5f, tc);
 
@@ -752,7 +819,8 @@ void gpu_conformer_layer(cublasHandle_t cublas, cudaStream_t stream,
     layernorm_kernel<<<static_cast<unsigned>(t), block,
                        2 * block * sizeof(float), stream>>>(
         res, w.n_conv_g, w.n_conv_b, tmp, t, c);
-    dev_linear(cublas, block, tmp, w.conv.pw1_w, w.conv.pw1_b, pw1, t, c, 2 * c);
+    dev_linear(cublas, stream, block, tmp, w.conv.pw1_w, w.conv.pw1_b, pw1,
+               t, c, 2 * c, cast16);
     glu_kernel<<<bench_grid_for(tc, pw_block), pw_block, 0, stream>>>(
         pw1, glu_out, t, c);
     dwconv_bn_silu_kernel<<<bench_grid_for(tc, pw_block), pw_block, 0,
@@ -760,7 +828,8 @@ void gpu_conformer_layer(cublasHandle_t cublas, cudaStream_t stream,
                                       w.conv.bn_w, w.conv.bn_b,
                                       w.conv.bn_mean, w.conv.bn_var, dw_out,
                                       t, c, 9);
-    dev_linear(cublas, block, dw_out, w.conv.pw2_w, w.conv.pw2_b, tmp, t, c, c);
+    dev_linear(cublas, stream, block, dw_out, w.conv.pw2_w, w.conv.pw2_b,
+               tmp, t, c, c, cast16);
     add_scaled_kernel<<<bench_grid_for(tc, pw_block), pw_block, 0, stream>>>(
         res, tmp, 1.0f, tc);
 
@@ -768,11 +837,13 @@ void gpu_conformer_layer(cublasHandle_t cublas, cudaStream_t stream,
     layernorm_kernel<<<static_cast<unsigned>(t), block,
                        2 * block * sizeof(float), stream>>>(
         res, w.n_ff2_g, w.n_ff2_b, tmp, t, c);
-    dev_linear(cublas, block, tmp, w.ff2_w1, w.ff2_b1, ff_up, t, c, d_ff);
+    dev_linear(cublas, stream, block, tmp, w.ff2_w1, w.ff2_b1, ff_up, t, c,
+               d_ff, cast16);
     silu_kernel<<<bench_grid_for(static_cast<std::size_t>(t) * d_ff, block),
                   block, 0, stream>>>(ff_up, ff_up,
                                       static_cast<std::size_t>(t) * d_ff);
-    dev_linear(cublas, block, ff_up, w.ff2_w2, w.ff2_b2, tmp, t, d_ff, c);
+    dev_linear(cublas, stream, block, ff_up, w.ff2_w2, w.ff2_b2, tmp, t,
+               d_ff, c, cast16);
     add_scaled_kernel<<<bench_grid_for(tc, pw_block), pw_block, 0, stream>>>(
         res, tmp, 0.5f, tc);
     layernorm_kernel<<<static_cast<unsigned>(t), block,
@@ -783,10 +854,46 @@ void gpu_conformer_layer(cublasHandle_t cublas, cudaStream_t stream,
 
 // isolated-op bench entries (parity vs CPU references)
 
+// explicit instantiations: exactly two routes (fp32 Sgemm / fp16-storage
+// GemmEx) — matches the extern-template declarations in backend_cuda.hpp.
+template void gpu_relpos_mha<MhaDevWeights>(
+    cublasHandle_t, cudaStream_t, int, const MhaDevWeights&, const float*,
+    const float*, float*, float*, int, int, int);
+template void gpu_relpos_mha<MhaDevWeightsH>(
+    cublasHandle_t, cudaStream_t, int, const MhaDevWeightsH&, const float*,
+    const float*, float*, float*, int, int, int);
+template void gpu_conformer_layer<LayerDevWeights>(
+    cublasHandle_t, cudaStream_t, int, const LayerDevWeights&, const float*,
+    const float*, float*, float*, int, int, int, int);
+template void gpu_conformer_layer<LayerDevWeightsH>(
+    cublasHandle_t, cudaStream_t, int, const LayerDevWeightsH&, const float*,
+    const float*, float*, float*, int, int, int, int);
+template void gpu_transformer_block<TransformerDevWeights>(
+    cublasHandle_t, cudaStream_t, int, const TransformerDevWeights&,
+    const float*, float*, float*, int, int, int, int);
+template void gpu_transformer_block<TransformerDevWeightsH>(
+    cublasHandle_t, cudaStream_t, int, const TransformerDevWeightsH&,
+    const float*, float*, float*, int, int, int, int);
+
 void bench_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
                   const float* x, const float* w, const float* b, float* y,
                   int t, int in, int out) {
-    dev_linear(cublas, block, x, w, b, y, t, in, out);
+    dev_linear<float>(cublas, stream, block, x, w, b, y, t, in, out,
+                      nullptr);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bench_linear_h(cublasHandle_t cublas, cudaStream_t stream, int block,
+                    const float* x, const __half* w, const float* b,
+                    float* y, int t, int in, int out, __half* cast16) {
+    dev_linear<__half>(cublas, stream, block, x, w, b, y, t, in, out,
+                       cast16);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bench_cast_f32_f16(const float* x, __half* y, std::size_t n,
+                        cudaStream_t s, int block) {
+    cast_f32_f16_kernel<<<bench_grid_for(n, block), block, 0, s>>>(x, y, n);
     CUDA_CHECK(cudaGetLastError());
 }
 

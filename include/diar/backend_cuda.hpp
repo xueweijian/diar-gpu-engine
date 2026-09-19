@@ -16,7 +16,7 @@
 #ifdef DIAR_WITH_CUDA
 #include <cublas_v2.h>     // both at FILE SCOPE — inside a namespace they
 #include <cuda_runtime.h>  // would drag the whole CUDA API into diar::backend
-// (v4's compile error)
+#include <cuda_fp16.h>     // (v4's compile error). fp16 storage route (Step 5).
 #endif
 
 namespace diar::backend {
@@ -99,26 +99,84 @@ struct LayerDevWeights {
     ConvDevWeights conv;
 };
 
+// ---- Step 5: fp16 weight storage (opt-in GemmEx 16F-in / 32F-acc route) ---
+//
+// H-suffix structs mirror the fp32 ones field-for-field with the SAME field
+// names, except every GEMM weight (*_w) is __half. Biases, LayerNorm and BN
+// parameters stay fp32 (they feed pointwise kernels, not GEMMs). The layer
+// bodies below are templates over the weights struct type, so the fp32 and
+// fp16 routes share ONE source of truth — no drift between paths.
+//
+// Semantics: weights are quantized fp32->fp16 (RNE) once at upload
+// (cublas_layout.hpp float_to_half + pack_weights_f16); each GEMM input
+// activation is cast fp32->fp16 on device right before cublasGemmEx
+// (computeType CUBLAS_COMPUTE_32F, C output fp32 — accumulation stays
+// fp32 on every card: P100 runs it on fp16-capable CUDA cores, T4/V100
+// may dispatch HMMA with fp32 accumulate; the K6 four-fixture gate is
+// the arbiter for whether this route ships as default).
+struct MhaDevWeightsH {
+    const __half *q_w, *k_w, *v_w, *pos_w, *out_w;  // GEMM weights
+    const float *q_b, *k_b, *v_b, *bu, *bv, *out_b;
+};
+struct ConvDevWeightsH {
+    const __half *pw1_w, *pw2_w;
+    const float *pw1_b, *dw_w, *dw_b, *bn_w, *bn_b, *bn_mean, *bn_var;
+};
+struct LayerDevWeightsH {
+    const float *n_ff1_g, *n_ff1_b, *n_sa_g, *n_sa_b, *n_conv_g, *n_conv_b,
+        *n_ff2_g, *n_ff2_b, *n_out_g, *n_out_b;
+    const float *ff1_b1, *ff1_b2, *ff2_b1, *ff2_b2;
+    const __half *ff1_w1, *ff1_w2, *ff2_w1, *ff2_w2;
+    MhaDevWeightsH attn;
+    ConvDevWeightsH conv;
+};
+struct TransformerDevWeightsH {
+    const __half *q_w, *k_w, *v_w, *o_w, *f1_w, *f2_w;
+    const float *q_b, *k_b, *v_b, *o_b;
+    const float *ln1_g, *ln1_b, *ln2_g, *ln2_b;
+    const float *f1_b, *f2_b;
+};
+
 // Scratch layout for one MHA call (floats): returned requirement for
 // t frames, c dims, h heads. Caller allocates once per (t) and reuses.
+// Includes the cast16 region (fp16 route activation casts, unused by the
+// fp32 route) so both routes can share one allocation.
 std::size_t mha_scratch_floats(int t, int c, int h);
 
 // rel-pos MHA forward, device-resident. x [t,c], pos [2t-1,c], y [t,c];
 // ws = scratch (>= mha_scratch_floats). Blocks on stream before return.
+// Template over the weights struct: MhaDevWeights = fp32 Sgemm route,
+// MhaDevWeightsH = fp16-storage GemmEx route (Step 5). Both instantiations
+// are emitted in backend_cuda.cpp.
+template <typename W>
 void gpu_relpos_mha(cublasHandle_t cublas, cudaStream_t stream, int block,
-                    const MhaDevWeights& w, const float* x, const float* pos,
+                    const W& w, const float* x, const float* pos,
                     float* y, float* ws, int t, int c, int heads);
+extern template void gpu_relpos_mha<MhaDevWeights>(
+    cublasHandle_t, cudaStream_t, int, const MhaDevWeights&, const float*,
+    const float*, float*, float*, int, int, int);
+extern template void gpu_relpos_mha<MhaDevWeightsH>(
+    cublasHandle_t, cudaStream_t, int, const MhaDevWeightsH&, const float*,
+    const float*, float*, float*, int, int, int);
 
 // Full conformer layer, device-resident. Mirror of
 // diar::conformer_layer_forward (pos_emb [2t-1,c] computed once per chunk
 // by the host and shared by all 17 layers). ws = scratch (>=
 // conformer_layer_scratch_floats). Conv module pinned: k=9, BN, symmetric
 // pad 4, pw1 2D->GLU->dw->BN->SiLU->pw2 (conv.hpp upstream pins).
+// Template over the weights struct (fp32 / fp16-storage routes, Step 5).
 std::size_t conformer_layer_scratch_floats(int t, int c, int d_ff, int h);
+template <typename W>
 void gpu_conformer_layer(cublasHandle_t cublas, cudaStream_t stream,
-                         int block, const LayerDevWeights& w,
+                         int block, const W& w,
                          const float* x, const float* pos, float* y,
                          float* ws, int t, int c, int d_ff, int heads);
+extern template void gpu_conformer_layer<LayerDevWeights>(
+    cublasHandle_t, cudaStream_t, int, const LayerDevWeights&, const float*,
+    const float*, float*, float*, int, int, int, int);
+extern template void gpu_conformer_layer<LayerDevWeightsH>(
+    cublasHandle_t, cudaStream_t, int, const LayerDevWeightsH&, const float*,
+    const float*, float*, float*, int, int, int, int);
 
 // ---- Step 4b: transformer block (18-layer stack, plan §3 item 2) ---------
 //
@@ -137,16 +195,35 @@ std::size_t transformer_block_scratch_floats(int t, int h, int inner,
                                              int heads);
 
 // x [t,h] -> y [t,h]; ws >= transformer_block_scratch_floats.
+// Template over the weights struct (fp32 / fp16-storage routes, Step 5).
+template <typename W>
 void gpu_transformer_block(cublasHandle_t cublas, cudaStream_t stream,
-                           int block, const TransformerDevWeights& w,
+                           int block, const W& w,
                            const float* x, float* y, float* ws, int t, int h,
                            int inner, int heads);
+extern template void gpu_transformer_block<TransformerDevWeights>(
+    cublasHandle_t, cudaStream_t, int, const TransformerDevWeights&,
+    const float*, float*, float*, int, int, int, int);
+extern template void gpu_transformer_block<TransformerDevWeightsH>(
+    cublasHandle_t, cudaStream_t, int, const TransformerDevWeightsH&,
+    const float*, float*, float*, int, int, int, int);
 
 // Raw device-resident linear (same plan as Step 3's Context::linear, no
 // host copies): gate-evidence probe for the cuBLAS reduction-noise tier.
 void bench_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
                   const float* x, const float* w, const float* b, float* y,
                   int t, int in, int out);
+
+// ---- Step 5 bench entries (fp16-storage route) ----------------------------
+// fp16-weights linear: w is a DEVICE __half array (host-packed via
+// pack_weights_f16), x stays fp32 and is cast into cast16 (DEVICE scratch
+// >= t*in halves, carved from the layer scratch cast16 region).
+void bench_linear_h(cublasHandle_t cublas, cudaStream_t stream, int block,
+                    const float* x, const __half* w, const float* b,
+                    float* y, int t, int in, int out, __half* cast16);
+// device fp32->fp16 cast alone (bit-identity gate vs host float_to_half).
+void bench_cast_f32_f16(const float* x, __half* y, std::size_t n,
+                        cudaStream_t s, int block);
 
 // Isolated-op bench entries (parity vs CPU nn:: reference): same kernels
 // the resident layer calls, exposed so the harness can gate them one by one.

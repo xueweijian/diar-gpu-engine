@@ -1,0 +1,15 @@
+{
+  "id": "weijianxue/diar-m3-step5",
+  "title": "diar-m3-step5",
+  "code_file": "m5_step5_run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [],
+  "model_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}
