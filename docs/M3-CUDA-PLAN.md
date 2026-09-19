@@ -183,6 +183,16 @@ directly measurable on Kaggle anymore (P100 retired) — the acceptance
 protocol is our engine vs the T4-official RTF scaled by card class, plus
 absolute ms/chunk targets recorded at first bench.
 
+**Self-deception guards:**
+- If the T4 target is missed, benchmark official + `torch.compile` as a
+  stronger control before any conclusion — never widen the gate to pass.
+- Launch-overhead reality check moves to Step 3 day one (not Step 5):
+  the Step 3 bench harness also times an empty-launch loop, so the
+  CUDA-Graph decision (§4) is made on measured launch cost, not vibes.
+- Host/GPU async pipelining (prep chunk n+1 while GPU runs chunk n) is
+  noted as a post-parity option only — the streaming state machine is
+  host-serial; never let it silently reorder semantics.
+
 ## 6. Acceptance and bench protocol on user hardware
 
 - Deliverable: one fatbin + `diar-bench` harness. The user runs
