@@ -355,6 +355,11 @@ def cmd_kernels_push(args: argparse.Namespace) -> int:
         "categoryIds": meta.get("keywords", []),
     }
     if meta.get("machine_shape"):
+        # Wire name is snake_case (kagglesdk ApiSaveKernelRequest.to_field_map
+        # emits machine_shape); the earlier camelCase machineShape was silently
+        # dropped and every GPU session defaulted to T4. Send both spellings
+        # so whichever the endpoint honors wins.
+        payload["machine_shape"] = meta["machine_shape"]
         payload["machineShape"] = meta["machine_shape"]
     if meta.get("docker_image"):
         payload["dockerImage"] = meta["docker_image"]

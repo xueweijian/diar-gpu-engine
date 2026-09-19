@@ -45,15 +45,18 @@ Do not download the 471 MB/147 MB model artifacts to the phone. Use a Kaggle run
 M2 CLOSED 2026-09-19: K5 v4 k5a-green (patched engine, FE tail-frame
 exemption) + K6 v5 hard-gate green with v13-mid advisory (fixture-side GPU
 autotune noise) + tailfix. See m2-stage3/M2-STAGE3-CLOSURE.md. CUDA-side
-delivery moved to [M3-P100-CUDA-PLAN.md](M3-P100-CUDA-PLAN.md).
+delivery moved to [M3-T4-CUDA-PLAN.md](M3-T4-CUDA-PLAN.md).
 
 ## M3 — P100 optimization
 
-**Stage 1 OPEN (2026-09-19):** per-stage profiler landed (`DIAR_PROFILE_STAGE`,
-12 taps, zero behavior change pinned by tests) — kernel
-`weijianxue/diar-m3-stage1-prof` (m3prof gate) runs the real d=512 engine
-over the short reference; delivers the top-3/5 operator coverage table for
-the port order. Entry discipline: `embed_stage3.py` → `build_k6_entry.py` →
+**Stage 1 CLOSED (2026-09-19):** profiler landed (`DIAR_PROFILE_STAGE`,
+12 taps, zero behavior change pinned) — profile verdict: **conformer
+92.34%** / transformer 6.85% / stem 0.68% (top3 99.87%); port order =
+conformer chain first. Target GPU pivoted **P100 → T4x2** (Kaggle retired
+the P100 2026-09-15; M3-P100-RETIRED-T4-PIVOT.md). T4 baselines in hand
+(nvcc sm_60->sm_75, cuBLAS SGEMM 0.25 ms/shape, naive cross-check exact).
+Step 2 backend skeleton landed (d4fe425, DIAR_WITH_CUDA reserved).
+Entry discipline: `embed_stage3.py` → `build_k6_entry.py` →
 `build_m3_entry.py` before every push.
 
 Optimize only after M2 parity is green:

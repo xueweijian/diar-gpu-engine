@@ -1,4 +1,9 @@
-# M3 — P100 CUDA Backend Plan (draft, pre-closure)
+# M3 — T4 CUDA Backend Plan (was P100; see M3-P100-RETIRED-T4-PIVOT.md)
+
+> **2026-09-19**: Kaggle retired the P100 on 2026-09-15 (official notice
+> 735239). Target accelerator is now **T4x2 (sm_75)**; all porting work
+> below is unchanged, only the optimization target moves. fp16 route is
+> re-evaluated (tensor core on T4), first pass stays pure fp32.
 
 Status: DRAFT — unlock condition is M2 closure (K5 v4 patched-engine green
 + K6 advisory judgement). Zero implementation has started. This document
