@@ -47,9 +47,16 @@ Fleet-level corollaries:
 1. **sm_60 feature floor** — every .cu file must compile clean under
    `-arch=sm_60`; CI/kernel enforces it (§2). P100 defines what the
    engine may use; V100/T4 merely run it faster.
-2. **No tensor cores in the mainline.** P100 has none, and fp16
-   accumulate violates fp32 parity. V100/T4 tensor-core experiments
-   belong in a side branch, off by default, correctness-only claims.
+2. **No hand-written tensor-core kernels (wmma/mma) in the mainline.**
+   The P100 in the fleet has none, so portability would fork. What we DO
+   get for free: cuBLAS `GemmEx` with 16F inputs + 32F compute **already
+   dispatches to tensor cores transparently on V100/T4 and to CUDA-core
+   fp16 (2:1) on P100** — one codebase, per-card optimal path, identical
+   numerical semantics (16F input quantization, 32F accumulation). That
+   transparent dispatch is part of the fp16-storage route (item 3), gated
+   by the same measured-error tiers; it is not a separate code path we
+   maintain. cublasLt epilogue fusion may use tensor op math on the same
+   terms.
 3. **FP32 compute is the parity anchor.** FP16 *storage* (weights in
    half precision, GEMM reads 16F, accumulates 32F) is an opt-in
    bandwidth optimization, enabled only if measured error passes the

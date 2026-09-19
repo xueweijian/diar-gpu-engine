@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(DIAR_PROFILE_STAGE "Enable per-stage wall-clock profiling (M3 §2; zero behavior change)" OFF)
 option(DIAR_WITH_CUDA "Compile the CUDA backend translation unit (OFF keeps CI CPU-only)" OFF)
 
-add_library(diar_core STATIC src/diar.cpp src/aosc.cpp src/birth_gate.cpp src/fe.cpp src/nn.cpp src/layers.cpp src/mha.cpp src/conv.cpp src/conformer.cpp src/subsampling.cpp src/posenc.cpp src/gguf.cpp src/sortformer.cpp src/tailfix.cpp src/engine.cpp src/profile.cpp src/backend.cpp)
+add_library(diar_core STATIC src/diar.cpp src/aosc.cpp src/birth_gate.cpp src/fe.cpp src/nn.cpp src/layers.cpp src/mha.cpp src/conv.cpp src/conformer.cpp src/subsampling.cpp src/posenc.cpp src/gguf.cpp src/sortformer.cpp src/tailfix.cpp src/engine.cpp src/profile.cpp src/backend.cpp src/cublas_layout.cpp)
 target_include_directories(diar_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(diar_core PUBLIC cxx_std_17)
 if(DIAR_PROFILE_STAGE)
@@ -46,6 +46,15 @@ if(BUILD_TESTING)
 
   # M3 Step 2: backend skeleton (CPU passthrough pinned bit-identical to nn::;
   # the CUDA translation unit is absent unless DIAR_WITH_CUDA=ON).
+  add_executable(diar_cublas_layout_tests tests/test_cublas_layout.cpp)
+  target_link_libraries(diar_cublas_layout_tests PRIVATE diar_core)
+  if(MSVC)
+    target_compile_options(diar_cublas_layout_tests PRIVATE /W4)
+  else()
+    target_compile_options(diar_cublas_layout_tests PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+  add_test(NAME diar_cublas_layout_tests COMMAND diar_cublas_layout_tests)
+
   add_executable(diar_backend_tests tests/test_backend.cpp)
   target_link_libraries(diar_backend_tests PRIVATE diar_core)
   if(MSVC)

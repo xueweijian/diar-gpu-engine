@@ -13,6 +13,10 @@ ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   -o "$BUILD/test_nn"
 "$BUILD/test_nn"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
+  -I"$ROOT/include" "$ROOT/src/cublas_layout.cpp" "$ROOT/src/nn.cpp" "$ROOT/src/gguf.cpp" "$ROOT/tests/test_cublas_layout.cpp" \
+  -o "$BUILD/test_cublas_layout"
+"$BUILD/test_cublas_layout"
+${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   -I"$ROOT/include" "$ROOT/src/nn.cpp" "$ROOT/src/layers.cpp" "$ROOT/tests/test_layers.cpp" \
   -o "$BUILD/test_layers"
 "$BUILD/test_layers"
@@ -49,10 +53,10 @@ ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   -I"$ROOT/include" -I"$ROOT/tests" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" $NN_SRC "$ROOT/tools/dump_forward.cpp" -o "$BUILD/diar_dump_forward"
 g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
-  -I"$ROOT/include" -I"$ROOT/tests" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/fe.cpp" "$ROOT/src/diar.cpp" "$ROOT/src/aosc.cpp" "$ROOT/src/birth_gate.cpp" $NN_SRC "$ROOT/tests/test_engine.cpp" -o "$BUILD/test_engine"
+  -I"$ROOT/include" -I"$ROOT/tests" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/fe.cpp" "$ROOT/src/diar.cpp" "$ROOT/src/aosc.cpp" "$ROOT/src/birth_gate.cpp" "$ROOT/src/tailfix.cpp" $NN_SRC "$ROOT/tests/test_engine.cpp" -o "$BUILD/test_engine"
 "$BUILD/test_engine"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
-  -I"$ROOT/include" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/fe.cpp" "$ROOT/src/diar.cpp" "$ROOT/src/aosc.cpp" "$ROOT/src/birth_gate.cpp" $NN_SRC "$ROOT/tools/k5_runner.cpp" -o "$BUILD/k5_runner"
+  -I"$ROOT/include" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/fe.cpp" "$ROOT/src/diar.cpp" "$ROOT/src/aosc.cpp" "$ROOT/src/birth_gate.cpp" "$ROOT/src/tailfix.cpp" $NN_SRC "$ROOT/tools/k5_runner.cpp" -o "$BUILD/k5_runner"
 "$BUILD/k5_runner" --selftest
 "$BUILD/k5_runner" --expected-names > /dev/null
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
