@@ -305,6 +305,10 @@ int main(int argc, char** argv) {
         probe_cfg = w.config();
     }
     int max_l = 0;  // full-offline: no encoder route (whole-file CPU path)
+#ifdef DIAR_WITH_CUDA
+    diar::backend::CudaEncoderRoute* cuda_route = nullptr;
+    diar::backend::CudaStemRoute* cuda_stem = nullptr;
+#endif
 
     if (mode == "full-offline") {
         route_effective = "cpu";
@@ -332,8 +336,6 @@ int main(int argc, char** argv) {
     max_l = route_max_l(ec.geometry, probe_cfg.subsampling_factor);
 
 #ifdef DIAR_WITH_CUDA
-    diar::backend::CudaEncoderRoute* cuda_route = nullptr;
-    diar::backend::CudaStemRoute* cuda_stem = nullptr;
     if (route != "cpu") {
         // Step 6b: head bound into the route (fused device head; only preds
         // [L,S] cross back) + device stem route (the 75% CPU share of the
@@ -347,7 +349,7 @@ int main(int argc, char** argv) {
         cuda_stem = new diar::backend::CudaStemRoute(
             diar::SortformerWeights::load(weights), t_mel_max + 32);
     }
-#endif
+#endif  // DIAR_WITH_CUDA
 
     for (int rep = 0; rep < reps; rep++) {
         RunOut ro;
