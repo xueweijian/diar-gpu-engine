@@ -46,6 +46,7 @@ FILES = {
     "hpp_layers":         WORK + "/include/diar/layers.hpp",
     "hpp_posenc":         WORK + "/include/diar/posenc.hpp",
     "hpp_subsampling":    WORK + "/include/diar/subsampling.hpp",
+    "hpp_profile":        WORK + "/include/diar/profile.hpp",
     "cpp_backend":        WORK + "/src/backend.cpp",
     "cpp_cublas_layout":  WORK + "/src/cublas_layout.cpp",
     "cpp_backend_cuda":   WORK + "/src/backend_cuda.cpp",

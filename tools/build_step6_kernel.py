@@ -29,6 +29,7 @@ FILES = [
     ('include/diar/layers.hpp', 'hpp_layers'),
     ('include/diar/posenc.hpp', 'hpp_posenc'),
     ('include/diar/subsampling.hpp', 'hpp_subsampling'),
+    ('include/diar/profile.hpp', 'hpp_profile'),
     ('src/backend.cpp', 'cpp_backend'),
     ('src/cublas_layout.cpp', 'cpp_cublas_layout'),
     ('src/backend_cuda.cpp', 'cpp_backend_cuda'),
