@@ -689,6 +689,13 @@ void gpu_conformer_layer(cublasHandle_t cublas, cudaStream_t stream,
 
 // isolated-op bench entries (parity vs CPU references)
 
+void bench_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
+                  const float* x, const float* w, const float* b, float* y,
+                  int t, int in, int out) {
+    dev_linear(cublas, block, x, w, b, y, t, in, out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void bench_softmax_rows(const float* x, float* y, int rows, int cols,
                         cudaStream_t s, int block) {
     (void)block;

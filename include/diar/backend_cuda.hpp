@@ -120,6 +120,12 @@ void gpu_conformer_layer(cublasHandle_t cublas, cudaStream_t stream,
                          const float* x, const float* pos, float* y,
                          float* ws, int t, int c, int d_ff, int heads);
 
+// Raw device-resident linear (same plan as Step 3's Context::linear, no
+// host copies): gate-evidence probe for the cuBLAS reduction-noise tier.
+void bench_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
+                  const float* x, const float* w, const float* b, float* y,
+                  int t, int in, int out);
+
 // Isolated-op bench entries (parity vs CPU nn:: reference): same kernels
 // the resident layer calls, exposed so the harness can gate them one by one.
 void bench_softmax_rows(const float* x, float* y, int rows, int cols,

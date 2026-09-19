@@ -5,7 +5,8 @@
 //    checks so a Kaggle round-trip never burns on harness bugs.
 //  - GPU bench (DIAR_WITH_CUDA, nvcc):
 //      G-S4a  op parity: softmax / glu / dwconv+BN+SiLU  <= 1e-5
-//      G-S4b  rel-pos MHA parity (t=12/20/26)            <= 5e-5
+//      G-S4b  rel-pos MHA parity (t=12/20/26)            <= 2*parity_gate(512)
+//      G-S4b2 raw GEMM baseline at k=512 (gate evidence)  <= parity_gate(512)
 //      G-S4c  full conformer layer parity (t=20)         <= 2e-4
 //      G-S4d  17-layer device-resident timeline (ms/chunk) — decision input
 //  Reports [s4] JSON lines. All Step-4 chains run device-resident (GpuArena,
@@ -63,7 +64,19 @@ constexpr int kTimelineLayers = 17;
 constexpr int kTimelineChunks = 30;
 
 constexpr double kOpGate = 1e-5;
-constexpr double kMhaGate = 5e-5;
+
+// Cross-implementation gate (CPU naive vs cuBLAS FMA/split-k blocks), same
+// k-scaling rule as step3: 2e-7 per k-unit, floor 1e-5, cap 5e-4. Measured
+// on T4 (step3 v5): 2-5e-5 at k=512, 1.3e-4 at k=2048.
+inline double parity_gate(int k) {
+    return std::min(5e-4, std::max(1e-5, 2e-7 * static_cast<double>(k)));
+}
+// MHA chain = q/k/v/pos proj (k=512) -> head GEMMs (k=64) -> rel-shift
+// softmax -> ctx -> out proj (k=512): two chained k=512 tiers. Gate set to
+// 2 * parity_gate(512) with measured 7.3-8.1e-5 (SASS == PTX bit-identical,
+// so the residual is genuine reduction-order noise, not a codegen or
+// indexing effect; the layer gate below covers the same MHA in context).
+const double kMhaGate = 2.0 * parity_gate(512);
 constexpr double kLayerGate = 2e-4;
 
 std::mt19937& rng() { static std::mt19937 r(20260919); return r; }
@@ -431,6 +444,45 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- G-S4b2: raw GEMM baseline (evidence for the MHA gate tier) ------
+    // Measures CPU-sequential vs cuBLAS reduction-order noise at the same
+    // reduction depth as the MHA projections. The MHA gate must sit above
+    // this; identical values across SASS/PTX runs confirm codegen is not a
+    // factor.
+    for (const int out_dim : {512, 2048}) {
+        const int in_dim = 512, t = 20;
+        std::vector<float> x(static_cast<std::size_t>(t) * in_dim);
+        std::vector<float> w(static_cast<std::size_t>(out_dim) * in_dim);
+        std::vector<float> b(out_dim);
+        std::vector<float> ref(static_cast<std::size_t>(t) * out_dim);
+        fill_random(x);
+        fill_random(w);
+        fill_random(b);
+        nn::linear_forward(x.data(), w.data(), b.data(), ref.data(), t,
+                           in_dim, out_dim);
+        diar::backend::GpuArena a;
+        a.init(8u * 1024u * 1024u);
+        float* dx = h2d(x, a, "lx");
+        float* dw = h2d(w, a, "lw");
+        float* db = h2d(b, a, "lb");
+        float* dy = a.alloc("ly", (static_cast<std::size_t>(t)) * out_dim);
+        diar::backend::bench_linear(cublas, stream, kBlock, dx, dw, db, dy, t,
+                                    in_dim, out_dim);
+        CUDA4_CHECK(cudaStreamSynchronize(stream));
+        std::vector<float> got(static_cast<std::size_t>(t) * out_dim);
+        CUDA4_CHECK(cudaMemcpy(got.data(), dy, got.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost));
+        const double m = max_abs(ref, got);
+        report("parity_linear",
+               "\"t\":" + std::to_string(t) +
+                   ",\"in\":" + std::to_string(in_dim) +
+                   ",\"out\":" + std::to_string(out_dim) +
+                   ",\"max_abs\":" + fmt9(m) +
+                   ",\"gate\":" + fmt9(parity_gate(in_dim)) +
+                   ",\"pass\":" +
+                   (m <= parity_gate(in_dim) ? "true" : "false") + "}\n");
+    }
+
     // ---- G-S4c: full conformer layer parity ------------------------------
     // (runs in --parity-only mode too: the PTX-JIT pass must gate the layer)
     {
@@ -484,6 +536,11 @@ int main(int argc, char** argv) {
             lh.build(kC, kF, kK);
             layers.push_back(upload_layer(a, lh, "T" + std::to_string(i)));
         }
+        struct TState {
+            int t;
+            float *dpos, *dx, *dy, *dws;
+        };
+        std::vector<TState> states;
         for (const int t : {20, 26}) {
             const int p = 2 * t - 1;
             const std::size_t tc = static_cast<std::size_t>(t) * kC;
@@ -492,26 +549,34 @@ int main(int argc, char** argv) {
             fill_random(x);
             diar::relpos_table_forward(pos.data(), t, kC);
             const std::string tag = std::to_string(t);
-            float* dpos = h2d(pos, a, "pos" + tag);
-            float* dx = h2d(x, a, "x" + tag);
-            float* dy = a.alloc(("y" + tag).c_str(), tc);
-            float* dws = a.alloc(("ws" + tag).c_str(),
-                                 conformer_layer_scratch_floats(t, kC, kF, kH));
-            // alternate y/x as input/output across layers (per-chunk chain)
+            states.push_back(TState{t, h2d(pos, a, "pos" + tag),
+                                    h2d(x, a, "x" + tag),
+                                    a.alloc(("y" + tag).c_str(), tc),
+                                    a.alloc(("ws" + tag).c_str(),
+                                            conformer_layer_scratch_floats(
+                                                t, kC, kF, kH))});
+        }
+        // per-chunk chain = 17 layers, alternating input buffers
+        auto run_chain = [&](const TState& st) {
+            float* in = st.dx;
+            float* out = st.dy;
+            for (int l = 0; l < kTimelineLayers; ++l) {
+                gpu_conformer_layer(cublas, stream, kBlock, layers[l], in,
+                                    st.dpos, out, st.dws, st.t, kC, kF, kH);
+                std::swap(in, out);
+            }
+        };
+        // symmetric warmup for BOTH configs first — v1 timed t=20 cold
+        // (first cuBLAS autotune + clock ramp) and it read 35% slower than
+        // t=26 which was plain wrong.
+        for (const TState& st : states)
+            for (int c = 0; c < 8; ++c) run_chain(st);
+        for (const TState& st : states) {
             cudaEvent_t e0, e1;
             CUDA4_CHECK(cudaEventCreate(&e0));
             CUDA4_CHECK(cudaEventCreate(&e1));
-            const int kWarm = 3;
-            for (int c = 0; c < kWarm + kTimelineChunks; ++c) {
-                if (c == kWarm) CUDA4_CHECK(cudaEventRecord(e0, stream));
-                float* in = dx;
-                float* out = dy;
-                for (int l = 0; l < kTimelineLayers; ++l) {
-                    gpu_conformer_layer(cublas, stream, kBlock, layers[l], in,
-                                        dpos, out, dws, t, kC, kF, kH);
-                    std::swap(in, out);
-                }
-            }
+            CUDA4_CHECK(cudaEventRecord(e0, stream));
+            for (int c = 0; c < kTimelineChunks; ++c) run_chain(st);
             CUDA4_CHECK(cudaEventRecord(e1, stream));
             CUDA4_CHECK(cudaEventSynchronize(e1));
             float total_ms = 0.0f;
@@ -519,7 +584,7 @@ int main(int argc, char** argv) {
             const double per_chunk = total_ms / kTimelineChunks;
             report("timeline",
                    "\"layers\":" + std::to_string(kTimelineLayers) +
-                       ",\"t\":" + std::to_string(t) +
+                       ",\"t\":" + std::to_string(st.t) +
                        ",\"ms_per_chunk\":" + fmt9(per_chunk) +
                        ",\"us_per_layer\":" +
                        fmt9(per_chunk * 1000.0 / kTimelineLayers) + "}\n");

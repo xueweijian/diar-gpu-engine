@@ -147,29 +147,32 @@ gate_from(parsed2, "parity_dwconv", "g_s4jit_dwconv")
 gate_from(parsed2, "parity_mha", "g_s4jit_mha")
 gate_from(parsed2, "parity_layer", "g_s4jit_layer")
 # PTX-JIT semantics identical to SASS: same worst numbers on EVERY parity
-# output (shape-keyed for mha, single-row for the rest).
+# output. Rows are keyed by (kind, shape-or-out) so multi-shape sections
+# compare pairwise.
 def _jit_identical() -> bool:
-    pairs = [("parity_softmax", None), ("parity_glu", None),
-             ("parity_dwconv", None), ("parity_layer", None)]
-    for key, _ in pairs:
-        a = [r for r in parsed if r.get("k") == key]
-        b = [r for r in parsed2 if r.get("k") == key]
-        if not a or not b:
-            print("[s4k] jit-bitidentical: missing rows for", key)
+    kinds = ("parity_softmax", "parity_glu", "parity_dwconv", "parity_layer",
+             "parity_linear", "parity_mha")
+
+    def index(rows):
+        out = {}
+        for r in rows:
+            key = (r.get("k"), r.get("shape") or r.get("out") or "")
+            out[key] = r.get("max_abs")
+        return out
+
+    a, b = index(parsed), index(parsed2)
+    keys = [k for k in a if k[0] in kinds]
+    if not keys:
+        return False
+    for k in keys:
+        if k not in b:
+            print("[s4k] jit-bitidentical: missing", k)
             return False
-        if abs(a[0].get("max_abs", -1) - b[0].get("max_abs", -2)) > 0:
-            print("[s4k] jit-bitidentical: mismatch on", key, a[0].get("max_abs"),
-                  "vs", b[0].get("max_abs"))
+        if abs(a[k] - b[k]) > 0:
+            print("[s4k] jit-bitidentical: mismatch", k, a[k], b[k])
             return False
-    shapes = {r.get("shape") for r in mha_rows}
-    for sh in shapes:
-        a = [r for r in mha_rows if r.get("shape") == sh]
-        b = [r for r in parsed2
-             if r.get("k") == "parity_mha" and r.get("shape") == sh]
-        if not b or abs(a[0].get("max_abs", -1) - b[0].get("max_abs", -2)) > 0:
-            print("[s4k] jit-bitidentical: mismatch on parity_mha", sh)
-            return False
-    return bool(shapes)
+    print("[s4k] jit-bitidentical: all", len(keys), "parity rows match")
+    return True
 
 REPORT["gates"]["g_s4d_jit_bitidentical"] = _jit_identical()
 
