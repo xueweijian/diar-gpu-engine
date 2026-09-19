@@ -36,7 +36,7 @@ jobs:
           nvcc --version
       - name: Compile gate (fatbin sm_60/70/75 + compute_60 PTX)
         run: |
-          nvcc -O2 -std=c++17 -DDIAR_WITH_CUDA -Iinclude             -gencode arch=compute_60,code=sm_60             -gencode arch=compute_70,code=sm_70             -gencode arch=compute_75,code=sm_75             -gencode arch=compute_60,code=compute_60             src/cublas_layout.cpp src/backend_cuda.cpp src/nn.cpp             src/gguf.cpp tools/step3_bench_main.cpp             -lcublas -o /tmp/step3_bench
+          nvcc -O2 -std=c++17 -DDIAR_WITH_CUDA -Iinclude -gencode arch=compute_60,code=sm_60 -gencode arch=compute_70,code=sm_70 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_60,code=compute_60 -x cu src/backend_cuda.cpp -x cu tools/step3_bench_main.cpp src/cublas_layout.cpp src/nn.cpp src/gguf.cpp -lcublas -o /tmp/step3_bench
       - name: Fatbin arch verification
         run: |
           cuobjdump --list-elf /tmp/step3_bench | tee /tmp/elf.txt
