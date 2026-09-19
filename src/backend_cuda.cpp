@@ -776,7 +776,7 @@ void gpu_conformer_layer(cublasHandle_t cublas, cudaStream_t stream,
     const std::size_t cast16_f =
         (static_cast<std::size_t>(t) * d_ff + 1) / 2;
     float* ws_end = ws + 7 * tc + static_cast<std::size_t>(t) * d_ff +
-                    mha_scratch_floats(t, c, h) + cast16_f;
+                    mha_scratch_floats(t, c, heads) + cast16_f;
     __half* cast16 = reinterpret_cast<__half*>(ws_end - cast16_f);
     float* res = ws;
     float* tmp = res + tc;

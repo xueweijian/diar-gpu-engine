@@ -120,7 +120,8 @@ struct MhaDevWeightsH {
 };
 struct ConvDevWeightsH {
     const __half *pw1_w, *pw2_w;
-    const float *pw1_b, *dw_w, *dw_b, *bn_w, *bn_b, *bn_mean, *bn_var;
+    const float *pw1_b, *pw2_b, *dw_w, *dw_b, *bn_w, *bn_b, *bn_mean,
+        *bn_var;
 };
 struct LayerDevWeightsH {
     const float *n_ff1_g, *n_ff1_b, *n_sa_g, *n_sa_b, *n_conv_g, *n_conv_b,
