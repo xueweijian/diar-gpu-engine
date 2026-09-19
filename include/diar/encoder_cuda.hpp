@@ -57,6 +57,8 @@ public:
     long refused() const { return refused_; }    // L > max_l (CPU fallback)
     int max_l() const { return max_l_; }
     bool fp16_storage() const { return fp16_; }
+    bool head_bound() const { return head_; }
+    long headed_calls() const { return headed_calls_; }
     // Bytes moved per chunk (for the bench JSON's H2D/D2H accounting):
     // x + pe up, px down.
     std::size_t bytes_h2d(int L) const;
