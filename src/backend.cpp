@@ -73,11 +73,21 @@ std::unique_ptr<Context> create(Kind kind) {
     switch (kind) {
     case Kind::cpu:
         return std::make_unique<CpuContext>();
+#ifdef DIAR_WITH_CUDA
+    case Kind::cuda: {
+        // Device introspection here so the frozen selection table is keyed
+        // on the device we actually got (never an assumed one).
+        int cc = cuda::bench_device_cc();
+        return std::unique_ptr<Context>(
+            make_cuda_context(cc / 10, cc % 10));
+    }
+#else
     case Kind::cuda:
         // Backend translation unit not compiled in this configuration
         // (DIAR_WITH_CUDA=OFF). Loud failure beats a silent CPU fallback.
         throw std::runtime_error(
             "diar::backend: CUDA backend not compiled (DIAR_WITH_CUDA=OFF)");
+#endif
     }
     throw std::logic_error("unreachable");
 }
