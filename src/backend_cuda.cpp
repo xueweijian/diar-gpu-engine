@@ -516,7 +516,11 @@ float* GpuArena::alloc(const char* name, std::size_t n) {
     }
     float* p = base_ + used_;
     used_ += n;
-    names_[count_] = name;
+    const std::size_t len = std::strlen(name);
+    char* copy = static_cast<char*>(std::malloc(len + 1));
+    if (!copy) die("arena name alloc", -1);
+    std::memcpy(copy, name, len + 1);
+    names_[count_] = copy;
     ptrs_[count_] = p;
     ++count_;
     return p;
@@ -531,6 +535,10 @@ float* GpuArena::span(const char* name) const {
 
 GpuArena::~GpuArena() {
     if (base_) cudaFree(base_);
+    if (names_) {
+        for (std::size_t i = 0; i < count_; ++i)
+            std::free(const_cast<char*>(names_[i]));  // owned copies
+    }
     std::free(names_);
     std::free(ptrs_);
 }

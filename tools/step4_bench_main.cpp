@@ -214,8 +214,9 @@ namespace {
         }                                                                   \
     } while (0)
 
-float* h2d(const std::vector<float>& v, GpuArena& arena, const char* name) {
-    float* d = arena.alloc(name, v.size());
+float* h2d(const std::vector<float>& v, diar::backend::GpuArena& arena,
+              const std::string& name) {
+    float* d = arena.alloc(name.c_str(), v.size());
     CUDA4_CHECK(cudaMemcpy(d, v.data(), v.size() * sizeof(float),
                            cudaMemcpyHostToDevice));
     return d;
@@ -264,8 +265,9 @@ int main(int argc, char** argv) {
     const bool parity_only =
         argc > 1 && std::string(argv[1]) == "--parity-only";
     CUDA4_CHECK(cudaSetDevice(0));
-    report("env", std::string("\"name\":\"") + bench_device_name() +
-                  "\",\"cc\":" + std::to_string(bench_device_cc()) + "}\n");
+    report("env", std::string("\"name\":\"") +
+                      diar::backend::bench_device_name() + "\",\"cc\":" +
+                      std::to_string(diar::backend::bench_device_cc()) + "}\n");
 
     cublasHandle_t cublas;
     CUBLAS4_CHECK(cublasCreate(&cublas));
@@ -489,10 +491,11 @@ int main(int argc, char** argv) {
             std::vector<float> pos(static_cast<std::size_t>(p) * kC);
             fill_random(x);
             diar::relpos_table_forward(pos.data(), t, kC);
-            float* dpos = h2d(pos, a, "pos" + std::to_string(t));
-            float* dx = h2d(x, a, "x" + std::to_string(t));
-            float* dy = a.alloc("y" + std::to_string(t), tc);
-            float* dws = a.alloc("ws" + std::to_string(t),
+            const std::string tag = std::to_string(t);
+            float* dpos = h2d(pos, a, "pos" + tag);
+            float* dx = h2d(x, a, "x" + tag);
+            float* dy = a.alloc(("y" + tag).c_str(), tc);
+            float* dws = a.alloc(("ws" + tag).c_str(),
                                  conformer_layer_scratch_floats(t, kC, kF, kH));
             // alternate y/x as input/output across layers (per-chunk chain)
             cudaEvent_t e0, e1;
