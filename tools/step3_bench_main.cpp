@@ -139,9 +139,9 @@ double parity_one(diar::backend::Context& ctx, const Shape& s) {
 
 void run_gpu(const std::string& tag, bool parity_only) {
     cchk(cudaSetDevice(0), "cudaSetDevice");
-    report("env", std::string("\"name\":\"") + diar::backend::cuda::bench_device_name() +
-           "\",\"cc\":" + std::to_string(diar::backend::cuda::bench_device_cc()) +
-           ",\"sm\":" + std::to_string(diar::backend::cuda::bench_device_sm_count()) + "}\n");
+    report("env", std::string("\"name\":\"") + diar::backend::bench_device_name() +
+           "\",\"cc\":" + std::to_string(diar::backend::bench_device_cc()) +
+           ",\"sm\":" + std::to_string(diar::backend::bench_device_sm_count()) + "}\n");
 
     auto ctx = diar::backend::create(diar::backend::Kind::cuda);
 
@@ -165,7 +165,7 @@ void run_gpu(const std::string& tag, bool parity_only) {
         // launch-only cost: queue kIters, sync once
         const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < kIters; ++i)
-            diar::backend::cuda::bench_empty_launch(st, 256);
+            diar::backend::bench_empty_launch(st, 256);
         cchk(cudaStreamSynchronize(st), "sync");
         const auto t1 = std::chrono::steady_clock::now();
         const double us_launch =
@@ -173,7 +173,7 @@ void run_gpu(const std::string& tag, bool parity_only) {
         // round-trip cost: launch + sync each time
         const auto t2 = std::chrono::steady_clock::now();
         for (int i = 0; i < 2000; ++i) {
-            diar::backend::cuda::bench_empty_launch(st, 256);
+            diar::backend::bench_empty_launch(st, 256);
             cchk(cudaStreamSynchronize(st), "sync");
         }
         const auto t3 = std::chrono::steady_clock::now();
@@ -256,11 +256,9 @@ void run_gpu(const std::string& tag, bool parity_only) {
         dr.alloc(n);
         cchk(cudaMemcpy(df.p, ff.data(), n * 4, cudaMemcpyHostToDevice), "H2D");
         cchk(cudaMemcpy(dr.p, res.data(), n * 4, cudaMemcpyHostToDevice), "H2D");
-        // parity via the public linear path is not applicable; run the same
-        // kernel through a minimal local launch (mirrors backend internals).
-        extern void bench_ff_residual(float* ff, const float* res,
-                                      std::size_t n, cudaStream_t s, int block);
-        bench_ff_residual(df.p, dr.p, n, nullptr, 256);
+        // parity through the backend TU's public bench entry (same kernel
+        // the CudaContext would use; no anonymous-namespace shadow decl).
+        diar::backend::bench_ff_residual(df.p, dr.p, n, nullptr, 256);
         cchk(cudaDeviceSynchronize(), "fuse sync");
         std::vector<float> got(n);
         cchk(cudaMemcpy(got.data(), df.p, n * 4, cudaMemcpyDeviceToHost),

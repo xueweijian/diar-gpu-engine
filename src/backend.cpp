@@ -2,6 +2,10 @@
 // The CUDA translation unit (backend_cuda.cpp) lands with DIAR_WITH_CUDA.
 #include "diar/backend.hpp"
 
+#ifdef DIAR_WITH_CUDA
+#include "diar/backend_cuda.hpp"
+#endif
+
 #include "diar/nn.hpp"
 
 #include <new>
@@ -77,7 +81,7 @@ std::unique_ptr<Context> create(Kind kind) {
     case Kind::cuda: {
         // Device introspection here so the frozen selection table is keyed
         // on the device we actually got (never an assumed one).
-        int cc = cuda::bench_device_cc();
+        int cc = bench_device_cc();
         return std::unique_ptr<Context>(
             make_cuda_context(cc / 10, cc % 10));
     }
