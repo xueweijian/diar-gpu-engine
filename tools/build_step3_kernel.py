@@ -15,6 +15,7 @@ OUT = os.path.join(ROOT, 'kaggle/m3_step3/m3_step3_run.py')
 FRAMEWORK = os.path.join(ROOT, 'kaggle/m3_step3/framework.py')
 
 FILES = [
+    ('src/backend.cpp', 'cpp_backend'),
     ('include/diar/backend.hpp', 'hpp_backend'),
     ('include/diar/cublas_layout.hpp', 'hpp_cublas_layout'),
     ('include/diar/backend_cuda.hpp', 'hpp_backend_cuda'),

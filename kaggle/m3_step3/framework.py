@@ -14,6 +14,7 @@ os.makedirs(WORK + "/src", exist_ok=True)
 os.makedirs(WORK + "/tools", exist_ok=True)
 
 FILES = {
+    "cpp_backend":       WORK + "/src/backend.cpp",
     "hpp_backend":       WORK + "/include/diar/backend.hpp",
     "hpp_cublas_layout": WORK + "/include/diar/cublas_layout.hpp",
     "hpp_backend_cuda":  WORK + "/include/diar/backend_cuda.hpp",
@@ -66,7 +67,8 @@ sh(["nvcc", "-O3", "-std=c++17", "-DDIAR_WITH_CUDA", "-I", WORK + "/include",
     *GENCODE,
     "-x", "cu", FILES["cpp_backend_cuda"],
     "-x", "cu", FILES["cpp_bench_main"],
-    FILES["cpp_cublas_layout"], FILES["cpp_nn"], FILES["cpp_gguf"],
+    FILES["cpp_backend"], FILES["cpp_cublas_layout"], FILES["cpp_nn"],
+    FILES["cpp_gguf"],
     "-lcublas", "-o", WORK + "/bench_sass"], timeout=1200)
 
 # verify the fatbin really carries 3 SASS + 1 PTX
@@ -102,7 +104,8 @@ sh(["nvcc", "-O3", "-std=c++17", "-DDIAR_WITH_CUDA", "-I", WORK + "/include",
     "-gencode", "arch=compute_60,code=compute_60",
     "-x", "cu", FILES["cpp_backend_cuda"],
     "-x", "cu", FILES["cpp_bench_main"],
-    FILES["cpp_cublas_layout"], FILES["cpp_nn"], FILES["cpp_gguf"],
+    FILES["cpp_backend"], FILES["cpp_cublas_layout"], FILES["cpp_nn"],
+    FILES["cpp_gguf"],
     "-lcublas", "-o", WORK + "/bench_ptx60"], timeout=1200)
 b2 = sh([WORK + "/bench_ptx60", "ptx60jit", "--parity-only"])
 parsed2 = []
