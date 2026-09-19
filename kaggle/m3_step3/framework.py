@@ -64,8 +64,9 @@ GENCODE = ["-gencode", "arch=compute_60,code=sm_60",
            "-gencode", "arch=compute_60,code=compute_60"]
 sh(["nvcc", "-O3", "-std=c++17", "-DDIAR_WITH_CUDA", "-I", WORK + "/include",
     *GENCODE,
-    FILES["cpp_bench_main"], FILES["cpp_cublas_layout"],
-    FILES["cpp_backend_cuda"], FILES["cpp_nn"], FILES["cpp_gguf"],
+    "-x", "cu", FILES["cpp_backend_cuda"],
+    "-x", "cu", FILES["cpp_bench_main"],
+    FILES["cpp_cublas_layout"], FILES["cpp_nn"], FILES["cpp_gguf"],
     "-lcublas", "-o", WORK + "/bench_sass"], timeout=1200)
 
 # verify the fatbin really carries 3 SASS + 1 PTX
@@ -99,8 +100,9 @@ REPORT["gates"]["g_s3e_fuse"] = bool(fuse) and all(r.get("pass") for r in fuse)
 # 4) PTX-only binary (compute_60 PTX; JIT-compiles to sm_75 at load)
 sh(["nvcc", "-O3", "-std=c++17", "-DDIAR_WITH_CUDA", "-I", WORK + "/include",
     "-gencode", "arch=compute_60,code=compute_60",
-    FILES["cpp_bench_main"], FILES["cpp_cublas_layout"],
-    FILES["cpp_backend_cuda"], FILES["cpp_nn"], FILES["cpp_gguf"],
+    "-x", "cu", FILES["cpp_backend_cuda"],
+    "-x", "cu", FILES["cpp_bench_main"],
+    FILES["cpp_cublas_layout"], FILES["cpp_nn"], FILES["cpp_gguf"],
     "-lcublas", "-o", WORK + "/bench_ptx60"], timeout=1200)
 b2 = sh([WORK + "/bench_ptx60", "ptx60jit", "--parity-only"])
 parsed2 = []
