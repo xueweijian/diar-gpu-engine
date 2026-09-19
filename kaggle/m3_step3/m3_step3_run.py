@@ -92,7 +92,8 @@ ptx_archs = _archs(ptx, "compute_")
 print("[s3k] SASS archs in fatbin:", sass_archs)
 print("[s3k] PTX archs in fatbin:", ptx_archs)
 REPORT["gates"]["fatbin_sass_all3"] = all(a in sass_archs for a in ("sm_60", "sm_70", "sm_75"))
-REPORT["gates"]["fatbin_ptx_compute60"] = "compute_60" in ptx_archs
+REPORT["gates"]["fatbin_ptx_compute60"] = ("compute_60" in ptx_archs or
+                                           ".sm_60.ptx" in ptx)
 
 # 3) GPU bench (SASS path): parity + launch + sgemm + fuse
 b1 = sh([WORK + "/bench_sass", "sass"])

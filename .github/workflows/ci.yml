@@ -44,7 +44,7 @@ jobs:
           for a in sm_60 sm_70 sm_75; do
             grep -q "$a" /tmp/elf.txt || { echo "MISSING SASS $a"; exit 1; }
           done
-          grep -q "compute_60" /tmp/ptx.txt || { echo "MISSING PTX compute_60"; exit 1; }
+          grep -Eq "sm_60\.ptx|compute_60" /tmp/ptx.txt || { echo "MISSING PTX for compute_60"; exit 1; }
           echo "fatbin carries all 3 SASS + PTX: OK"
       - name: CPU selftest of the bench harness
         run: |
