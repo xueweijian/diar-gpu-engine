@@ -382,6 +382,8 @@ const char* bench_device_name() {
     return name.c_str();
 }
 
+}  // namespace diar::backend
+
 #else  // !DIAR_WITH_CUDA
 
 namespace diar::backend {
