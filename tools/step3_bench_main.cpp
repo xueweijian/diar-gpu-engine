@@ -164,7 +164,7 @@ void run_gpu(const std::string& tag, bool parity_only) {
         for (int r = 0; r < kParityRuns; ++r)
             worst = std::max(worst, parity_one(*ctx, s));
         const double gate = parity_gate(s.in);
-        report("parity_sass", std::string("\"shape\":\"") + s.name +
+        report("parity_" + tag, std::string("\"shape\":\"") + s.name +
                "\",\"max_abs\":" + std::to_string(worst) +
                ",\"gate\":" + std::to_string(gate) +
                ",\"pass\":" + (worst <= gate ? "true" : "false") + "}\n");
