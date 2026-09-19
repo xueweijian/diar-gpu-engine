@@ -1,0 +1,14 @@
+{
+  "id": "weijianxue/diar-official-bench",
+  "title": "diar-official-bench",
+  "code_file": "official_bench.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "weijianxue/diar-smoke-audio",
+    "weijianxue/diar-real-audio-5"
+  ]
+}
