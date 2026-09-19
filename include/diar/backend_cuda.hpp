@@ -14,8 +14,9 @@
 #include <cstddef>
 
 #ifdef DIAR_WITH_CUDA
-#include <cuda_runtime.h>  // at FILE SCOPE — inside a namespace it would
-// drag the whole CUDA runtime API into diar::backend (v4's compile error)
+#include <cublas_v2.h>     // both at FILE SCOPE — inside a namespace they
+#include <cuda_runtime.h>  // would drag the whole CUDA API into diar::backend
+// (v4's compile error)
 #endif
 
 namespace diar::backend {
