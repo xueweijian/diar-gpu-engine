@@ -67,6 +67,9 @@ ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   -I"$ROOT/include" -I"$ROOT/tests" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/fe.cpp" "$ROOT/src/diar.cpp" "$ROOT/src/aosc.cpp" "$ROOT/src/birth_gate.cpp" "$ROOT/src/tailfix.cpp" $NN_SRC "$ROOT/tests/test_encoder_route.cpp" -o "$BUILD/test_encoder_route"
 "$BUILD/test_encoder_route"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
+  -I"$ROOT/include" -I"$ROOT/tests" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/fe.cpp" "$ROOT/src/diar.cpp" "$ROOT/src/aosc.cpp" "$ROOT/src/birth_gate.cpp" "$ROOT/src/tailfix.cpp" $NN_SRC "$ROOT/tests/test_stem_route.cpp" -o "$BUILD/test_stem_route"
+"$BUILD/test_stem_route"
+${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   -I"$ROOT/include" "$ROOT/src/gguf.cpp" "$ROOT/src/sortformer.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/fe.cpp" "$ROOT/src/diar.cpp" "$ROOT/src/aosc.cpp" "$ROOT/src/birth_gate.cpp" "$ROOT/src/tailfix.cpp" "$ROOT/src/profile.cpp" "$ROOT/src/backend.cpp" "$ROOT/src/cublas_layout.cpp" $NN_SRC "$ROOT/tools/diar_bench_main.cpp" -o "$BUILD/diar_bench"
 "$BUILD/diar_bench" --selftest
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \

@@ -94,6 +94,11 @@ public:
     // the CPU chain inside run_chunk.
     void set_encoder_route(EncoderRoute* route) { encoder_route_ = route; }
 
+    // M3 Step 6b: optional device-resident pre_encode stem (step 1; the
+    // 75 % CPU-side share of the Step-6 profile). Same contract as the
+    // encoder route: null = CPU reference, taps stay authoritative.
+    void set_stem_route(StemRoute* route) { stem_route_ = route; }
+
     const std::vector<ChunkLedgerEntry>& chunk_ledger() const { return ledger_; }
 
     // Full copy of the AOSC state — the closed-loop comparison face for 3.3
@@ -148,6 +153,7 @@ private:
     std::vector<ChunkLedgerEntry> ledger_;
     TapSink* tap_sink_ = nullptr;
     EncoderRoute* encoder_route_ = nullptr;
+    StemRoute* stem_route_ = nullptr;
     std::vector<AoscSnapshot>* aosc_recorder_ = nullptr;
 };
 

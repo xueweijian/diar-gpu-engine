@@ -370,6 +370,22 @@ void bench_ff_residual(float* ff, const float* res, std::size_t n,
     if (c != cudaSuccess) die("ff_residual launch", static_cast<int>(c));
 }
 
+// Step 6b shared pointwise wrappers (stem route + fused head).
+void dev_relu_inplace(float* x, std::size_t n, cudaStream_t s, int block) {
+    if (n == 0) return;
+    relu_inplace_kernel<<<bench_grid_for(n, block), block, 0, s>>>(x, n);
+    const cudaError_t c = cudaGetLastError();
+    if (c != cudaSuccess) die("dev_relu_inplace launch", static_cast<int>(c));
+}
+
+void dev_sigmoid(const float* x, float* y, std::size_t n, cudaStream_t s,
+                 int block) {
+    if (n == 0) return;
+    sigmoid_kernel<<<bench_grid_for(n, block), block, 0, s>>>(x, y, n);
+    const cudaError_t c = cudaGetLastError();
+    if (c != cudaSuccess) die("dev_sigmoid launch", static_cast<int>(c));
+}
+
 // ---- Step 4: device-resident forward wave ---------------------------------
 // (declared in backend_cuda.hpp; all pointers DEVICE-side, zero H2D per call)
 

@@ -134,7 +134,7 @@ bool DiarEngine::run_one_chunk(bool force, bool final_flush) {
     SortformerChunkOutput out = sortformer_run_chunk(mel_run, t_mel_pad, feat_len,
         aosc_.spkcache_frames() ? aosc_.spkcache().data() : nullptr, aosc_.spkcache_frames(),
         aosc_.fifo_frames() ? aosc_.fifo().data() : nullptr, aosc_.fifo_frames(), weights_,
-        tap_sink_, encoder_route_);
+        tap_sink_, encoder_route_, stem_route_);
 
     const int lc_enc = static_cast<int>(std::lround(lc_mel / static_cast<double>(sub_)));
     const int rc_enc = static_cast<int>(std::ceil(rc_mel / static_cast<double>(sub_)));

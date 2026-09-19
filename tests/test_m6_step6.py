@@ -77,7 +77,7 @@ def test_runner_blobs_match_sources() -> None:
         assert key in embeds, f"{key} missing from runner"
         blob = base64.b64decode(embeds[key])
         assert blob == path.read_bytes(), f"stale blob: {key} (re-run build)"
-    assert len(embeds) == 38, f"expected 38 embedded files, got {len(embeds)}"
+    assert len(embeds) == 40, f"expected 40 embedded files, got {len(embeds)}"
 
 
 def test_framework_placeholder_and_gates_present() -> None:

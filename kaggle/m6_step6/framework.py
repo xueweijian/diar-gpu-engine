@@ -33,6 +33,7 @@ FILES = {
     "hpp_backend":        WORK + "/include/diar/backend.hpp",
     "hpp_backend_cuda":   WORK + "/include/diar/backend_cuda.hpp",
     "hpp_encoder_cuda":   WORK + "/include/diar/encoder_cuda.hpp",
+    "hpp_stem_cuda":      WORK + "/include/diar/stem_cuda.hpp",
     "hpp_cublas_layout":  WORK + "/include/diar/cublas_layout.hpp",
     "hpp_nn":             WORK + "/include/diar/nn.hpp",
     "hpp_gguf":           WORK + "/include/diar/gguf.hpp",
@@ -51,6 +52,7 @@ FILES = {
     "cpp_cublas_layout":  WORK + "/src/cublas_layout.cpp",
     "cpp_backend_cuda":   WORK + "/src/backend_cuda.cpp",
     "cpp_encoder_cuda":   WORK + "/src/encoder_cuda.cpp",
+    "cpp_stem_cuda":      WORK + "/src/stem_cuda.cpp",
     "cpp_nn":             WORK + "/src/nn.cpp",
     "cpp_gguf":           WORK + "/src/gguf.cpp",
     "cpp_sortformer":     WORK + "/src/sortformer.cpp",
@@ -81,17 +83,18 @@ GENCODE = ["-gencode", "arch=compute_60,code=sm_60",
            "-gencode", "arch=compute_70,code=sm_70",
            "-gencode", "arch=compute_75,code=sm_75",
            "-gencode", "arch=compute_60,code=compute_60"]
-SRC_GPU = [FILES[k] for k in ("cpp_backend_cuda", "cpp_encoder_cuda")]
+SRC_GPU = [FILES[k] for k in ("cpp_backend_cuda", "cpp_encoder_cuda", "cpp_stem_cuda")]
 SRC_CPU = [FILES[k] for k in (
     "cpp_backend", "cpp_cublas_layout", "cpp_nn", "cpp_gguf", "cpp_sortformer",
     "cpp_engine", "cpp_fe", "cpp_diar", "cpp_aosc", "cpp_birth_gate",
     "cpp_tailfix", "cpp_profile", "cpp_mha", "cpp_conv", "cpp_conformer",
     "cpp_layers", "cpp_posenc", "cpp_subsampling")]
 
-def sh(cmd, timeout=3600, check=True):
+def sh(cmd, timeout=3600, check=True, env=None):
     print("[s6k] $", " ".join(cmd[:8]), "...", flush=True)
     t0 = time.time()
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                       env=env)
     print(f"[s6k] rc={p.returncode} ({time.time()-t0:.1f}s)", flush=True)
     if p.stdout.strip():
         print(p.stdout[-2500:], flush=True)
@@ -114,6 +117,7 @@ sh(["nvcc", "-O2", "-std=c++17", "-DDIAR_WITH_CUDA", "-DDIAR_PROFILE_STAGE",
     "-I", WORK + "/include", *GENCODE,
     "-x", "cu", FILES["cpp_backend_cuda"],
     "-x", "cu", FILES["cpp_encoder_cuda"],
+    "-x", "cu", FILES["cpp_stem_cuda"],
     "-x", "cu", FILES["cpp_bench_main"],
     *SRC_CPU, "-lcublas", "-o", BENCH])
 
@@ -197,12 +201,22 @@ OFFICIAL_T4_MS = 45.5
 def run_bench(tag: str, mode: str, route: str, audio_f32: Path,
               ref: Path | None, ref_face: str, reps: int) -> dict:
     prefix = str(Path(WORK) / tag)
+    # fp32jit: same fp32 bench, but CUDA_FORCE_JIT=1 loads the fatbin via
+    # the embedded compute_60 PTX -> runtime JIT instead of the sm_75 SASS.
+    # The Pascal-codegen semantics proxy from Step 3's G-S3b (user has no
+    # P100 access right now; G-E cross-card check is deferred, this pins
+    # the sm_60 SEMANTICS on T4).
+    bench_route = "fp32" if route == "fp32jit" else route
     cmd = [BENCH, "--weights", str(GGUF), "--audio", str(audio_f32),
-           "--mode", mode, "--route", route, "--reps", str(reps),
+           "--mode", mode, "--route", bench_route, "--reps", str(reps),
            "--label", tag, "--out", prefix]
     if ref is not None:
         cmd += ["--ref", str(ref), "--ref-face", ref_face]
-    sh(cmd, timeout=6 * 3600)
+    env = None
+    if route == "fp32jit":
+        env = dict(os.environ)
+        env["CUDA_FORCE_JIT"] = "1"
+    sh(cmd, timeout=6 * 3600, env=env)
     with open(prefix + ".bench.json") as f:
         return json.load(f)
 
@@ -217,8 +231,11 @@ def case_job(label: str, fdir: Path) -> dict:
     audio_f32.write_bytes(pcm.tobytes())
 
     out = {"mode": mode, "face": face, "routes": {}}
+    # fp32jit on streaming cases: compute_60 PTX-JIT semantics proxy
     routes = [("cpu", 2)] if mode == "full-offline" else \
              [("cpu", 2), ("fp32", 3), ("fp16", 3)]
+    if mode == "streaming":
+        routes += [("fp32jit", 2)]
     cpu_probs = None
     for route, reps in routes:
         ref = ref_fixture  # every route compares against the FIXTURE
@@ -232,6 +249,14 @@ def case_job(label: str, fdir: Path) -> dict:
             # route-vs-cpu: compare the routed dump against the cpu dump
             dump = Path(WORK) / f"{label}.{route}.{face}.f32"
             entry["vs_cpu_max_abs"] = wire_diff(dump, cpu_probs)
+        # JIT-vs-SASS: compute_60 PTX-JIT must be BIT-IDENTICAL to the
+        # sm_75 SASS run (Step 3 G-S3b precedent) — the strongest no-P100
+        # Pascal semantics pin.
+        if route == "fp32jit":
+            jit_dump = Path(WORK) / f"{label}.fp32jit.{face}.f32"
+            sass_dump = Path(WORK) / f"{label}.fp32.{face}.f32"
+            if jit_dump.exists() and sass_dump.exists():
+                entry["jit_vs_sass_max_abs"] = wire_diff(jit_dump, sass_dump)
         out["routes"][route] = entry
     # G-E artifact: the fp32 streaming postgate dump goes to /kaggle/working
     if mode != "full-offline":
@@ -297,15 +322,22 @@ def judge(cases: dict) -> tuple[str, list[str]]:
                 reasons.append(f"{label}/{route}: frame_agreement="
                                f"{vf['frame_agreement']:.4f}")
             # route hygiene: a routed run must never fall back to CPU
-            if route != "cpu" and b.get("route_refused", 0) != 0:
+            if route not in ("cpu", "fp32jit") and b.get("route_refused", 0) != 0:
                 reasons.append(f"{label}/{route}: route_refused="
                                f"{b.get('route_refused')}")
-            # G-D: routed wall ms/chunk (skip full-offline, always cpu)
-            if route != "cpu":
+            # G-D: routed wall ms/chunk (skip full-offline always-cpu and
+            # the fp32jit proxy — JIT perf is not a gate)
+            if route not in ("cpu", "fp32jit"):
                 mpc = b.get("ms_per_chunk_best", 1e9)
                 if mpc > G_D_GATE_MS:
                     reasons.append(f"{label}/{route}: {mpc:.2f} ms/chunk "
                                    f"> {G_D_GATE_MS}")
+            # G-S6b-JIT: compute_60 PTX-JIT must be bit-identical to SASS
+            if route == "fp32jit" and "jit_vs_sass_max_abs" in entry:
+                if entry["jit_vs_sass_max_abs"] != 0.0:
+                    reasons.append(f"{label}/fp32jit: JIT-vs-SASS "
+                                   f"max_abs={entry['jit_vs_sass_max_abs']:.3g}"
+                                   " (must be bit-identical)")
             # G-B2 provisional: fp32 route vs cpu route (K6 tier in v1)
             if route == "fp32" and "vs_cpu_max_abs" in entry:
                 if entry["vs_cpu_max_abs"] > HARD["max_abs"]:
@@ -317,6 +349,19 @@ verdict, reasons = judge(REPORT["cases"])
 REPORT["verdict"] = verdict
 REPORT["reasons"] = reasons
 REPORT["gates"]["g_d_official_ms"] = OFFICIAL_T4_MS
+
+# engine-vs-official perf table (archived official T4 eager: 45.5 ms/chunk
+# short / 46.1 mid — m3-official-bench v4; the user-facing comparison)
+for label, c in sorted(REPORT["cases"].items()):
+    if "error" in c:
+        continue
+    for route, entry in sorted(c["routes"].items()):
+        mpc = entry["bench"].get("ms_per_chunk_best")
+        if mpc is None or route in ("cpu", "fp32jit"):
+            continue
+        print(f"[s6k] perf {label}/{route}: {mpc:.1f} ms/chunk "
+              f"vs official {OFFICIAL_T4_MS} -> {OFFICIAL_T4_MS / mpc:.2f}x",
+              flush=True)
 
 with open("/kaggle/working/step6_verdict.json", "w") as f:
     json.dump(REPORT, f, indent=1)

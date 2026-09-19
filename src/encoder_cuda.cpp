@@ -84,11 +84,17 @@ struct CudaEncoderRoute::Impl {
     float* ws_conf = nullptr;
     float* ws_tf = nullptr;
     __half* proj_cast16 = nullptr;  // fp16 route proj activation cast
+
+    // Step 6b fused head (bound iff with_head): hh [X,X]+b, hs [S,X]+b.
+    const float *hh_w = nullptr, *hh_b = nullptr;
+    const float *hs_w = nullptr, *hs_b = nullptr;
+    float* dhead = nullptr;   // [max_l * X] hidden activations
+    float* dlogits = nullptr; // [max_l * S] logits (sigmoid input)
 };
 
 CudaEncoderRoute::CudaEncoderRoute(const SortformerWeights& w, bool fp16_storage,
-                                   int max_l)
-    : max_l_(max_l), fp16_(fp16_storage) {
+                                   int max_l, bool with_head)
+    : max_l_(max_l), fp16_(fp16_storage), head_(with_head) {
     if (max_l <= 0) throw std::invalid_argument("CudaEncoderRoute: max_l <= 0");
     const SortformerConfig& c = w.config();
     d_ = c.d_model;
@@ -100,6 +106,7 @@ CudaEncoderRoute::CudaEncoderRoute(const SortformerWeights& w, bool fp16_storage
     tf_layers_ = c.transformer_layers;
     tf_heads_ = c.transformer_heads;
     tf_inner_ = c.transformer_inner;
+    nspk_ = c.num_speakers;
     // The device conv body pins k=9 (dwconv_bn_silu call in the layer
     // template). A different kernel must fail here, not run wrong numbers.
     if (conv_k_ != 9)
@@ -126,6 +133,12 @@ CudaEncoderRoute::CudaEncoderRoute(const SortformerWeights& w, bool fp16_storage
         (4u * X * X + 4u * X + 4u * X + static_cast<std::size_t>(TI) * X +
          TI + static_cast<std::size_t>(X) * TI + X);
     const std::size_t ml = static_cast<std::size_t>(max_l_);
+    const std::size_t head_wts =
+        head_ ? (static_cast<std::size_t>(X) * X + X +
+                 static_cast<std::size_t>(nspk_) * X + nspk_)
+              : 0;
+    const std::size_t head_acts =
+        head_ ? (ml * X + ml * static_cast<std::size_t>(nspk_)) : 0;
     const std::size_t acts = ml * C + (2 * ml - 1) * C + 2 * ml * C +
                              2 * ml * C + 2 * ml * X +
                              conformer_layer_scratch_floats(max_l, C, F,
@@ -135,7 +148,8 @@ CudaEncoderRoute::CudaEncoderRoute(const SortformerWeights& w, bool fp16_storage
                              (ml * C + 1) / 2;  // proj cast16 (fp16 route)
     I.arena.init(static_cast<std::size_t>(N) * conf_w +
                  static_cast<std::size_t>(M) * tf_w +
-                 static_cast<std::size_t>(X) * C + X + acts + (1u << 20));
+                 static_cast<std::size_t>(X) * C + X + acts + head_wts +
+                 head_acts + (1u << 20));
 
     // ---- weights ----
     for (int i = 0; i < N; ++i) {
@@ -319,6 +333,16 @@ CudaEncoderRoute::CudaEncoderRoute(const SortformerWeights& w, bool fp16_storage
         I.proj_w = upload_f32(I.arena, "pjw", w.proj_w(),
                               static_cast<std::size_t>(X) * C);
 
+    // ---- Step 6b fused head (bound iff with_head) ----
+    if (head_) {
+        I.hh_w = upload_f32(I.arena, "hhw", w.head_hidden_w(),
+                            static_cast<std::size_t>(X) * X);
+        I.hh_b = upload_f32(I.arena, "hhb", w.head_hidden_b(), X);
+        I.hs_w = upload_f32(I.arena, "hsw", w.head_spks_w(),
+                            static_cast<std::size_t>(nspk_) * X);
+        I.hs_b = upload_f32(I.arena, "hsb", w.head_spks_b(), nspk_);
+    }
+
     // ---- activations ----
     const std::size_t lc = static_cast<std::size_t>(max_l_) * C;
     const std::size_t lx = static_cast<std::size_t>(max_l_) * X;
@@ -334,6 +358,11 @@ CudaEncoderRoute::CudaEncoderRoute(const SortformerWeights& w, bool fp16_storage
     I.ws_tf = I.arena.alloc(
         "wst", transformer_block_scratch_floats(max_l_, X, TI, tf_heads_));
     I.proj_cast16 = reinterpret_cast<__half*>(I.arena.alloc("pjc", (lc + 1) / 2));
+    if (head_) {
+        I.dhead = I.arena.alloc("dh", lx);
+        I.dlogits = I.arena.alloc("dl", static_cast<std::size_t>(max_l_) *
+                                            nspk_);
+    }
 }
 
 CudaEncoderRoute::~CudaEncoderRoute() {
@@ -352,12 +381,12 @@ std::size_t CudaEncoderRoute::bytes_d2h(int L) const {
     return static_cast<std::size_t>(L) * x_ * sizeof(float);
 }
 
-bool CudaEncoderRoute::encoder_forward(const float* x, const float* pe,
-                                       float* px, int L,
-                                       const EncoderRouteConfig& cfg) {
+const float* CudaEncoderRoute::chain_run(const float* x, const float* pe,
+                                         int L,
+                                         const EncoderRouteConfig& cfg) {
     if (L > max_l_) {
         refused_++;
-        return false;  // CPU fallback in sortformer_run_chunk
+        return nullptr;  // budget refusal -> CPU fallback in run_chunk
     }
     if (cfg.d_model != d_ || cfg.encoder_layers != enc_layers_ ||
         cfg.encoder_heads != enc_heads_ || cfg.encoder_d_ff != enc_ff_ ||
@@ -367,12 +396,11 @@ bool CudaEncoderRoute::encoder_forward(const float* x, const float* pe,
         throw std::invalid_argument(
             "CudaEncoderRoute: config mismatch (route built from different "
             "weights)");
-    if (L <= 0) return false;
+    if (L <= 0) return nullptr;
 
     Impl& I = *impl_;
     const int C = d_, X = x_;
     const std::size_t lc = static_cast<std::size_t>(L) * C;
-    const std::size_t lx = static_cast<std::size_t>(L) * X;
 
     enc_cuda_check(cudaMemcpyAsync(I.dx, x, lc * sizeof(float),
                                    cudaMemcpyHostToDevice, I.stream),
@@ -426,12 +454,50 @@ bool CudaEncoderRoute::encoder_forward(const float* x, const float* pe,
                    ? I.tf1
                    : const_cast<float*>(prev);
     }
+    return cur2;
+}
 
+bool CudaEncoderRoute::encoder_forward(const float* x, const float* pe,
+                                       float* px, int L,
+                                       const EncoderRouteConfig& cfg) {
+    const float* cur2 = chain_run(x, pe, L, cfg);
+    if (!cur2) return false;
+    Impl& I = *impl_;
+    const std::size_t lx = static_cast<std::size_t>(L) * x_;
     enc_cuda_check(cudaMemcpyAsync(px, cur2, lx * sizeof(float),
                                    cudaMemcpyDeviceToHost, I.stream),
                    "px D2H");
     enc_cuda_check(cudaStreamSynchronize(I.stream), "stream sync");
     calls_++;
+    return true;
+}
+
+bool CudaEncoderRoute::encoder_forward_headed(const float* x, const float* pe,
+                                              float* preds, int L,
+                                              const EncoderRouteConfig& cfg) {
+    if (!head_) return false;
+    const float* cur2 = chain_run(x, pe, L, cfg);
+    if (!cur2) return false;
+    Impl& I = *impl_;
+    const int X = x_, S = nspk_;
+    const std::size_t lx = static_cast<std::size_t>(L) * X;
+    const std::size_t ls = static_cast<std::size_t>(L) * S;
+    // diar_head_forward's math on device: ReLU in -> hidden Linear -> ReLU
+    // -> spks Linear -> sigmoid. cur2 is CONSUMED (in-place relu) — the px
+    // domain never crosses back to the host on this path.
+    dev_relu_inplace(const_cast<float*>(cur2), lx, I.stream, I.block);
+    dev_linear(I.cublas, I.stream, I.block, cur2, I.hh_w, I.hh_b, I.dhead,
+               L, X, X, nullptr);
+    dev_relu_inplace(I.dhead, lx, I.stream, I.block);
+    dev_linear(I.cublas, I.stream, I.block, I.dhead, I.hs_w, I.hs_b,
+               I.dlogits, L, X, S, nullptr);
+    dev_sigmoid(I.dlogits, I.dhead, ls, I.stream, I.block);
+    enc_cuda_check(cudaMemcpyAsync(preds, I.dhead, ls * sizeof(float),
+                                   cudaMemcpyDeviceToHost, I.stream),
+                   "preds D2H");
+    enc_cuda_check(cudaStreamSynchronize(I.stream), "stream sync");
+    calls_++;
+    headed_calls_++;
     return true;
 }
 

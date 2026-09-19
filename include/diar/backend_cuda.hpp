@@ -50,6 +50,13 @@ void bench_empty_launch(cudaStream_t s, int block);
 void bench_ff_residual(float* ff, const float* res, std::size_t n,
                        cudaStream_t s, int block);
 
+// ---- Step 6b: shared pointwise entry points (stem route + fused head) ----
+// Thin exported wrappers over the file-local kernels so encoder/stem route
+// files can reuse the exact same device code as the layer bodies.
+void dev_relu_inplace(float* x, std::size_t n, cudaStream_t s, int block);
+void dev_sigmoid(const float* x, float* y, std::size_t n, cudaStream_t s,
+                 int block);
+
 // ---- Step 4: device-resident forward wave (MHA + conv + full layer) -------
 //
 // Design note: the Context:: linear interface copies per call (host->device

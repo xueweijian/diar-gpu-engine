@@ -236,11 +236,14 @@ int sortformer_subsampled_len(int t_mel, int subsampling_factor);
 // Throws std::invalid_argument on L exceeding the PE budget.
 // route: optional Step-6 accelerator (steps 5-7). Taps force the CPU chain
 // (per-layer taps are a CPU contract; a routed run fires no layer taps).
+// stem_route: optional Step-6b accelerator for step 1 (pre_encode stem).
+// Same tap contract — taps force the full CPU reference.
 struct EncoderRoute;  // defined below (pointer param — incomplete here)
+struct StemRoute;     // defined below (pointer param — incomplete here)
 SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat_len,
     const float* spkcache, int spkcache_frames, const float* fifo, int fifo_frames,
     const SortformerWeights& w, TapSink* taps = nullptr,
-    EncoderRoute* route = nullptr);
+    EncoderRoute* route = nullptr, StemRoute* stem_route = nullptr);
 
 // M3 Step 6 — accelerator hook for steps 5-7 of sortformer_run_chunk
 // (conformer chain + encoder_proj + transformer chain; the 99.2 % profile
@@ -266,6 +269,45 @@ struct EncoderRoute {
     // (single stream, fixed kernel order — G-C pins this).
     virtual bool encoder_forward(const float* x, const float* pe, float* px,
         int L, const EncoderRouteConfig& cfg) = 0;
+
+    // M3 Step 6b — optional fused head. provides_head() == true iff the
+    // route was built with the head weights bound (see encoder_cuda.hpp).
+    // encoder_forward_headed runs the same device chain and additionally
+    // applies diar_head_forward's math (ReLU -> hidden Linear -> ReLU ->
+    // spk Linear -> sigmoid) on device, D2H-ing ONLY preds [L,S] — the px
+    // domain never crosses back. Returns false like encoder_forward (budget
+    // refusal) -> caller falls back to encoder_forward + CPU head. The
+    // base impl makes every pre-6b route a plain encoder route.
+    virtual bool provides_head() const { return false; }
+    virtual bool encoder_forward_headed(const float* x, const float* pe,
+        float* preds, int L, const EncoderRouteConfig& cfg) {
+        (void)x; (void)pe; (void)preds; (void)L; (void)cfg;
+        return false;
+    }
+};
+
+// M3 Step 6b — accelerator hook for step 1 of sortformer_run_chunk (the
+// pre_encode stem; the 75 % CPU-side share measured by the Step-6 profile:
+// 236.8 ms/chunk naive CPU vs a ~1 ms device path). Same deliberate
+// CUDA-free shape as EncoderRoute. Semantics contract: bit-compatible with
+// subsampling_forward up to fp32 GEMM reassociation (G-B2 gates the end-to
+// end residue at 0.05; observed ~1e-6 level). feat_len <= 0 selects the
+// full window; the masked-tail route (v13) must match the CPU masks.
+struct StemRouteConfig {
+    int feat_in = 0;
+    int conv_channels = 0;
+    int d_model = 0;
+    int subsampling_factor = 0;
+};
+
+struct StemRoute {
+    virtual ~StemRoute() = default;
+    // mel [t_mel, feat_in] frame-major, y [t3, d_model] out. t3 is the
+    // caller-computed sortformer_subsampled_len(t_mel) — the route must
+    // verify it against its own geometry (never a silent wrong answer).
+    // Returns false ONLY on t_mel beyond the sized budget.
+    virtual bool stem_forward(const float* mel, int t_mel, int feat_len,
+        float* y, int t3, const StemRouteConfig& cfg) = 0;
 };
 
 }  // namespace diar

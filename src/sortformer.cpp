@@ -417,7 +417,8 @@ int sortformer_subsampled_len(int t_mel, int subsampling_factor) {
 
 SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat_len,
     const float* spkcache, int spkcache_frames, const float* fifo, int fifo_frames,
-    const SortformerWeights& w, TapSink* taps, EncoderRoute* route) {
+    const SortformerWeights& w, TapSink* taps, EncoderRoute* route,
+    StemRoute* stem_route) {
     const SortformerConfig& c = w.config();
     const int D = c.d_model, X = c.transformer_hidden, SPK = c.num_speakers;
     const int T3 = sortformer_subsampled_len(t_mel, c.subsampling_factor);
@@ -428,12 +429,25 @@ SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat
     out.chunk_frames = T3;
     if (L <= 0) return out;
 
-    // 1) stem — raw pre-encode embeddings (chunk_embs BEFORE any scaling)
+    // 1) stem — raw pre-encode embeddings (chunk_embs BEFORE any scaling).
+    // Step 6b: the device stem route serves the same output contract as
+    // subsampling_forward; taps keep the CPU reference authoritative.
     out.chunk_embs.resize(static_cast<std::size_t>(T3) * D);
     if (T3 > 0) {
         DIAR_PROFILE_SCOPE("stem");
-        subsampling_forward(mel, w.stem(), out.chunk_embs.data(), t_mel, c.feat_in,
-            c.subsampling_conv_channels, D, feat_len);
+        bool stem_routed = false;
+        if (stem_route && !taps) {
+            StemRouteConfig sc{};
+            sc.feat_in = c.feat_in;
+            sc.conv_channels = c.subsampling_conv_channels;
+            sc.d_model = D;
+            sc.subsampling_factor = c.subsampling_factor;
+            stem_routed = stem_route->stem_forward(mel, t_mel, feat_len,
+                out.chunk_embs.data(), T3, sc);
+        }
+        if (!stem_routed)
+            subsampling_forward(mel, w.stem(), out.chunk_embs.data(), t_mel, c.feat_in,
+                c.subsampling_conv_channels, D, feat_len);
     }
     if (taps && T3 > 0) taps->tap("stem.out", out.chunk_embs.data(), T3, D);
 
@@ -486,9 +500,13 @@ SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat
     // reference below, or the attached Step-6 route (device-resident chain;
     // one H2D/D2H pair per chunk). Taps force the CPU chain — per-layer
     // taps are a CPU contract, a routed run fires none.
+    // Step 6b: a head-providing route fuses step 8 on device (encoder ->
+    // head in one pass, only preds [L,SPK] cross back).
     std::vector<float> px(static_cast<std::size_t>(L) * X);
     const float* enc_out = nullptr;
     bool routed = false;
+    bool headed = false;
+    out.preds.resize(static_cast<std::size_t>(L) * SPK);
     if (route && !taps) {
         EncoderRouteConfig rc{};
         rc.d_model = D;
@@ -500,12 +518,20 @@ SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat
         rc.transformer_hidden = X;
         rc.transformer_inner = c.transformer_inner;
         rc.transformer_heads = c.transformer_heads;
-        DIAR_PROFILE_SCOPE("encoder_route");
-        routed = route->encoder_forward(x.data(), pe.data(), px.data(), L, rc);
+        if (route->provides_head()) {
+            DIAR_PROFILE_SCOPE("encoder_route");
+            headed = route->encoder_forward_headed(x.data(), pe.data(),
+                out.preds.data(), L, rc);
+            routed = headed;
+        }
+        if (!routed) {
+            DIAR_PROFILE_SCOPE("encoder_route");
+            routed = route->encoder_forward(x.data(), pe.data(), px.data(), L, rc);
+        }
     }
-    if (routed) {
+    if (routed && !headed) {
         enc_out = px.data();
-    } else {
+    } else if (!routed) {
         // 5) conformer chain (ping-pong)
         std::vector<float> y(static_cast<std::size_t>(L) * D);
         float* cur = x.data();
@@ -552,9 +578,9 @@ SortformerChunkOutput sortformer_run_chunk(const float* mel, int t_mel, int feat
         enc_out = cur;
     }
 
-    // 8) head -> pre-gate preds
-    out.preds.resize(static_cast<std::size_t>(L) * SPK);
-    {
+    // 8) head -> pre-gate preds (skipped when the fused device head served
+    // it in encoder_forward_headed — out.preds is already populated)
+    if (!headed) {
         DIAR_PROFILE_SCOPE("head");
         diar_head_forward(enc_out, w.head_hidden_w(), w.head_hidden_b(), w.head_spks_w(),
             w.head_spks_b(), out.preds.data(), L, X, SPK);
