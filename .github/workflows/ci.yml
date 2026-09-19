@@ -24,6 +24,34 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
 
+  cuda-build:
+    name: nvcc-compile-gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CUDA toolkit (compile-only; no GPU on runners)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nvidia-cuda-toolkit
+          nvcc --version
+      - name: Compile gate (fatbin sm_60/70/75 + compute_60 PTX)
+        run: |
+          nvcc -O2 -std=c++17 -DDIAR_WITH_CUDA -Iinclude             -gencode arch=compute_60,code=sm_60             -gencode arch=compute_70,code=sm_70             -gencode arch=compute_75,code=sm_75             -gencode arch=compute_60,code=compute_60             src/cublas_layout.cpp src/backend_cuda.cpp src/nn.cpp             src/gguf.cpp tools/step3_bench_main.cpp             -lcublas -o /tmp/step3_bench
+      - name: Fatbin arch verification
+        run: |
+          cuobjdump --list-elf /tmp/step3_bench | tee /tmp/elf.txt
+          cuobjdump --list-ptx /tmp/step3_bench | tee /tmp/ptx.txt
+          for a in sm_60 sm_70 sm_75; do
+            grep -q "$a" /tmp/elf.txt || { echo "MISSING SASS $a"; exit 1; }
+          done
+          grep -q "compute_60" /tmp/ptx.txt || { echo "MISSING PTX compute_60"; exit 1; }
+          echo "fatbin carries all 3 SASS + PTX: OK"
+      - name: CPU selftest of the bench harness
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Iinclude -O2             tools/step3_bench_main.cpp src/cublas_layout.cpp src/nn.cpp             src/gguf.cpp -o /tmp/step3_selftest
+          /tmp/step3_selftest | tee /tmp/selftest.txt
+          grep -q '"mode":"cpu-selftest-complete"' /tmp/selftest.txt
+
   sanitizer:
     name: asan-ubsan
     runs-on: ubuntu-24.04
