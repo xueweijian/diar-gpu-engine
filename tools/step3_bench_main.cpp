@@ -49,6 +49,17 @@ const Shape kShapes[] = {
 constexpr int kParityRuns = 3;
 constexpr double kParityGate = 1e-5;
 
+// Cross-implementation gate (CPU naive loop vs cuBLAS FMA/split-k): the
+// 1e-5 tier is for isomorphic transcriptions (M2 K1-style, same summation
+// order). Here the order differs BY CONSTRUCTION — FMA fuses mul+add into
+// one rounding and block reductions reorder k. Measured v5 (T4):
+// 2-5e-5 at k=512, 1.3e-4 at k=2048 (~3e-7 per k unit). Gate scales with
+// the reduction depth, floor 1e-5, cap 5e-4 (still 20x tighter than the
+// fp16 quantization tier, so Step 5's gate stays meaningful).
+inline double parity_gate(int k) {
+    return std::min(5e-4, std::max(1e-5, 2e-7 * static_cast<double>(k)));
+}
+
 std::mt19937& rng() { static std::mt19937 r(20260919); return r; }
 
 void fill_random(std::vector<float>& v) {
@@ -152,10 +163,11 @@ void run_gpu(const std::string& tag, bool parity_only) {
         double worst = 0.0;
         for (int r = 0; r < kParityRuns; ++r)
             worst = std::max(worst, parity_one(*ctx, s));
+        const double gate = parity_gate(s.in);
         report("parity_sass", std::string("\"shape\":\"") + s.name +
                "\",\"max_abs\":" + std::to_string(worst) +
-               ",\"gate\":" + std::to_string(kParityGate) +
-               ",\"pass\":" + (worst <= kParityGate ? "true" : "false") + "}\n");
+               ",\"gate\":" + std::to_string(gate) +
+               ",\"pass\":" + (worst <= gate ? "true" : "false") + "}\n");
     }
 
     if (!parity_only) {

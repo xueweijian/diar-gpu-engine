@@ -74,11 +74,13 @@ sh(["nvcc", "-O3", "-std=c++17", "-DDIAR_WITH_CUDA", "-I", WORK + "/include",
 # verify the fatbin really carries 3 SASS + 1 PTX
 elf = sh(["cuobjdump", "--list-elf", WORK + "/bench_sass"], check=False).stdout
 ptx = sh(["cuobjdump", "--list-ptx", WORK + "/bench_sass"], check=False).stdout
+print("[s3k] raw --list-elf:\n" + elf)
+print("[s3k] raw --list-ptx:\n" + ptx)
 def _archs(text, prefix):
-    toks = {t.strip(",;:") for t in text.split()}
+    toks = {t.strip(",;:").split(".")[0] for t in text.replace(".", ". ").split()}
     return sorted(t for t in toks if t.startswith(prefix))
 sass_archs = _archs(elf, "sm_")
-ptx_archs = _archs(ptx, "compute_")
+ptx_archs = _archs(ptx, "sm_") + _archs(ptx, "compute_")
 print("[s3k] SASS archs in fatbin:", sass_archs)
 print("[s3k] PTX archs in fatbin:", ptx_archs)
 REPORT["gates"]["fatbin_sass_all3"] = all(a in sass_archs for a in ("sm_60", "sm_70", "sm_75"))
