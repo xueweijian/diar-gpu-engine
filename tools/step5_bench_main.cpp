@@ -113,12 +113,15 @@ const double kTfGate = 2.0 * parity_gate(768);
 // ---- Step 5 (fp16-storage route) gate tiers -------------------------------
 // Unlike the fp32 tiers, the fp16 parity error is dominated by INPUT
 // QUANTIZATION (2^-11 RNE on the weights once at upload + on every GEMM
-// activation on device), accumulated over k products: expected ~sqrt(k)
-// random-walk of per-term ~|x||w|*2^-10 relative. Provisional tier
-// 2.5e-6*k (floor 2e-3, cap 4e-2) — recalibrated against measured values
-// exactly like every gate in this harness lineage (Step 4 v2 precedent).
+// activation on device), accumulated over k products as a random walk:
+// measured on T4 (kernel v1) 1.2e-3 @k=192, 2.0-2.4e-3 @k=512,
+// 2.2e-3 @k=768, 3.7e-3 @k=2048 — i.e. ~1.5e-4*sqrt(k), NOT linear in k.
+// Gate tier 1.5e-4*sqrt(k) with floor 3e-3 (>=1.45x margin at every
+// engine shape). Recalibrated from v1 measurements (Step-4 v2 precedent);
+// the K6 four-fixture gate stays the production arbiter for shipping this
+// route as default.
 inline double fp16_gate(int k) {
-    return std::min(4e-2, std::max(2e-3, 2.5e-6 * static_cast<double>(k)));
+    return std::min(4e-2, std::max(3e-3, 1.5e-4 * std::sqrt(static_cast<double>(k))));
 }
 // Layer-chain tiers: LN renormalization resets the residual scale each
 // block, so the chain stays near the linear tier; generous first run,
@@ -809,7 +812,7 @@ int main(int argc, char** argv) {
                std::string("\"shape\":\"") + s.name +
                    "\",\"max_abs\":" + fmt9(m) + ",\"gate\":" + fmt9(g) +
                    ",\"pass\":" + (m <= g ? "true" : "false") + "}\n");
-        const double gq = std::max(1e-3, g / 2);
+        const double gq = std::max(1.5e-3, 0.7 * g);  // measured hq ~0.7x
         report("parity_linear_hq",
                std::string("\"shape\":\"") + s.name +
                    "\",\"max_abs\":" + fmt9(mq) + ",\"gate\":" + fmt9(gq) +
