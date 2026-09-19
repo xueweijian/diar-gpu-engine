@@ -219,12 +219,20 @@ void bench_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
 // proj GEMM — the same body the resident conformer/transformer layers
 // call; fp32 Sgemm route, or fp16-storage GemmEx with the activation cast
 // into cast16, cast16 >= t*in halves).
+//
+// Template over the weight storage type: float = fp32 Sgemm, __half =
+// fp16-storage GemmEx. Explicit instantiations live in backend_cuda.cpp
+// (extern template: other TUs reference the same symbols — a NON-template
+// declaration here would shadow them and leave every call site unresolved
+// at link; that was the first CI link failure of Step 6).
+template <typename WT>
 void dev_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
-                const float* x, const float* w, const float* bias, float* y,
+                const float* x, const WT* w, const float* bias, float* y,
                 int t, int in, int out, __half* cast16);
-void dev_linear(cublasHandle_t cublas, cudaStream_t stream, int block,
-                const float* x, const __half* w, const float* bias, float* y,
-                int t, int in, int out, __half* cast16);
+extern template void dev_linear<float>(cublasHandle_t, cudaStream_t, int,
+    const float*, const float*, const float*, float*, int, int, int, __half*);
+extern template void dev_linear<__half>(cublasHandle_t, cudaStream_t, int,
+    const float*, const __half*, const float*, float*, int, int, int, __half*);
 
 // ---- Step 5 bench entries (fp16-storage route) ----------------------------
 // fp16-weights linear: w is a DEVICE __half array (host-packed via
