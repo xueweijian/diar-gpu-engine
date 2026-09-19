@@ -34,3 +34,16 @@ naive-vs-cuBLAS cross-check: max_abs = 0（harness 转置 bug 已修）。
 CPU 引擎同形状 GEMM ~2.2 s/chunk（conformer 92.34% = 36.8 s/chunk），
 T4 单卡 fp32 全 conformer ≈ 17 × (0.254+0.256+MHA+conv) ≈ 20-30 ms/chunk
 量级 —— 三个数量级的余量，fp32 起步完全够。
+## 后续修订（同日 v2）：三卡家族规划
+
+用户澄清：目标 P100 的原因是**自己拥有 P100 和 V100 硬件**，要给
+自己的卡做专属推理。因此 Kaggle 退役 P100 只影响开发平台选择，
+不影响目标硬件——规划升级为三卡家族（docs/M3-CUDA-PLAN.md v2）：
+
+- T4（Kaggle，有货免费）= 开发/回归平台 + 悲观性能下限
+- P100（用户）= 功能基线（sm_60 下限）+ 生产靶机 1
+- V100（用户）= 性能上限参考 + 生产靶机 2
+- 单 fatbin 三 SASS（sm_60/70/75）+ compute_60 PTX 兜底未来卡
+- sm_60 编译门 + PTX-JIT-on-T4 语义验证 = 不持有 P100 也能守住基线
+- 新增跨卡数值门 G-E（三卡同输入 probs ≤ 1e-6 互证）
+- tensor core 仍排除主线（P100 没有 + fp16 累加违 parity）
