@@ -6,6 +6,8 @@
 
 #include "diar/gguf.hpp"  // half_to_float (read direction, M2-pinned)
 
+#include <cstring>
+
 namespace diar {
 
 CublasGemmPlan linear_gemm_plan(int t, int in_features, int out_features) noexcept {
@@ -47,7 +49,7 @@ std::uint16_t float_to_half(float f) noexcept {
   // IEEE-754 binary16, round-to-nearest-even. Self-contained on purpose
   // (gguf.cpp is an embedded blob). Round-trips with diar::half_to_float.
   std::uint32_t bits = 0;
-  __builtin_memcpy(&bits, &f, sizeof(bits));
+  std::memcpy(&bits, &f, sizeof(bits));
   const std::uint32_t sign = (bits >> 16) & 0x8000u;
   const std::uint32_t exp8 = (bits >> 23) & 0xFFu;
   const std::uint32_t man23 = bits & 0x7FFFFFu;
