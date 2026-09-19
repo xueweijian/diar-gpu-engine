@@ -21,6 +21,9 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -354,6 +357,353 @@ void bench_ff_residual(float* ff, const float* res, std::size_t n,
     ff_residual_kernel<<<bench_grid_for(n, block), block, 0, s>>>(ff, res, n);
     const cudaError_t c = cudaGetLastError();
     if (c != cudaSuccess) die("ff_residual launch", static_cast<int>(c));
+}
+
+// ---- Step 4: device-resident forward wave ---------------------------------
+// (declared in backend_cuda.hpp; all pointers DEVICE-side, zero H2D per call)
+
+namespace {
+
+// One thread per row: max-sub + expf + sum + div (nn.hpp softmax order).
+__global__ void softmax_rows_kernel(const float* x, float* y, int cols) {
+    const int row = blockIdx.x;
+    const float* xr = x + static_cast<std::size_t>(row) * cols;
+    float* yr = y + static_cast<std::size_t>(row) * cols;
+    float m = xr[0];
+    for (int j = 1; j < cols; ++j) m = fmaxf(m, xr[j]);
+    float s = 0.0f;
+    for (int j = 0; j < cols; ++j) {
+        const float e = __expf(xr[j] - m);
+        yr[j] = e;
+        s += e;
+    }
+    const float inv = 1.0f / s;
+    for (int j = 0; j < cols; ++j) yr[j] *= inv;
+}
+
+// y[r,c] = x[r, c] * sigmoid(x[r, c+C]) — torch glu(dim=-1): per-row
+// halves, a = FIRST half (matches nn::glu_forward row-major [t, 2c]).
+__global__ void glu_kernel(const float* x, float* y, int t, int c) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < t * c) {
+        const int r = i / c;
+        const int ci = i - r * c;
+        const float* xr = x + static_cast<std::size_t>(r) * 2 * c;
+        y[i] = xr[ci] / (1.0f + __expf(-xr[c + ci]));
+    }
+}
+
+// depthwise k-tap conv (symmetric zero pad (k-1)/2, conv.hpp pin) + BN
+// inference + SiLU, fused. One thread per (t,c).
+__global__ void dwconv_bn_silu_kernel(const float* x, const float* w,
+                                      const float* b, const float* bn_g,
+                                      const float* bn_b, const float* mean,
+                                      const float* var, float* y, int t,
+                                      int c, int k) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= t * c) return;
+    const int ti = i / c;
+    const int ci = i - ti * c;
+    const int half = (k - 1) / 2;
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        const int s = ti + j - half;
+        if (s >= 0 && s < t)
+            acc += x[static_cast<std::size_t>(s) * c + ci] *
+                   w[static_cast<std::size_t>(ci) * k + j];
+    }
+    acc += b[ci];
+    const float inv = rsqrtf(var[ci] + 1e-5f);
+    acc = (acc - mean[ci]) * inv * bn_g[ci] + bn_b[ci];
+    y[i] = acc / (1.0f + __expf(-acc));  // SiLU
+}
+
+// y = a + s*b (residual add; s=1 plain, s=0.5 FF second half)
+__global__ void add_scaled_kernel(float* a, const float* b, float s,
+                                  std::size_t n) {
+    const std::size_t i =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) a[i] += s * b[i];
+}
+
+// q += bias broadcast (rows x cols, bias[cols])
+__global__ void add_rows_bias_kernel(float* q, const float* bias,
+                                     std::size_t n, int cols) {
+    const std::size_t i =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) q[i] += bias[i % cols];
+}
+
+// One thread per (h, query-row): scores = (ac[h,i,:] + bd[h, i-j+t-1, j]) *
+// inv_sqrt(dk) -> row softmax -> probs. The rel_shift index math replaces
+// torch pad+view+drop-row (contract S[i,j] = BD[i-j+T-1, j], M2-proven).
+__global__ void mha_softmax_kernel(const float* ac, const float* bd,
+                                   float* probs, int t, int p, float inv) {
+    const int flat = blockIdx.x;  // h * t + i
+    const int i = flat % t;
+    const std::size_t h = static_cast<std::size_t>(flat) / t;
+    const float* ar = ac + (h * t + i) * t;
+    const float* br = bd + h * t * p;  // [t, p] row-major: br[a*p + m]
+    float* pr = probs + (h * t + i) * t;
+    float m = -3.0e38f;
+    for (int j = 0; j < t; ++j) {
+        // rel_shift contract (sim_mha_chain.cpp): value(bd[i][j-i+t-1])
+        const float s =
+            (ar[j] + br[static_cast<std::size_t>(i) * p + (j - i + t - 1)]) *
+            inv;
+        pr[j] = s;
+        m = fmaxf(m, s);
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < t; ++j) {
+        const float e = __expf(pr[j] - m);
+        pr[j] = e;
+        sum += e;
+    }
+    const float isum = 1.0f / sum;
+    for (int j = 0; j < t; ++j) pr[j] *= isum;
+}
+
+// device-resident linear: y = x @ w + bias (zero-pack plan, no host copies)
+void dev_linear(cublasHandle_t cublas, int block, const float* x,
+                const float* w, const float* bias, float* y, int t, int in,
+                int out) {
+    const auto plan = linear_gemm_plan(t, in, out);
+    const float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasSgemm(cublas,
+                             static_cast<cublasOperation_t>(plan.op_a),
+                             static_cast<cublasOperation_t>(plan.op_b),
+                             plan.m, plan.n, plan.k, &alpha, w, plan.lda, x,
+                             plan.ldb, &beta, y, plan.ldc));
+    if (bias) {
+        const std::size_t yn = static_cast<std::size_t>(t) * out;
+        add_rows_bias_kernel<<<bench_grid_for(yn, block), block>>>(y, bias,
+                                                                   yn, out);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+}  // namespace
+
+std::size_t mha_scratch_floats(int t, int c, int h) {
+    const int p = 2 * t - 1;
+    const std::size_t tc = static_cast<std::size_t>(t) * c;
+    // qu qv q k v [5*tc] | p [p*c] | out_tmp [tc] | ac bd probs [h*t*(2t+p)]
+    return 6 * tc + static_cast<std::size_t>(p) * c +
+           static_cast<std::size_t>(h) * t * (2 * t + p);
+}
+
+// GpuArena: one cudaMalloc, bump-allocated named spans (weights device
+// resident = uploaded once; per-chunk work touches activations + scratch).
+void GpuArena::init(std::size_t n_floats) {
+    cap_ = n_floats;
+    CUDA_CHECK(cudaMalloc(&base_, n_floats * sizeof(float)));
+    reg_cap_ = 256;
+    names_ = static_cast<const char**>(std::calloc(reg_cap_, sizeof(char*)));
+    ptrs_ = static_cast<float**>(std::calloc(reg_cap_, sizeof(float*)));
+    if (!names_ || !ptrs_) die("arena registry alloc", -1);
+}
+
+float* GpuArena::alloc(const char* name, std::size_t n) {
+    if (used_ + n > cap_) die("arena exhausted", static_cast<int>(used_ + n));
+    if (count_ == reg_cap_) {
+        reg_cap_ *= 2;
+        names_ = static_cast<const char**>(
+            std::realloc(names_, reg_cap_ * sizeof(char*)));
+        ptrs_ = static_cast<float**>(
+            std::realloc(ptrs_, reg_cap_ * sizeof(float*)));
+        if (!names_ || !ptrs_) die("arena registry grow", -1);
+    }
+    float* p = base_ + used_;
+    used_ += n;
+    names_[count_] = name;
+    ptrs_[count_] = p;
+    ++count_;
+    return p;
+}
+
+float* GpuArena::span(const char* name) const {
+    for (std::size_t i = 0; i < count_; ++i)
+        if (std::strcmp(names_[i], name) == 0) return ptrs_[i];
+    die("arena span missing", -1);
+    return nullptr;
+}
+
+GpuArena::~GpuArena() {
+    if (base_) cudaFree(base_);
+    std::free(names_);
+    std::free(ptrs_);
+}
+
+void gpu_relpos_mha(cublasHandle_t cublas, cudaStream_t stream, int block,
+                    const MhaDevWeights& w, const float* x, const float* pos,
+                    float* y, float* ws, int t, int c, int heads) {
+    const int p = 2 * t - 1;
+    const int dk = c / heads;
+    const std::size_t tc = static_cast<std::size_t>(t) * c;
+    const std::size_t pc = static_cast<std::size_t>(p) * c;
+    float* qu = ws;
+    float* qv = qu + tc;
+    float* dq = qv + tc;
+    float* dkbuf = dq + tc;
+    float* dv = dkbuf + tc;
+    float* dp = dv + tc;
+    float* otmp = dp + pc;
+    const std::size_t per_h = static_cast<std::size_t>(heads) * t;
+    float* ac = otmp + tc;          // [h, t, t]
+    float* bd = ac + per_h * t;     // [h, t, p]
+    float* probs = bd + per_h * p;  // [h, t, t]
+
+    dev_linear(cublas, block, x, w.q_w, w.q_b, dq, t, c, c);
+    dev_linear(cublas, block, x, w.k_w, w.k_b, dkbuf, t, c, c);
+    dev_linear(cublas, block, x, w.v_w, w.v_b, dv, t, c, c);
+    dev_linear(cublas, block, pos, w.pos_w, nullptr, dp, p, c, c);
+    CUDA_CHECK(cudaMemcpyAsync(qu, dq, tc * sizeof(float),
+                               cudaMemcpyDeviceToDevice, stream));
+    add_rows_bias_kernel<<<bench_grid_for(tc, block), block, 0, stream>>>(
+        qu, w.bu, tc, c);
+    CUDA_CHECK(cudaMemcpyAsync(qv, dq, tc * sizeof(float),
+                               cudaMemcpyDeviceToDevice, stream));
+    add_rows_bias_kernel<<<bench_grid_for(tc, block), block, 0, stream>>>(
+        qv, w.bv, tc, c);
+    CUDA_CHECK(cudaGetLastError());
+
+    // ac[h] = qu_h @ k_h^T ; bd[h] = qv_h @ p_h^T. Head h of a row-major
+    // [T,C] tensor is columns [h*dk,(h+1)*dk) = a col-major [dk,T] with
+    // ld=C — zero-pack head split (cublas_layout contract family).
+    {
+        const float alpha = 1.0f, beta = 0.0f;
+        CUBLAS_CHECK(cublasSgemmStridedBatched(
+            cublas, CUBLAS_OP_T, CUBLAS_OP_N, t, t, dk, &alpha, dkbuf, c, dk,
+            qu, c, dk, &beta, ac, t, static_cast<long long>(t) * t, heads));
+        CUBLAS_CHECK(cublasSgemmStridedBatched(
+            cublas, CUBLAS_OP_T, CUBLAS_OP_N, p, t, dk, &alpha, dp, c, dk,
+            qv, c, dk, &beta, bd, p, static_cast<long long>(t) * p, heads));
+    }
+
+    mha_softmax_kernel<<<per_h, 1, 0, stream>>>(
+        ac, bd, probs, t, p, 1.0f / std::sqrt(static_cast<float>(dk)));
+    CUDA_CHECK(cudaGetLastError());
+
+    // ctx_h [t,dk] = probs_h @ v_h — written straight into the merged [t,c]
+    // head slice (heads are contiguous column blocks: zero transpose).
+    {
+        const float alpha = 1.0f, beta = 0.0f;
+        // A = dv op_N: A(m_idx, r) = dv[r*c + hr + m_idx] (lda=c, batch=hr).
+        CUBLAS_CHECK(cublasSgemmStridedBatched(
+            cublas, CUBLAS_OP_N, CUBLAS_OP_N, dk, t, t, &alpha, dv, c, dk,
+            probs, t, static_cast<long long>(t) * t, &beta, otmp, c, dk,
+            heads));
+    }
+    dev_linear(cublas, block, otmp, w.out_w, w.out_b, y, t, c, c);
+}
+
+std::size_t conformer_layer_scratch_floats(int t, int c, int d_ff, int h) {
+    // res tmp attn [3tc] | ff_up [t*ff] | pw1 [2tc] | glu_out dw_out [2tc]
+    // | mha scratch
+    const std::size_t tc = static_cast<std::size_t>(t) * c;
+    return 7 * tc + static_cast<std::size_t>(t) * d_ff +
+           mha_scratch_floats(t, c, h);
+}
+
+void gpu_conformer_layer(cublasHandle_t cublas, cudaStream_t stream,
+                         int block, const LayerDevWeights& w, const float* x,
+                         const float* pos, float* y, float* ws, int t, int c,
+                         int d_ff, int heads) {
+    const std::size_t tc = static_cast<std::size_t>(t) * c;
+    float* res = ws;
+    float* tmp = res + tc;
+    float* attn = tmp + tc;
+    float* ff_up = attn + tc;                  // [t, d_ff]
+    float* pw1 = ff_up + static_cast<std::size_t>(t) * d_ff;  // [t, 2c]
+    float* glu_out = pw1 + 2 * tc;
+    float* dw_out = glu_out + tc;
+    float* mha_ws = dw_out + tc;
+
+    const int pw_block = block;
+    // residual = x (this is the first write; x may alias nothing)
+    CUDA_CHECK(cudaMemcpyAsync(res, x, tc * sizeof(float),
+                               cudaMemcpyDeviceToDevice, stream));
+
+    // FF1: x = LN(res); ff = silu(x@W1+b1)@W2+b2; res += 0.5*ff
+    layernorm_kernel<<<static_cast<unsigned>(t), block,
+                       2 * block * sizeof(float), stream>>>(
+        res, w.n_ff1_g, w.n_ff1_b, tmp, t, c);
+    dev_linear(cublas, block, tmp, w.ff1_w1, w.ff1_b1, ff_up, t, c, d_ff);
+    silu_kernel<<<bench_grid_for(static_cast<std::size_t>(t) * d_ff, block),
+                  block, 0, stream>>>(ff_up, ff_up,
+                                      static_cast<std::size_t>(t) * d_ff);
+    dev_linear(cublas, block, ff_up, w.ff1_w2, w.ff1_b2, tmp, t, d_ff, c);
+    add_scaled_kernel<<<bench_grid_for(tc, pw_block), pw_block, 0, stream>>>(
+        res, tmp, 0.5f, tc);
+
+    // MHA: a = LN(res); attn = mha(a, pos); res += attn
+    layernorm_kernel<<<static_cast<unsigned>(t), block,
+                       2 * block * sizeof(float), stream>>>(
+        res, w.n_sa_g, w.n_sa_b, tmp, t, c);
+    gpu_relpos_mha(cublas, stream, block, w.attn, tmp, pos, attn, mha_ws, t,
+                   c, heads);
+    add_scaled_kernel<<<bench_grid_for(tc, pw_block), pw_block, 0, stream>>>(
+        res, attn, 1.0f, tc);
+
+    // conv: v = LN(res); pw1 -> GLU -> dw+BN+SiLU -> pw2; res += v
+    layernorm_kernel<<<static_cast<unsigned>(t), block,
+                       2 * block * sizeof(float), stream>>>(
+        res, w.n_conv_g, w.n_conv_b, tmp, t, c);
+    dev_linear(cublas, block, tmp, w.conv.pw1_w, w.conv.pw1_b, pw1, t, c, 2 * c);
+    glu_kernel<<<bench_grid_for(tc, pw_block), pw_block, 0, stream>>>(
+        pw1, glu_out, t, c);
+    dwconv_bn_silu_kernel<<<bench_grid_for(tc, pw_block), pw_block, 0,
+                            stream>>>(glu_out, w.conv.dw_w, w.conv.dw_b,
+                                      w.conv.bn_w, w.conv.bn_b,
+                                      w.conv.bn_mean, w.conv.bn_var, dw_out,
+                                      t, c, 9);
+    dev_linear(cublas, block, dw_out, w.conv.pw2_w, w.conv.pw2_b, tmp, t, c, c);
+    add_scaled_kernel<<<bench_grid_for(tc, pw_block), pw_block, 0, stream>>>(
+        res, tmp, 1.0f, tc);
+
+    // FF2 + final LN
+    layernorm_kernel<<<static_cast<unsigned>(t), block,
+                       2 * block * sizeof(float), stream>>>(
+        res, w.n_ff2_g, w.n_ff2_b, tmp, t, c);
+    dev_linear(cublas, block, tmp, w.ff2_w1, w.ff2_b1, ff_up, t, c, d_ff);
+    silu_kernel<<<bench_grid_for(static_cast<std::size_t>(t) * d_ff, block),
+                  block, 0, stream>>>(ff_up, ff_up,
+                                      static_cast<std::size_t>(t) * d_ff);
+    dev_linear(cublas, block, ff_up, w.ff2_w2, w.ff2_b2, tmp, t, d_ff, c);
+    add_scaled_kernel<<<bench_grid_for(tc, pw_block), pw_block, 0, stream>>>(
+        res, tmp, 0.5f, tc);
+    layernorm_kernel<<<static_cast<unsigned>(t), block,
+                       2 * block * sizeof(float), stream>>>(
+        res, w.n_out_g, w.n_out_b, y, t, c);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// isolated-op bench entries (parity vs CPU references)
+
+void bench_softmax_rows(const float* x, float* y, int rows, int cols,
+                        cudaStream_t s, int block) {
+    (void)block;
+    softmax_rows_kernel<<<rows, 1, 0, s>>>(x, y, cols);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bench_glu(const float* x, float* y, int t, int c, cudaStream_t s,
+               int block) {
+    glu_kernel<<<bench_grid_for(static_cast<std::size_t>(t) * c, block),
+                 block, 0, s>>>(x, y, t, c);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bench_dwconv_bn_silu(const float* x, const float* w, const float* b,
+                          const float* bn_g, const float* bn_b,
+                          const float* mean, const float* var, float* y,
+                          int t, int c, int k, cudaStream_t s, int block) {
+    dwconv_bn_silu_kernel<<<bench_grid_for(static_cast<std::size_t>(t) * c,
+                                           block),
+                            block, 0, s>>>(x, w, b, bn_g, bn_b, mean, var, y,
+                                           t, c, k);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // Factory hand-off: backend.cpp owns create(Kind); the CUDA branch lands

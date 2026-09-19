@@ -25,6 +25,10 @@ ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   -o "$BUILD/test_mha"
 "$BUILD/test_mha"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
+  -I"$ROOT/include" "$ROOT/src/nn.cpp" "$ROOT/src/mha.cpp" "$ROOT/tests/sim_mha_chain.cpp" \
+  -o "$BUILD/sim_mha_chain"
+"$BUILD/sim_mha_chain"
+${CXX:-g++} -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 \
   -I"$ROOT/include" "$ROOT/src/nn.cpp" "$ROOT/src/conv.cpp" "$ROOT/tests/test_conv.cpp" \
   -o "$BUILD/test_conv"
 "$BUILD/test_conv"

@@ -82,6 +82,17 @@ if(BUILD_TESTING)
   endif()
   add_test(NAME diar_mha_tests COMMAND diar_mha_tests)
 
+  # Orientation contract for the Step 4 CUDA MHA chain (no CUDA needed):
+  # simulates cuBLAS buffer layouts + the softmax/rel_shift indexing.
+  add_executable(diar_sim_mha_chain tests/sim_mha_chain.cpp)
+  target_link_libraries(diar_sim_mha_chain PRIVATE diar_core)
+  if(MSVC)
+    target_compile_options(diar_sim_mha_chain PRIVATE /W4)
+  else()
+    target_compile_options(diar_sim_mha_chain PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+  add_test(NAME diar_sim_mha_chain COMMAND diar_sim_mha_chain)
+
   add_executable(diar_conv_tests tests/test_conv.cpp)
   target_link_libraries(diar_conv_tests PRIVATE diar_core)
   if(MSVC)
